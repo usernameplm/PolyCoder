@@ -1,0 +1,9 @@
+# 在项目根目录创建 .gitignore，防止 Key 泄露
+cat > .gitignore << 'EOF'
+.env
+.venv/
+__pycache__/
+*.pyc
+sessions/
+logs/
+EOF
