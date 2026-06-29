@@ -2264,7 +2264,8 @@ LLM 最终回答 → "项目 A 的美元收入是 XXX"
 ```
 my-agent/
 ├── agent/
-│   ├── __init__.py
+│   ├── __init__.py      ← 只做导出（from .api import ...）
+│   ├── api.py           ← 对外接口（ask、ask_stream、AskResult）
 │   ├── loop.py          ← ★ Agentic Loop 核心实现
 │   ├── state.py         ← Loop 状态对象
 │   └── executor.py      ← 工具并行执行器
@@ -2592,15 +2593,24 @@ async def run_agent_loop(
 
 ---
 
-## 4.6 更新 `agent.py` 使用 Agentic Loop
+## 4.6 新建 `agent/api.py`（对外接口）
+
+> **注意**：第 1-3 章的 `agent.py` 到这里可以删除。
+> 第 4 章起改用 `agent/` 包，`agent.py` 会被 `agent/` 目录遮蔽。
+> `agent/__init__.py` 只做导出，实现放在 `agent/api.py`。
 
 ```python
-# agent.py（替换原有内容）
+# agent/api.py
+# 对外暴露的简洁接口：ask() 和 ask_stream()
+# cli.py、main.py、测试代码都从这里导入，不直接接触 loop.py
+
+import asyncio
+from asyncio import Queue
 from dataclasses import dataclass
 from typing import AsyncGenerator
-from agent.loop import run_agent_loop, LoopResult
+
+from .loop import run_agent_loop, LoopResult
 from providers.router import get_provider
-from providers.types import TextDelta
 
 SYSTEM_PROMPT = "你是一个智能助手，请用中文回答问题，回答要简洁准确。"
 
@@ -2634,16 +2644,11 @@ async def ask(question: str) -> AskResult:
 
 async def ask_stream(question: str) -> AsyncGenerator[str, None]:
     """流式调用，通过 on_text_delta 回调实时传出文本。"""
-    from asyncio import Queue, Event
-
     queue: Queue[str | None] = Queue()
 
     def on_delta(text: str):
         queue.put_nowait(text)
 
-    import asyncio
-
-    # 在后台任务里跑 Loop，主协程从队列里取 chunk yield 出去
     async def run_loop():
         provider = get_provider()
         await run_agent_loop(
@@ -2653,7 +2658,7 @@ async def ask_stream(question: str) -> AsyncGenerator[str, None]:
             max_turns=10,
             on_text_delta=on_delta,
         )
-        queue.put_nowait(None)  # 发送结束标记
+        queue.put_nowait(None)
 
     loop_task = asyncio.create_task(run_loop())
 
@@ -2665,6 +2670,15 @@ async def ask_stream(question: str) -> AsyncGenerator[str, None]:
 
     await loop_task
 ```
+
+`agent/__init__.py` 只做一行导出，不写任何实现：
+
+```python
+# agent/__init__.py
+from .api import ask, ask_stream, AskResult
+```
+
+这样 `from agent import ask` 依然正常工作，`__init__.py` 保持干净。
 
 ---
 
@@ -6933,7 +6947,8 @@ my-agent/
 │   └── gemini.py
 │
 ├── agent/                  ← 阶段 4：Agentic Loop
-│   ├── __init__.py
+│   ├── __init__.py         ← 只做导出（from .api import ...）
+│   ├── api.py              ← 对外接口（ask、ask_stream、AskResult）
 │   ├── loop.py
 │   ├── state.py
 │   ├── executor.py
