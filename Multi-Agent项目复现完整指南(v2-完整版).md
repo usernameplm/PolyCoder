@@ -8525,3 +8525,2453 @@ agg demo.cast demo.gif
 
 □ 面试前一天运行一遍 demo.py，确认 API Key 没过期
 ```
+
+---
+
+# 第 15 章：阶段 15 —— 多模态 RAG（PDF + 图片知识库）
+
+## 15.1 为什么需要多模态 RAG
+
+第 9 章（附录 G.1.4）实现了一个基础 RAG 工具，只能读取 `.txt` 和 `.md` 纯文本文档。
+现实中的知识库文档往往更复杂：
+
+| 文档类型 | 挑战 |
+|---|---|
+| 带图表的 PDF | 文字可以提取，但图表的数据只存在于图片里 |
+| 产品截图 | 界面上的文字和布局信息都在图片里 |
+| 技术架构图 | 组件关系只能从视觉理解，文字描述不完整 |
+| 纯图片文件 | 没有文字可以提取 |
+
+**解决思路：用视觉 LLM "读懂" 图片，把理解后的文字存入知识库。**
+
+处理流程如下：
+
+```
+知识库目录
+├── manual.pdf     → 提取文字 + 图片 → 图片发给视觉 LLM → 合并为文本块
+├── screenshot.png → 发给视觉 LLM 描述 → 得到文本块
+└── policy.md      → 直接读取文字
+         ↓ 统一变成 DocumentChunk（文本）
+         ↓ TF-IDF 建索引
+         ↓ 用户查询 → 检索相关块 → 返回给 LLM 作为上下文
+```
+
+---
+
+## 15.2 本章新增内容
+
+```
+新增文件：
+tools/
+├── registry.py                   ← 工具注册表（本章需要）
+├── knowledge_base.py             ← 多模态 RAG 工具（替换 G.1.4 的版本）
+└── document_loaders/
+    ├── __init__.py
+    ├── base.py                   ← DocumentChunk 数据结构
+    ├── vision.py                 ← 调用视觉 LLM 生成图片描述
+    ├── text_loader.py            ← 加载 .txt / .md
+    ├── pdf_loader.py             ← 加载 PDF（文字 + 图片）
+    └── image_loader.py           ← 加载独立图片
+
+修改文件：
+providers/types.py                ← 新增 ImageBlock 类型
+providers/anthropic.py            ← _to_sdk_messages() 支持 ImageBlock
+pyproject.toml                    ← 新增 pymupdf、pillow 依赖
+```
+
+---
+
+## 15.3 核心概念讲解
+
+### 15.3.1 什么是多模态 LLM
+
+传统 LLM 只接受文本输入。**多模态 LLM**（如 Claude claude-sonnet-4-6、GPT-4o）还能接受图片。
+调用时，消息内容里可以同时包含文字和图片：
+
+```python
+# 普通文本消息（第 1 章就是这种）
+{"role": "user", "content": [{"type": "text", "text": "你好"}]}
+
+# 多模态消息（本章新增）
+{"role": "user", "content": [
+    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}},
+    {"type": "text", "text": "请描述这张图片"},
+]}
+```
+
+Anthropic SDK 原生支持这种格式，我们只需要在 `providers/types.py` 加一个 `ImageBlock` 类型，
+然后在 `providers/anthropic.py` 里告诉适配器如何把它转成 SDK 所需的字典即可。
+
+### 15.3.2 PDF 里有什么
+
+一个 PDF 文件在底层包含三类内容：
+1. **文字流**：可以直接提取成字符串
+2. **图片对象**：以 JPEG/PNG 格式嵌入，提取后是二进制数据
+3. **矢量图形**：折线、方块等，本章暂不处理
+
+`pymupdf`（Python 中 `import fitz`）是处理 PDF 最常用的库，能同时提取文字和图片二进制数据。
+
+### 15.3.3 整体分层设计
+
+本章采用"加载器 + 工具"两层设计：
+
+```
+Layer 1：document_loaders/（负责"读懂"各种格式的文件）
+  TextLoader  → list[DocumentChunk]
+  PDFLoader   → list[DocumentChunk]（异步：并发调用视觉 LLM）
+  ImageLoader → list[DocumentChunk]（异步：调用视觉 LLM）
+
+Layer 2：knowledge_base.py（负责索引、检索）
+  KnowledgeBaseTool.ensure_loaded()  → 扫描目录，调用对应加载器
+  KnowledgeBaseTool.execute()        → TF-IDF 检索，返回 top-k 结果
+```
+
+这样做的好处：以后想支持新格式（如 Word、Excel），只需新增一个 Loader，不需要动检索逻辑。
+
+---
+
+## 15.4 安装新依赖
+
+在项目根目录运行：
+
+```bash
+# 激活虚拟环境（确保提示符前有 (.venv)）
+uv add pymupdf pillow
+```
+
+`pyproject.toml` 会自动更新，加入：
+```toml
+"pymupdf>=1.24.0",
+"pillow>=10.0.0",
+```
+
+验证安装：
+```bash
+python -c "import fitz; import PIL; print('依赖安装成功')"
+# 预期输出：依赖安装成功
+```
+
+---
+
+## 15.5 扩展消息格式 `providers/types.py`
+
+在现有 `providers/types.py` 的 `ToolResultBlock` 类之后，添加 `ImageBlock` 类，
+然后更新 `ContentBlock` 联合类型：
+
+```python
+# providers/types.py（在 ToolResultBlock 定义之后添加这个新类）
+
+class ImageBlock(BaseModel):
+    """
+    图片内容块——把图片以 base64 格式传给多模态 LLM。
+
+    使用场景：
+      1. 文档加载时：把 PDF 里的图片 / 独立图片文件传给 LLM 生成描述
+      2. 直接对话时：如果将来需要让用户上传图片提问
+
+    media_type 支持的值：
+      "image/jpeg"  最常见，文件大小小
+      "image/png"   截图常用，支持透明度
+      "image/webp"  现代格式，比 JPEG 小
+      "image/gif"   动图（只取第一帧）
+    """
+    type: Literal["image"] = "image"
+    source_type: Literal["base64"] = "base64"
+    media_type: str   # 图片的 MIME 类型
+    data: str         # base64 编码的图片，不包含 "data:image/jpeg;base64," 前缀
+
+
+# 修改这一行，在原来的 Union 里加入 ImageBlock：
+# 原来是：ContentBlock = Union[TextBlock, ToolUseBlock, ToolResultBlock]
+# 改为：
+ContentBlock = Union[TextBlock, ToolUseBlock, ToolResultBlock, ImageBlock]
+```
+
+---
+
+## 15.6 更新 Anthropic 适配器支持图片 `providers/anthropic.py`
+
+打开 `providers/anthropic.py`，做两处修改：
+
+**修改 1：顶部导入加入 ImageBlock（约第 11-15 行）**
+
+```python
+# 原来：
+from .types import (
+    Message, ToolDefinition, ProviderResponse,
+    StreamChunk, TextBlock, ToolUseBlock, Usage,
+    TextDelta, MessageStart, MessageStop,
+)
+
+# 改为（加入 ImageBlock）：
+from .types import (
+    Message, ToolDefinition, ProviderResponse,
+    StreamChunk, TextBlock, ToolUseBlock, ImageBlock, Usage,
+    TextDelta, MessageStart, MessageStop,
+)
+```
+
+**修改 2：`_to_sdk_messages()` 方法里，在 `else: # TextBlock` 之前加入 ImageBlock 处理**
+
+找到下面这段（约第 40-56 行），在 `else:` 之前插入 ImageBlock 的处理分支：
+
+```python
+            for block in msg.content:
+                if isinstance(block, ToolUseBlock):
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    })
+                elif hasattr(block, "tool_use_id"):  # ToolResultBlock
+                    blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.tool_use_id,
+                        "content": block.content,
+                        "is_error": block.is_error,
+                    })
+                elif isinstance(block, ImageBlock):          # ← 新增这一段
+                    blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": block.media_type,
+                            "data": block.data,
+                        },
+                    })
+                else:  # TextBlock
+                    blocks.append({"type": "text", "text": block.text})
+```
+
+---
+
+## 15.7 文档加载器层
+
+先创建目录：
+
+```bash
+mkdir tools/document_loaders
+```
+
+---
+
+### 15.7.1 通用数据结构 `tools/document_loaders/base.py`
+
+```python
+# tools/document_loaders/base.py
+"""
+DocumentChunk：从文档中提取的一个内容块。
+
+无论原始文件是 .txt、.pdf 还是 .png，
+最终都会被加载器转换成若干个 DocumentChunk。
+知识库只和 DocumentChunk 打交道，不关心原始格式。
+"""
+from dataclasses import dataclass, field
+
+
+@dataclass
+class DocumentChunk:
+    """一个可供检索的文本块。"""
+
+    source: str
+    """原始文件路径，如 'knowledge_base/manual.pdf'。"""
+
+    title: str
+    """文档标题，通常取文件名（去掉扩展名）。"""
+
+    text: str
+    """文本内容。
+    - 纯文本文件：直接是文件内容
+    - PDF：文字内容 + 图片描述（拼接在一起）
+    - 图片文件：视觉 LLM 生成的描述文字
+    TF-IDF 就是基于这个字段做检索的。"""
+
+    image_count: int = 0
+    """原始文档中包含的图片数量（纯文本为 0）。"""
+
+    page_count: int = 0
+    """文档页数（PDF 才有意义，其他为 0）。"""
+```
+
+---
+
+### 15.7.2 视觉描述函数 `tools/document_loaders/vision.py`
+
+```python
+# tools/document_loaders/vision.py
+"""
+调用视觉 LLM，为图片生成文字描述。
+
+这个函数是多模态 RAG 的核心：
+它把图片"翻译"成文字，让纯文本的 TF-IDF 引擎也能理解图片内容。
+"""
+
+import base64
+from providers.types import Message, TextBlock, ImageBlock
+from providers.router import get_provider
+
+
+_CAPTION_SYSTEM = "你是一个文档图片分析专家，擅长从各种图片中提取关键信息。"
+
+_CAPTION_PROMPT = """请用中文详细描述这张图片中的所有重要信息：
+
+- 如果是数据图表（折线图、柱状图、饼图等）：说明图表类型、坐标轴含义、主要数据点和趋势
+- 如果是流程图或架构图：说明各模块的名称、相互关系、数据流向
+- 如果是截图或界面：说明界面名称、主要功能区域、关键文字信息
+- 如果是照片或示意图：说明主要内容、包含的文字
+
+输出纯文字，不要使用 Markdown 格式，不要加标题，直接描述内容。
+尽量详细，这些描述将用于知识库检索。"""
+
+
+def _guess_media_type(suffix: str) -> str:
+    """根据文件扩展名猜测 MIME 类型。"""
+    mapping = {
+        ".jpg":  "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png":  "image/png",
+        ".webp": "image/webp",
+        ".gif":  "image/gif",
+    }
+    return mapping.get(suffix.lower(), "image/jpeg")
+
+
+async def caption_image(image_bytes: bytes, media_type: str = "image/jpeg") -> str:
+    """
+    把图片发给视觉 LLM，返回文字描述。
+
+    参数：
+        image_bytes  图片的原始二进制数据
+        media_type   图片的 MIME 类型
+
+    返回：
+        中文文字描述（出错时返回空字符串）
+
+    工作原理：
+        1. 把二进制图片数据用 base64 编码，变成文字字符串
+        2. 构造一条包含图片块和文字指令的消息
+        3. 发给 LLM，等待描述文字
+    """
+    if not image_bytes:
+        return ""
+
+    provider = get_provider()
+    b64_data = base64.b64encode(image_bytes).decode("utf-8")
+
+    messages = [
+        Message(
+            role="user",
+            content=[
+                ImageBlock(
+                    source_type="base64",
+                    media_type=media_type,
+                    data=b64_data,
+                ),
+                TextBlock(text=_CAPTION_PROMPT),
+            ],
+        )
+    ]
+
+    try:
+        response = await provider.chat(
+            messages=messages,
+            system=_CAPTION_SYSTEM,
+            max_tokens=512,
+        )
+        for block in response.content:
+            if isinstance(block, TextBlock):
+                return block.text.strip()
+    except Exception as e:
+        print(f"  [Vision] 图片描述失败：{e}")
+
+    return ""
+```
+
+---
+
+### 15.7.3 纯文本加载器 `tools/document_loaders/text_loader.py`
+
+```python
+# tools/document_loaders/text_loader.py
+"""加载 .txt 和 .md 纯文本文件。"""
+
+from pathlib import Path
+from .base import DocumentChunk
+
+
+class TextLoader:
+
+    SUPPORTED_EXTENSIONS = {".txt", ".md"}
+
+    def load(self, path: Path) -> list[DocumentChunk]:
+        """
+        加载单个文本文件。
+
+        返回包含一个 DocumentChunk 的列表。
+        如果文件无法读取，返回空列表（不抛异常，让知识库跳过这个文件）。
+        """
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"  [TextLoader] 无法读取 {path}: {e}")
+            return []
+
+        if not content.strip():
+            return []
+
+        return [
+            DocumentChunk(
+                source=str(path),
+                title=path.stem.replace("_", " ").replace("-", " "),
+                text=content,
+                image_count=0,
+                page_count=0,
+            )
+        ]
+```
+
+---
+
+### 15.7.4 PDF 加载器 `tools/document_loaders/pdf_loader.py`
+
+这是本章最复杂的部分，详细注释每一步：
+
+```python
+# tools/document_loaders/pdf_loader.py
+"""
+PDF 文档加载器。
+
+处理流程（每个 PDF 生成一个 DocumentChunk）：
+1. 用 pymupdf (fitz) 打开 PDF
+2. 逐页提取文字，拼接成完整文本
+3. 逐页提取图片，对每张图片调用 vision.caption_image()
+4. 把图片描述以「图片N描述」格式拼接到文本末尾
+5. 返回一个包含所有内容的 DocumentChunk
+"""
+
+import asyncio
+from pathlib import Path
+
+try:
+    import fitz  # pymupdf 安装后用 import fitz
+    HAS_PYMUPDF = True
+except ImportError:
+    HAS_PYMUPDF = False
+
+from .base import DocumentChunk
+from .vision import caption_image, _guess_media_type
+
+
+class PDFLoader:
+
+    SUPPORTED_EXTENSIONS = {".pdf"}
+
+    # 单个 PDF 最多处理的图片数量（防止超大 PDF 消耗太多 API 调用）
+    MAX_IMAGES = 20
+
+    # 忽略小于此大小的图片（字节）——通常是装饰性小图标
+    MIN_IMAGE_BYTES = 5000
+
+    async def load(self, path: Path) -> list[DocumentChunk]:
+        """
+        异步加载单个 PDF 文件。
+
+        这是 async 方法，因为图片描述需要调用 LLM（网络请求）。
+        多张图片通过 asyncio.gather() 并发处理，不会串行等待。
+        """
+        if not HAS_PYMUPDF:
+            print("  [PDFLoader] 未安装 pymupdf，跳过 PDF。运行：uv add pymupdf")
+            return []
+
+        try:
+            doc = fitz.open(str(path))
+        except Exception as e:
+            print(f"  [PDFLoader] 无法打开 {path}: {e}")
+            return []
+
+        all_text_parts: list[str] = []
+        all_images: list[tuple[bytes, str]] = []  # (图片二进制, media_type)
+
+        # 遍历每一页
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+
+            # 步骤 1：提取当前页的文字
+            page_text = page.get_text("text").strip()
+            if page_text:
+                all_text_parts.append(f"[第{page_num + 1}页]\n{page_text}")
+
+            # 步骤 2：提取当前页的图片（如果还没超上限）
+            if len(all_images) < self.MAX_IMAGES:
+                for img_info in page.get_images(full=True):
+                    xref = img_info[0]  # 图片的 xref 编号（PDF 内部 ID）
+                    try:
+                        img_data = doc.extract_image(xref)
+                        # img_data 是字典，包含 "image"（二进制）和 "ext"（扩展名）
+                        img_bytes = img_data["image"]
+                        img_ext = "." + img_data.get("ext", "jpg").lower()
+                        media_type = _guess_media_type(img_ext)
+
+                        # 过滤掉太小的图片
+                        if len(img_bytes) < self.MIN_IMAGE_BYTES:
+                            continue
+
+                        all_images.append((img_bytes, media_type))
+
+                        if len(all_images) >= self.MAX_IMAGES:
+                            break
+                    except Exception:
+                        continue
+
+        page_count = len(doc)
+        doc.close()
+
+        # 步骤 3：并发调用视觉 LLM 描述所有图片
+        image_count = len(all_images)
+        if all_images:
+            print(f"  [PDFLoader] {path.name}：正在描述 {image_count} 张图片（并发）...")
+            # asyncio.gather 同时发起所有视觉请求，比串行快很多
+            captions = await asyncio.gather(*[
+                caption_image(img_bytes, mt)
+                for img_bytes, mt in all_images
+            ])
+
+            # 把描述追加到文本内容
+            for i, caption in enumerate(captions, 1):
+                if caption:
+                    all_text_parts.append(f"【图片{i}描述】: {caption}")
+
+        # 合并所有内容
+        full_text = "\n\n".join(all_text_parts).strip()
+        if not full_text:
+            return []
+
+        return [
+            DocumentChunk(
+                source=str(path),
+                title=path.stem.replace("_", " ").replace("-", " "),
+                text=full_text,
+                image_count=image_count,
+                page_count=page_count,
+            )
+        ]
+```
+
+---
+
+### 15.7.5 图片加载器 `tools/document_loaders/image_loader.py`
+
+```python
+# tools/document_loaders/image_loader.py
+"""加载独立图片文件（.jpg, .png, .webp 等）。"""
+
+from pathlib import Path
+
+try:
+    from PIL import Image
+    import io
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+from .base import DocumentChunk
+from .vision import caption_image
+
+
+class ImageLoader:
+
+    SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+    async def load(self, path: Path) -> list[DocumentChunk]:
+        """
+        异步加载单个图片文件。
+
+        处理步骤：
+        1. 用 PIL 打开图片，确认格式可读
+        2. 统一转为 JPEG（减小 base64 体积，降低 token 消耗）
+        3. 调用视觉 LLM 生成描述
+        4. 返回以描述文字为内容的 DocumentChunk
+        """
+        if not HAS_PIL:
+            print("  [ImageLoader] 未安装 pillow，跳过图片。运行：uv add pillow")
+            return []
+
+        try:
+            img = Image.open(path)
+
+            # 统一转成 RGB + JPEG 格式
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            img_bytes = buf.getvalue()
+
+        except Exception as e:
+            print(f"  [ImageLoader] 无法读取图片 {path}: {e}")
+            return []
+
+        print(f"  [ImageLoader] 正在描述图片 {path.name}...")
+        caption = await caption_image(img_bytes, "image/jpeg")
+
+        if not caption:
+            return []
+
+        return [
+            DocumentChunk(
+                source=str(path),
+                title=path.stem.replace("_", " ").replace("-", " "),
+                text=f"【图片文件描述】\n{caption}",
+                image_count=1,
+                page_count=0,
+            )
+        ]
+```
+
+创建空的 `__init__.py`：
+
+```bash
+type nul > tools\document_loaders\__init__.py   # Windows
+# 或
+touch tools/document_loaders/__init__.py          # macOS/Linux
+```
+
+---
+
+## 15.8 工具注册表 `tools/registry.py`
+
+工具注册表是一个"工具名 → 工具实例"的映射表。
+`ToolExecutor`（第 4 章）要求注册表提供 `.get(name)` 和 `.list_names()` 方法。
+
+```python
+# tools/registry.py
+"""
+工具注册表：管理所有可用工具。
+
+为什么需要注册表：
+- ToolExecutor 接到 LLM 返回的工具调用（只有工具名字符串），
+  需要通过名字找到对应的工具实例来执行
+- 注册表统一管理，避免散落在各处的工具实例难以维护
+- default() 方法提供一键注册所有内置工具的快捷方式
+"""
+
+from tools.base import BaseTool
+from providers.types import ToolDefinition
+
+
+class ToolRegistry:
+
+    def __init__(self):
+        self._tools: dict[str, BaseTool] = {}
+
+    def register(self, tool: BaseTool) -> None:
+        """注册一个工具。工具名重复时会覆盖旧的。"""
+        self._tools[tool.name] = tool
+        print(f"  [Registry] 注册工具：{tool.name}")
+
+    def get(self, name: str) -> BaseTool | None:
+        """按名字查找工具，找不到返回 None。"""
+        return self._tools.get(name)
+
+    def list_names(self) -> list[str]:
+        """列出所有已注册的工具名。"""
+        return list(self._tools.keys())
+
+    def all_definitions(self) -> list[ToolDefinition]:
+        """返回所有工具的定义（发给 LLM 用）。"""
+        return [tool.definition for tool in self._tools.values()]
+
+    @classmethod
+    def default(cls, kb_dir: str = "knowledge_base") -> "ToolRegistry":
+        """
+        创建并返回一个已注册常用工具的注册表。
+
+        这是启动 Agent 时最常用的入口：
+            registry = ToolRegistry.default()
+            executor = ToolExecutor(registry)
+        """
+        registry = cls()
+
+        from tools.knowledge_base import KnowledgeBaseTool
+        kb_tool = KnowledgeBaseTool(kb_dir=kb_dir)
+        registry.register(kb_tool)
+
+        return registry
+```
+
+---
+
+## 15.9 多模态知识库工具 `tools/knowledge_base.py`
+
+```python
+# tools/knowledge_base.py
+"""
+多模态本地知识库检索工具。
+
+支持三种文件格式：
+  .txt / .md  → TextLoader（直接读取文字）
+  .pdf        → PDFLoader（提取文字 + 并发调用视觉 LLM 描述图片）
+  .jpg .png 等 → ImageLoader（调用视觉 LLM 描述整张图片）
+
+检索算法：TF-IDF（无需向量数据库，零额外依赖）。
+"""
+
+import re
+import math
+import asyncio
+import json
+from pathlib import Path
+from collections import Counter
+
+from tools.base import BaseTool
+from tools.document_loaders.base import DocumentChunk
+from tools.document_loaders.text_loader import TextLoader
+from tools.document_loaders.pdf_loader import PDFLoader
+from tools.document_loaders.image_loader import ImageLoader
+from providers.types import ToolDefinition
+
+
+# ── TF-IDF 检索算法 ────────────────────────────────────────────────────────────
+
+def _tokenize(text: str) -> list[str]:
+    """简单分词：英文按单词切分，中文按字切分。"""
+    en_tokens = re.findall(r"[a-zA-Z]+", text.lower())
+    zh_tokens = re.findall(r"[一-鿿]", text)
+    return en_tokens + zh_tokens
+
+
+def _tfidf_score(query: str, doc_text: str, all_doc_texts: list[str]) -> float:
+    """
+    计算查询词对某文档的 TF-IDF 相关性分数。
+
+    TF（词频）= 查询词在文档中的出现频率
+    IDF（逆文档频率）= log((文档总数 + 1) / (含该词的文档数 + 1))
+    最终分数 = 所有查询词的 TF × IDF 之和
+    """
+    query_tokens = _tokenize(query)
+    doc_tokens = _tokenize(doc_text)
+    doc_counter = Counter(doc_tokens)
+    doc_len = len(doc_tokens) or 1
+
+    score = 0.0
+    for token in query_tokens:
+        tf = doc_counter.get(token, 0) / doc_len
+        df = sum(1 for d in all_doc_texts if token in _tokenize(d))
+        idf = math.log((len(all_doc_texts) + 1) / (df + 1))
+        score += tf * idf
+
+    return score
+
+
+def _extract_best_chunk(content: str, query: str, chunk_size: int = 500) -> str:
+    """从长文本中提取最相关的段落（滑动窗口）。"""
+    query_tokens = set(_tokenize(query))
+    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+
+    if not paragraphs:
+        return content[:chunk_size]
+
+    best = max(
+        paragraphs,
+        key=lambda p: sum(1 for t in _tokenize(p) if t in query_tokens),
+        default=paragraphs[0],
+    )
+
+    if len(best) <= chunk_size:
+        return best
+    return best[:chunk_size] + "..."
+
+
+# ── 知识库工具 ─────────────────────────────────────────────────────────────────
+
+class KnowledgeBaseTool(BaseTool):
+
+    def __init__(self, kb_dir: str = "knowledge_base"):
+        self.kb_dir = Path(kb_dir)
+        self._docs: list[DocumentChunk] = []
+        self._loaded = False
+
+        self._text_loader = TextLoader()
+        self._pdf_loader = PDFLoader()
+        self._image_loader = ImageLoader()
+
+    async def ensure_loaded(self):
+        """延迟加载：第一次被调用时触发文档加载，之后直接返回。"""
+        if not self._loaded:
+            await self._load_all()
+            self._loaded = True
+
+    async def _load_all(self):
+        """扫描目录，对每个文件调用对应的加载器。"""
+        if not self.kb_dir.exists():
+            print(f"  [KnowledgeBase] 目录不存在：{self.kb_dir}")
+            return
+
+        text_paths = (
+            sorted(self.kb_dir.rglob("*.txt")) +
+            sorted(self.kb_dir.rglob("*.md"))
+        )
+        pdf_paths = sorted(self.kb_dir.rglob("*.pdf"))
+        image_paths = []
+        for ext in self._image_loader.SUPPORTED_EXTENSIONS:
+            image_paths.extend(sorted(self.kb_dir.rglob(f"*{ext}")))
+
+        total = len(text_paths) + len(pdf_paths) + len(image_paths)
+        print(f"  [KnowledgeBase] 发现 {total} 个文件"
+              f"（文本 {len(text_paths)}，PDF {len(pdf_paths)}，图片 {len(image_paths)}）")
+
+        for path in text_paths:
+            self._docs.extend(self._text_loader.load(path))
+
+        if pdf_paths:
+            pdf_results = await asyncio.gather(*[
+                self._pdf_loader.load(path) for path in pdf_paths
+            ])
+            for chunks in pdf_results:
+                self._docs.extend(chunks)
+
+        if image_paths:
+            img_results = await asyncio.gather(*[
+                self._image_loader.load(path) for path in image_paths
+            ])
+            for chunks in img_results:
+                self._docs.extend(chunks)
+
+        print(f"  [KnowledgeBase] 加载完成，共 {len(self._docs)} 个文档块")
+
+    async def reload(self):
+        """重新加载知识库（热更新，不重启服务）。"""
+        self._docs.clear()
+        self._loaded = False
+        await self.ensure_loaded()
+
+    @property
+    def name(self) -> str:
+        return "search_knowledge_base"
+
+    @property
+    def description(self) -> str:
+        count = len(self._docs)
+        return (
+            f"搜索本地知识库（已加载 {count} 个文档块，支持 PDF、图片、文本）。"
+            "当用户询问公司政策、产品信息、技术文档时优先调用此工具。"
+            "返回最相关的文档片段作为回答依据。"
+        )
+
+    @property
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索问题或关键词，越具体结果越准确",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "返回最相关的文档数量（1-5），默认 3",
+                    "default": 3,
+                    "minimum": 1,
+                    "maximum": 5,
+                },
+            },
+            "required": ["query"],
+        }
+
+    async def execute(self, inputs: dict) -> str:
+        """
+        检索知识库，返回 top_k 最相关的文档片段。
+
+        inputs 字典由 LLM 填写，包含：
+            query   搜索问题（必填）
+            top_k   返回数量（可选，默认 3）
+        """
+        await self.ensure_loaded()
+
+        query = inputs.get("query", "")
+        top_k = int(inputs.get("top_k", 3))
+
+        if not self._docs:
+            return json.dumps({
+                "error": f"知识库为空。请在 {self.kb_dir}/ 目录放置文档。"
+            }, ensure_ascii=False)
+
+        all_texts = [d.text for d in self._docs]
+
+        scored = sorted(
+            [(_tfidf_score(query, doc.text, all_texts), doc) for doc in self._docs],
+            key=lambda x: x[0],
+            reverse=True,
+        )
+
+        results = []
+        for score, doc in scored[:top_k]:
+            if score < 0.0001:
+                break
+            results.append({
+                "title": doc.title,
+                "source": doc.source,
+                "relevance": round(score, 4),
+                "content": _extract_best_chunk(doc.text, query),
+                "has_images": doc.image_count > 0,
+            })
+
+        if not results:
+            return json.dumps({
+                "found": False,
+                "message": "未找到相关内容",
+            }, ensure_ascii=False)
+
+        return json.dumps({
+            "found": True,
+            "query": query,
+            "total_docs": len(self._docs),
+            "results": results,
+        }, ensure_ascii=False, indent=2)
+```
+
+---
+
+## 15.10 准备知识库测试文档
+
+```bash
+mkdir knowledge_base
+```
+
+新建 `knowledge_base/company_policy.md`：
+
+```markdown
+# 公司退换货政策
+
+## 退货条件
+- 购买后 7 天内可无理由退货
+- 商品需保持原包装，未使用状态
+- 促销活动商品不支持退货
+
+## 换货条件
+- 商品存在质量问题可申请换货
+- 换货周期：收到退回商品后 3 个工作日内发出新品
+
+## 退款说明
+- 退款将在审核通过后 1-3 个工作日内原路返回
+- 运费由买家承担（质量问题除外）
+
+## 联系方式
+- 客服电话：400-xxx-xxxx
+- 工作时间：周一至周五 9:00-18:00
+```
+
+新建 `knowledge_base/product_faq.md`：
+
+```markdown
+# 产品常见问题
+
+## Q：支持哪些平台？
+A：支持 Windows 10+、macOS 12+、iOS 15+、Android 10+。
+
+## Q：免费版和付费版的区别？
+A：免费版每月 100 次调用额度；付费版无限调用，额外包含数据导出和 API 访问。
+
+## Q：数据安全如何保障？
+A：所有数据采用 AES-256 加密存储，符合数据安全法要求。
+
+## Q：如何升级到付费版？
+A：登录账户后进入「账户设置」→「升级套餐」，支持支付宝和微信支付。
+```
+
+---
+
+## 15.11 更新 `agent/api.py` 接入工具
+
+用以下内容替换 `agent/api.py`，让 `ask()` 带上知识库工具：
+
+```python
+# agent/api.py（完整替换）
+
+import asyncio
+from asyncio import Queue
+from dataclasses import dataclass, field
+from typing import AsyncGenerator
+
+from .loop import run_agent_loop, LoopResult
+from providers.router import get_provider
+
+
+SYSTEM_PROMPT = (
+    "你是一个智能助手，有知识库搜索能力。"
+    "当用户询问公司政策、产品信息、技术文档等内部知识时，"
+    "请先调用 search_knowledge_base 工具查询，再基于查询结果回答。"
+    "用中文回答，回答要简洁准确。"
+)
+
+
+@dataclass
+class AskResult:
+    text: str
+    input_tokens: int
+    output_tokens: int
+    turn_count: int = 1
+
+
+def _build_executor_and_tools():
+    """初始化工具注册表和执行器，返回 (executor, tool_definitions)。"""
+    from tools.registry import ToolRegistry
+    from agent.executor import ToolExecutor
+
+    registry = ToolRegistry.default()
+    executor = ToolExecutor(registry)
+    return executor, registry.all_definitions()
+
+
+async def ask(question: str) -> AskResult:
+    """非流式调用，使用 Agentic Loop + 知识库工具。"""
+    provider = get_provider()
+    executor, tools = _build_executor_and_tools()
+
+    result: LoopResult = await run_agent_loop(
+        prompt=question,
+        provider=provider,
+        system=SYSTEM_PROMPT,
+        tools=tools,
+        executor=executor,
+        max_turns=10,
+    )
+
+    return AskResult(
+        text=result.text,
+        input_tokens=result.total_usage.input_tokens,
+        output_tokens=result.total_usage.output_tokens,
+        turn_count=result.turn_count,
+    )
+
+
+async def ask_stream(question: str) -> AsyncGenerator[str, None]:
+    """流式调用。"""
+    queue: Queue[str | None] = Queue()
+
+    def on_delta(text: str):
+        queue.put_nowait(text)
+
+    async def run_loop():
+        provider = get_provider()
+        executor, tools = _build_executor_and_tools()
+        await run_agent_loop(
+            prompt=question,
+            provider=provider,
+            system=SYSTEM_PROMPT,
+            tools=tools,
+            executor=executor,
+            max_turns=10,
+            on_text_delta=on_delta,
+        )
+        queue.put_nowait(None)
+
+    loop_task = asyncio.create_task(run_loop())
+
+    while True:
+        chunk = await queue.get()
+        if chunk is None:
+            break
+        yield chunk
+
+    await loop_task
+```
+
+---
+
+## 15.12 测试：直接测试 Agent 效果
+
+### 快速验证加载
+
+新建 `test_kb_load.py`：
+
+```python
+# test_kb_load.py — 运行：python test_kb_load.py
+import asyncio
+from tools.knowledge_base import KnowledgeBaseTool
+
+async def main():
+    kb = KnowledgeBaseTool(kb_dir="knowledge_base")
+    await kb.ensure_loaded()
+    print(f"\n加载完成：{len(kb._docs)} 个文档块")
+    for doc in kb._docs:
+        print(f"  [{doc.source}]  图片数={doc.image_count}  字符数={len(doc.text)}")
+
+asyncio.run(main())
+```
+
+```bash
+python test_kb_load.py
+```
+
+预期输出：
+```
+  [KnowledgeBase] 发现 2 个文件（文本 2，PDF 0，图片 0）
+  [KnowledgeBase] 加载完成，共 2 个文档块
+
+加载完成：2 个文档块
+  [knowledge_base\company_policy.md]  图片数=0  字符数=371
+  [knowledge_base\product_faq.md]  图片数=0  字符数=288
+```
+
+### 验证检索效果
+
+```python
+# 追加到 test_kb_load.py 末尾，或新建文件运行
+
+import asyncio, json
+from tools.knowledge_base import KnowledgeBaseTool
+
+async def test_search():
+    kb = KnowledgeBaseTool(kb_dir="knowledge_base")
+
+    queries = [
+        ("退货需要几天？", "company_policy"),
+        ("支持哪些平台？",  "product_faq"),
+    ]
+
+    for query, expected_source in queries:
+        result = await kb.execute({"query": query, "top_k": 1})
+        data = json.loads(result)
+        top = data["results"][0] if data.get("found") else None
+        ok = top and expected_source in top["source"]
+        print(f"  {'✓' if ok else '✗'}  查询「{query}」→ {top['source'] if top else '无结果'}")
+
+asyncio.run(test_search())
+```
+
+### 测试 Agent 完整效果
+
+```bash
+python cli.py
+```
+
+输入问题并观察 Agent 是否调用工具：
+```
+你：我们公司的退货政策是什么？
+```
+
+预期（Agent 先调用工具，再基于结果回答）：
+```
+  [Loop] 第 1 轮，执行 1 个工具调用
+Agent：根据公司退货政策，购买后 7 天内可无理由退货，但商品需保持原包装...
+```
+
+---
+
+## 15.13 本章检查清单
+
+```
+□ 运行：python -c "import fitz; import PIL; print('OK')"  → 输出 OK
+□ 运行 test_kb_load.py，知识库正常加载，输出 2 个文档块
+□ 检索测试通过：查询「退货」返回 company_policy 文档
+□ cli.py 问退货政策，Agent 日志显示执行了 search_knowledge_base 工具
+□ （可选）在 knowledge_base/ 放一个 PDF，重跑加载，确认提取了图片描述
+□ （可选）在 knowledge_base/ 放一张 PNG 图片，确认生成了文字描述
+```
+
+---
+
+# 第 16 章：阶段 16 —— 自动化测试模块（Agent 指标收集）
+
+## 16.1 为什么要自动化测试
+
+没有自动化测试，你只能靠手动运行 `cli.py` 感受 Agent 是否正常，
+无法量化 Agent 的能力边界，也不知道修改代码后是否引入了退步。
+
+本章解决三个问题：
+
+| 问题 | 解决方案 |
+|---|---|
+| Agent 回答质量怎么衡量？ | SessionMetrics 收集延迟、token、工具调用次数等指标 |
+| RAG 检索准不准？ | 用已知文档写断言：给定问题，验证返回的是预期文档 |
+| Agent 会不会用对工具？ | 给 Agent 一个需要查知识库的问题，断言 metrics 里有工具调用记录 |
+
+---
+
+## 16.2 本章新增内容
+
+```
+新增文件：
+core/metrics.py                        ← 会话指标收集器
+tests/
+├── conftest.py                        ← pytest 配置和公共 fixtures
+├── fixtures/
+│   └── knowledge_base/
+│       ├── test_policy.md             ← 测试用知识库（内容固定，可重复测试）
+│       └── test_products.md
+├── test_metrics.py                    ← 指标单元测试（不调 LLM）
+├── test_rag.py                        ← RAG 检索质量测试（不调 LLM）
+├── test_tool_accuracy.py              ← 工具调用准确率测试（调 LLM）
+└── test_agent_e2e.py                  ← Agent 端到端集成测试（调 LLM）
+
+修改文件：
+agent/loop.py    ← 在 LLM 调用和工具执行处埋点，收集 metrics
+agent/api.py     ← AskResult 新增 metrics 字段
+pyproject.toml   ← pytest 异步配置
+```
+
+---
+
+## 16.3 核心概念讲解
+
+### 16.3.1 什么是"埋点"
+
+**埋点**（Instrumentation）是指在代码关键节点插入计时和计数代码，收集运行时数据。
+
+比如在 `run_agent_loop` 里：
+- LLM 调用前记录时间戳 `t0 = time.time()`
+- LLM 调用后算出耗时 `duration = (time.time() - t0) * 1000`
+- 把耗时记录到 `TurnRecord` 对象
+
+这样每次 Agent 运行结束后，你就得到了完整的性能数据。
+
+### 16.3.2 测试分层
+
+本章的测试分两层：
+
+```
+第一层：不需要调用 LLM（快速，可以在没有 API Key 时运行）
+  test_metrics.py  → 验证 SessionMetrics 的计算逻辑
+  test_rag.py      → 验证 TF-IDF 检索算法是否返回正确文档
+
+第二层：需要调用 LLM（较慢，需要 .env 里配置了 API Key）
+  test_tool_accuracy.py → 验证 Agent 对需要查知识库的问题会调用工具
+  test_agent_e2e.py     → 验证完整流程：提问 → 工具 → 回答
+```
+
+**运行建议：**
+- 日常开发：只跑第一层（`pytest tests/test_metrics.py tests/test_rag.py`），秒级完成
+- 提交代码前：跑全部（`pytest tests/`），确保没有退步
+
+---
+
+## 16.4 会话指标收集器 `core/metrics.py`
+
+```python
+# core/metrics.py
+"""
+轻量指标收集器。
+
+在 Agentic Loop 的关键节点埋点，运行结束后打印统计数字。
+这些数字可以用于：
+  1. 量化 Agent 的性能（延迟、费用）
+  2. 写自动化测试的断言（如：工具调用了几次？Token 消耗合理吗？）
+  3. 填简历时的量化成果
+"""
+
+import time
+from dataclasses import dataclass, field
+
+
+@dataclass
+class TurnRecord:
+    """一轮 LLM 调用的记录（一轮 = LLM 从接收消息到返回响应）。"""
+
+    turn_index: int
+    """第几轮（从 0 开始）"""
+
+    duration_ms: float
+    """LLM 调用耗时（毫秒）。
+    从发出请求到收到完整响应。"""
+
+    input_tokens: int
+    """本轮输入的 token 数（包含历史消息、system prompt、工具定义）。"""
+
+    output_tokens: int
+    """本轮 LLM 输出的 token 数。"""
+
+    cache_read_tokens: int
+    """从 Prompt Cache 命中读取的 token 数（Anthropic 专属）。
+    命中缓存的 token 只收约 10% 的费用，可以大幅降低成本。"""
+
+    cache_write_tokens: int
+    """写入 Prompt Cache 的 token 数。"""
+
+    tool_calls: list[str]
+    """本轮发起的工具调用名称列表，如 ['search_knowledge_base']。"""
+
+    stop_reason: str
+    """LLM 停止的原因：
+    'end_turn'  → 正常完成，不再需要工具
+    'tool_use'  → 需要执行工具，Loop 继续
+    'max_tokens' → 达到 token 上限，回答被截断（通常是问题）
+    """
+
+
+@dataclass
+class ToolRecord:
+    """一次工具调用的记录。"""
+
+    tool_name: str
+    """工具名称，如 'search_knowledge_base'。"""
+
+    duration_ms: float
+    """工具执行耗时（毫秒）。"""
+
+    success: bool
+    """工具是否执行成功。"""
+
+    error: str = ""
+    """如果失败，这里存错误信息。"""
+
+
+@dataclass
+class SessionMetrics:
+    """一次完整 Agent 会话的指标汇总。"""
+
+    session_id: str
+    """会话 ID，用于追踪和日志关联。"""
+
+    question: str
+    """用户的原始问题。"""
+
+    turns: list[TurnRecord] = field(default_factory=list)
+    """所有轮次的 LLM 调用记录。"""
+
+    tool_records: list[ToolRecord] = field(default_factory=list)
+    """所有工具调用记录（跨所有轮次）。"""
+
+    _start_time: float = field(default_factory=time.time, repr=False)
+    """会话开始时间戳，用于计算端到端延迟。"""
+
+    # ── 聚合属性（自动从 turns 和 tool_records 计算）────────────────────────
+
+    @property
+    def total_duration_ms(self) -> float:
+        """会话总耗时（毫秒），从创建 SessionMetrics 到调用此属性。"""
+        return (time.time() - self._start_time) * 1000
+
+    @property
+    def total_input_tokens(self) -> int:
+        """所有轮次的输入 token 总数。"""
+        return sum(t.input_tokens for t in self.turns)
+
+    @property
+    def total_output_tokens(self) -> int:
+        """所有轮次的输出 token 总数。"""
+        return sum(t.output_tokens for t in self.turns)
+
+    @property
+    def total_cache_read_tokens(self) -> int:
+        """从缓存命中的 token 总数。"""
+        return sum(t.cache_read_tokens for t in self.turns)
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Prompt Cache 命中率（命中 token / 总输入 token）。
+        0.0 表示完全没有命中，1.0 表示全部命中（不可能发生）。"""
+        total = self.total_input_tokens
+        if total == 0:
+            return 0.0
+        return self.total_cache_read_tokens / total
+
+    @property
+    def avg_llm_latency_ms(self) -> float:
+        """平均每轮 LLM 调用耗时（毫秒）。"""
+        if not self.turns:
+            return 0.0
+        return sum(t.duration_ms for t in self.turns) / len(self.turns)
+
+    @property
+    def total_tool_calls(self) -> int:
+        """工具被调用的总次数（跨所有轮次）。"""
+        return len(self.tool_records)
+
+    @property
+    def avg_tool_latency_ms(self) -> float:
+        """平均工具执行耗时（毫秒）。"""
+        if not self.tool_records:
+            return 0.0
+        return sum(t.duration_ms for t in self.tool_records) / len(self.tool_records)
+
+    @property
+    def tool_names_called(self) -> list[str]:
+        """按调用顺序列出所有被调用的工具名（含重复）。"""
+        return [r.tool_name for r in self.tool_records]
+
+    @property
+    def estimated_cost_usd(self) -> float:
+        """
+        按 Claude claude-sonnet-4-6 定价估算费用（USD）。
+
+        定价（每百万 token）：
+          输入  $3.00
+          缓存命中 $0.30（约 10%）
+          输出  $15.00
+
+        注意：这是估算值，实际价格以 Anthropic 官网为准。
+        """
+        normal_input = self.total_input_tokens - self.total_cache_read_tokens
+        cache_read = self.total_cache_read_tokens
+
+        return (
+            normal_input * 3.0 / 1_000_000
+            + cache_read * 0.3 / 1_000_000
+            + self.total_output_tokens * 15.0 / 1_000_000
+        )
+
+    # ── 报告输出 ─────────────────────────────────────────────────────────────
+
+    def print_report(self):
+        """打印可截图的统计报告。运行结束后调用。"""
+        divider = "─" * 52
+        print(f"\n{divider}")
+        print(f"  会话统计报告")
+        print(f"{divider}")
+        print(f"  问题：{self.question[:40]}{'...' if len(self.question) > 40 else ''}")
+        print(f"  会话 ID：{self.session_id}")
+        print(divider)
+        print(f"  LLM 调用轮次   : {len(self.turns)} 轮")
+        print(f"  平均 LLM 延迟  : {self.avg_llm_latency_ms:.0f} ms")
+        print(f"  总端到端延迟   : {self.total_duration_ms:.0f} ms")
+        print(divider)
+        print(f"  总输入 Token   : {self.total_input_tokens:,}")
+        print(f"  总输出 Token   : {self.total_output_tokens:,}")
+        if self.total_cache_read_tokens > 0:
+            print(f"  缓存命中 Token : {self.total_cache_read_tokens:,}"
+                  f"  ({self.cache_hit_rate:.0%})")
+        print(f"  估算费用       : ${self.estimated_cost_usd:.5f} USD")
+        print(divider)
+        if self.tool_records:
+            print(f"  工具调用次数   : {self.total_tool_calls} 次")
+            print(f"  平均工具延迟   : {self.avg_tool_latency_ms:.0f} ms")
+            for rec in self.tool_records:
+                status = "✓" if rec.success else "✗"
+                print(f"    {status} {rec.tool_name}  ({rec.duration_ms:.0f} ms)")
+        print(divider)
+
+    def to_dict(self) -> dict:
+        """转成字典，方便写入日志或 JSON 文件。"""
+        return {
+            "session_id": self.session_id,
+            "question": self.question,
+            "total_turns": len(self.turns),
+            "total_tool_calls": self.total_tool_calls,
+            "tool_names": self.tool_names_called,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "cache_hit_rate": round(self.cache_hit_rate, 3),
+            "avg_llm_latency_ms": round(self.avg_llm_latency_ms, 1),
+            "total_duration_ms": round(self.total_duration_ms, 1),
+            "estimated_cost_usd": round(self.estimated_cost_usd, 6),
+        }
+```
+
+---
+
+## 16.5 在 Agentic Loop 中埋点 `agent/loop.py`
+
+在现有 `agent/loop.py` 的基础上添加 metrics 收集。
+这里给出完整的替换版本，便于直接对比：
+
+**修改点 1：顶部添加导入**
+
+在文件顶部的 `import` 区域，加入：
+
+```python
+import time
+import uuid
+from core.metrics import SessionMetrics, TurnRecord, ToolRecord
+```
+
+**修改点 2：LoopResult 新增 metrics 字段**
+
+找到 `@dataclass class LoopResult`，在最后加一个字段：
+
+```python
+@dataclass
+class LoopResult:
+    """Agentic Loop 的最终结果。"""
+    text: str
+    total_usage: Usage
+    turn_count: int
+    stop_reason: str
+    metrics: SessionMetrics | None = None     # ← 新增
+```
+
+**修改点 3：`run_agent_loop` 函数签名新增参数**
+
+```python
+async def run_agent_loop(
+    prompt: str,
+    provider: BaseProvider,
+    system: str = "",
+    tools: list[ToolDefinition] | None = None,
+    executor: ToolExecutor | None = None,
+    max_turns: int = 10,
+    max_tokens: int = 4096,
+    on_text_delta: Callable[[str], None] | None = None,
+    session_id: str | None = None,           # ← 新增
+) -> LoopResult:
+```
+
+**修改点 4：函数体开头初始化 metrics**
+
+在 `initial_messages = [...]` 之后，`state = LoopState(...)` 之前，加入：
+
+```python
+    # 初始化 metrics 收集器
+    _metrics = SessionMetrics(
+        session_id=session_id or str(uuid.uuid4())[:8],
+        question=prompt,
+    )
+```
+
+**修改点 5：LLM 调用处加计时**
+
+找到非流式分支里的 `response = await provider.chat(...)` 这一块，
+改成：
+
+```python
+        else:
+            # 非流式模式：等待完整响应
+            _t_llm = time.time()
+            response = await provider.chat(
+                messages=list(state.messages),
+                system=system,
+                tools=tools or None,
+                max_tokens=max_tokens,
+            )
+            _llm_duration_ms = (time.time() - _t_llm) * 1000
+
+            for block in response.content:
+                if isinstance(block, TextBlock):
+                    text_chunks.append(block.text)
+                elif isinstance(block, ToolUseBlock):
+                    tool_calls.append(block)
+
+            turn_usage = response.usage
+
+            # 记录本轮 LLM 调用
+            _metrics.turns.append(TurnRecord(
+                turn_index=state.turn_count,
+                duration_ms=_llm_duration_ms,
+                input_tokens=turn_usage.input_tokens,
+                output_tokens=turn_usage.output_tokens,
+                cache_read_tokens=turn_usage.cache_read_tokens,
+                cache_write_tokens=turn_usage.cache_write_tokens,
+                tool_calls=[b.name for b in tool_calls],
+                stop_reason=response.stop_reason or "end_turn",
+            ))
+```
+
+**修改点 6：工具执行处加计时**
+
+找到 `tool_results = await executor.execute_all(tool_calls)` 附近，
+把执行过程改成逐个计时：
+
+```python
+        print(f"  [Loop] 第 {state.turn_count} 轮，执行 {len(tool_calls)} 个工具调用")
+
+        # 逐个执行工具并记录耗时（并发执行，各自计时）
+        import asyncio as _asyncio
+
+        async def _timed_execute(tc):
+            t0 = time.time()
+            result_block = (await executor.execute_all([tc]))[0]
+            elapsed = (time.time() - t0) * 1000
+            _metrics.tool_records.append(ToolRecord(
+                tool_name=tc.name,
+                duration_ms=elapsed,
+                success=not result_block.is_error,
+                error="" if not result_block.is_error else result_block.content[:200],
+            ))
+            return result_block
+
+        tool_results = list(await _asyncio.gather(*[_timed_execute(tc) for tc in tool_calls]))
+```
+
+**修改点 7：所有 return LoopResult(...) 处加入 metrics**
+
+共有三处 `return LoopResult(...)`，每处都在末尾加 `metrics=_metrics`：
+
+```python
+        # 轮次限制
+        return LoopResult(
+            text=f"（已达最大轮次限制 {max_turns}，任务可能未完成）",
+            total_usage=state.total_usage,
+            turn_count=state.turn_count,
+            stop_reason=STOP_MAX_TURNS,
+            metrics=_metrics,      # ← 加这一行
+        )
+
+        # 正常完成
+        return LoopResult(
+            text="".join(text_chunks),
+            total_usage=state.total_usage,
+            turn_count=state.turn_count,
+            stop_reason=STOP_COMPLETED,
+            metrics=_metrics,      # ← 加这一行
+        )
+
+        # 无 executor 错误
+        return LoopResult(
+            text="（错误：Agent 决定使用工具，但未配置 ToolExecutor）",
+            total_usage=state.total_usage,
+            turn_count=state.turn_count,
+            stop_reason=STOP_ABORTED,
+            metrics=_metrics,      # ← 加这一行
+        )
+```
+
+---
+
+## 16.6 更新 `agent/api.py` 暴露指标
+
+在上一章修改后的 `agent/api.py` 基础上，给 `AskResult` 加入 metrics 字段：
+
+```python
+# agent/api.py — 修改 AskResult dataclass
+
+from core.metrics import SessionMetrics   # ← 新增导入
+
+@dataclass
+class AskResult:
+    text: str
+    input_tokens: int
+    output_tokens: int
+    turn_count: int = 1
+    metrics: SessionMetrics | None = None  # ← 新增字段
+
+
+# ask() 函数里，创建 AskResult 时传入 metrics：
+async def ask(question: str) -> AskResult:
+    provider = get_provider()
+    executor, tools = _build_executor_and_tools()
+
+    result: LoopResult = await run_agent_loop(
+        prompt=question,
+        provider=provider,
+        system=SYSTEM_PROMPT,
+        tools=tools,
+        executor=executor,
+        max_turns=10,
+    )
+
+    return AskResult(
+        text=result.text,
+        input_tokens=result.total_usage.input_tokens,
+        output_tokens=result.total_usage.output_tokens,
+        turn_count=result.turn_count,
+        metrics=result.metrics,    # ← 新增这一行
+    )
+```
+
+---
+
+## 16.7 测试夹具
+
+### 测试用知识库文档
+
+创建目录：
+
+```bash
+mkdir -p tests/fixtures/knowledge_base
+```
+
+新建 `tests/fixtures/knowledge_base/test_policy.md`：
+
+```markdown
+# PolyCoder 测试退货政策
+
+## 退货条件
+购买后 30 天内可无理由退货。
+退货商品需保持全新状态，包装完好。
+数字商品和定制商品不支持退货。
+
+## 退款流程
+申请退货后，仓库收到商品 48 小时内处理退款。
+退款金额原路退回，不收取手续费。
+
+## 联系退货客服
+退货专线：010-12345678
+工作时间：周一到周五 9:00-17:00
+```
+
+新建 `tests/fixtures/knowledge_base/test_products.md`：
+
+```markdown
+# PolyCoder 产品规格
+
+## ProCoder X1 型号
+- CPU：8 核处理器
+- 内存：16GB DDR5
+- 存储：512GB NVMe SSD
+- 重量：1.8kg
+- 电池续航：12 小时
+
+## ProCoder X1 Pro 型号
+- CPU：12 核处理器
+- 内存：32GB DDR5
+- 存储：1TB NVMe SSD
+- 重量：2.1kg
+- 电池续航：10 小时
+
+## 保修说明
+所有型号提供 3 年整机保修和 1 年意外险。
+```
+
+### pytest 配置文件 `tests/conftest.py`
+
+```python
+# tests/conftest.py
+"""
+pytest 公共配置和 fixtures。
+
+Fixture 是什么：
+  pytest 里的 fixture 类似于"测试准备步骤"。
+  比如"每个测试都需要一个干净的知识库工具"，
+  可以写成一个 fixture，测试函数在参数里声明需要它，
+  pytest 就会自动创建并传进去。
+"""
+
+import pytest
+from pathlib import Path
+
+
+# 测试用知识库目录的绝对路径（跟着这个文件走，不依赖工作目录）
+FIXTURES_KB_DIR = Path(__file__).parent / "fixtures" / "knowledge_base"
+
+
+@pytest.fixture
+def test_kb_dir() -> str:
+    """返回测试用知识库目录的路径字符串。"""
+    return str(FIXTURES_KB_DIR)
+
+
+@pytest.fixture
+async def loaded_kb(test_kb_dir):
+    """
+    返回一个已加载测试文档的 KnowledgeBaseTool 实例。
+
+    用法（在测试函数里声明参数名即可）：
+        async def test_something(loaded_kb):
+            result = await loaded_kb.execute({"query": "退货"})
+    """
+    from tools.knowledge_base import KnowledgeBaseTool
+    kb = KnowledgeBaseTool(kb_dir=test_kb_dir)
+    await kb.ensure_loaded()
+    return kb
+```
+
+在 `pyproject.toml` 里加入 pytest 的 asyncio 配置（避免每个异步测试都要手写 `asyncio.run()`）：
+
+```toml
+# pyproject.toml — 在 [project] 同级别加入以下内容
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+```
+
+---
+
+## 16.8 指标单元测试 `tests/test_metrics.py`
+
+这批测试**完全不需要调用 LLM**，可以在没有 API Key 的环境下运行。
+
+```python
+# tests/test_metrics.py
+"""
+SessionMetrics 单元测试。
+
+测试所有聚合属性的计算逻辑，不调用 LLM。
+每个 test_ 函数是一个独立测试用例。
+"""
+
+import pytest
+from core.metrics import SessionMetrics, TurnRecord, ToolRecord
+
+
+def make_turn(
+    turn_index: int = 0,
+    duration_ms: float = 500.0,
+    input_tokens: int = 100,
+    output_tokens: int = 50,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    tool_calls: list[str] | None = None,
+    stop_reason: str = "end_turn",
+) -> TurnRecord:
+    """辅助函数：快速创建 TurnRecord，测试里常用。"""
+    return TurnRecord(
+        turn_index=turn_index,
+        duration_ms=duration_ms,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        tool_calls=tool_calls or [],
+        stop_reason=stop_reason,
+    )
+
+
+def make_metrics(question: str = "测试问题") -> SessionMetrics:
+    """辅助函数：创建空的 SessionMetrics。"""
+    return SessionMetrics(session_id="test-001", question=question)
+
+
+# ── 基础属性测试 ──────────────────────────────────────────────────────────────
+
+
+def test_empty_metrics_zero_values():
+    """没有任何记录时，所有聚合属性应该为 0。"""
+    m = make_metrics()
+    assert m.total_input_tokens == 0
+    assert m.total_output_tokens == 0
+    assert m.total_tool_calls == 0
+    assert m.avg_llm_latency_ms == 0.0
+    assert m.cache_hit_rate == 0.0
+
+
+def test_token_accumulation():
+    """多轮 LLM 调用的 token 应该累加。"""
+    m = make_metrics()
+    m.turns.append(make_turn(input_tokens=200, output_tokens=50))
+    m.turns.append(make_turn(input_tokens=300, output_tokens=80))
+    m.turns.append(make_turn(input_tokens=400, output_tokens=100))
+
+    assert m.total_input_tokens == 900
+    assert m.total_output_tokens == 230
+
+
+def test_avg_llm_latency():
+    """平均 LLM 延迟应该是所有轮次延迟的均值。"""
+    m = make_metrics()
+    m.turns.append(make_turn(duration_ms=1000.0))
+    m.turns.append(make_turn(duration_ms=500.0))
+    m.turns.append(make_turn(duration_ms=750.0))
+
+    # (1000 + 500 + 750) / 3 = 750
+    assert abs(m.avg_llm_latency_ms - 750.0) < 0.01
+
+
+# ── Cache 命中率测试 ──────────────────────────────────────────────────────────
+
+
+def test_cache_hit_rate_no_cache():
+    """没有缓存命中时，命中率应该为 0。"""
+    m = make_metrics()
+    m.turns.append(make_turn(input_tokens=1000, cache_read_tokens=0))
+    assert m.cache_hit_rate == 0.0
+
+
+def test_cache_hit_rate_calculation():
+    """命中率 = 缓存命中 token / 总输入 token。"""
+    m = make_metrics()
+    m.turns.append(make_turn(input_tokens=1000, cache_read_tokens=800))
+    # 命中率 = 800 / 1000 = 0.8
+    assert abs(m.cache_hit_rate - 0.8) < 0.001
+
+
+def test_cache_hit_rate_multi_turn():
+    """多轮时命中率基于所有轮次的总量计算。"""
+    m = make_metrics()
+    m.turns.append(make_turn(input_tokens=500, cache_read_tokens=400))
+    m.turns.append(make_turn(input_tokens=500, cache_read_tokens=300))
+    # 命中率 = (400 + 300) / (500 + 500) = 0.7
+    assert abs(m.cache_hit_rate - 0.7) < 0.001
+
+
+# ── 工具调用统计测试 ──────────────────────────────────────────────────────────
+
+
+def test_tool_call_count():
+    """tool_records 的数量应该等于 total_tool_calls。"""
+    m = make_metrics()
+    m.tool_records.append(ToolRecord("search_kb", 200.0, True))
+    m.tool_records.append(ToolRecord("search_kb", 180.0, True))
+    m.tool_records.append(ToolRecord("get_weather", 300.0, False, "网络超时"))
+
+    assert m.total_tool_calls == 3
+
+
+def test_tool_names_called():
+    """tool_names_called 应该按顺序列出所有工具名。"""
+    m = make_metrics()
+    m.tool_records.append(ToolRecord("search_kb", 200.0, True))
+    m.tool_records.append(ToolRecord("run_python", 150.0, True))
+
+    assert m.tool_names_called == ["search_kb", "run_python"]
+
+
+def test_avg_tool_latency():
+    """平均工具延迟应该是所有工具调用延迟的均值。"""
+    m = make_metrics()
+    m.tool_records.append(ToolRecord("tool_a", 100.0, True))
+    m.tool_records.append(ToolRecord("tool_b", 300.0, True))
+    # (100 + 300) / 2 = 200
+    assert abs(m.avg_tool_latency_ms - 200.0) < 0.01
+
+
+# ── 费用估算测试 ──────────────────────────────────────────────────────────────
+
+
+def test_cost_estimation_no_cache():
+    """没有缓存命中时，按正常输入价格计算费用。"""
+    m = make_metrics()
+    # 输入 1000 token，输出 100 token
+    m.turns.append(make_turn(input_tokens=1000, output_tokens=100, cache_read_tokens=0))
+
+    # 期望：1000 * 3/1e6 + 100 * 15/1e6 = 0.003 + 0.0015 = 0.0045
+    assert abs(m.estimated_cost_usd - 0.0045) < 0.0001
+
+
+def test_cost_estimation_with_cache():
+    """缓存命中的 token 按较低价格计算（约 10%）。"""
+    m = make_metrics()
+    # 输入 1000 token，其中 800 来自缓存
+    m.turns.append(make_turn(
+        input_tokens=1000,
+        output_tokens=0,
+        cache_read_tokens=800,
+    ))
+    # 正常输入：200 token，缓存：800 token
+    # 费用：200 * 3/1e6 + 800 * 0.3/1e6 = 0.0006 + 0.00024 = 0.00084
+    assert abs(m.estimated_cost_usd - 0.00084) < 0.00001
+
+
+# ── 输出测试 ──────────────────────────────────────────────────────────────────
+
+
+def test_print_report_does_not_crash():
+    """print_report() 不应该抛异常（即使数据为空）。"""
+    m = make_metrics()
+    m.print_report()  # 不抛异常即为通过
+
+
+def test_print_report_with_data_does_not_crash():
+    """有数据时 print_report() 也不应该抛异常。"""
+    m = make_metrics("北京今天天气怎么样？")
+    m.turns.append(make_turn(
+        input_tokens=500, output_tokens=100, cache_read_tokens=300,
+        tool_calls=["get_weather"], stop_reason="tool_use",
+    ))
+    m.turns.append(make_turn(
+        input_tokens=600, output_tokens=80,
+        stop_reason="end_turn",
+    ))
+    m.tool_records.append(ToolRecord("get_weather", 412.0, True))
+    m.print_report()
+
+
+def test_to_dict_contains_required_keys():
+    """to_dict() 应该包含所有关键字段。"""
+    m = make_metrics("测试")
+    d = m.to_dict()
+
+    required_keys = {
+        "session_id", "question", "total_turns", "total_tool_calls",
+        "tool_names", "total_input_tokens", "total_output_tokens",
+        "cache_hit_rate", "avg_llm_latency_ms", "total_duration_ms",
+        "estimated_cost_usd",
+    }
+    assert required_keys.issubset(set(d.keys()))
+```
+
+---
+
+## 16.9 RAG 检索质量测试 `tests/test_rag.py`
+
+这批测试使用固定的测试文档，验证 TF-IDF 检索算法的正确性，**不需要调用 LLM**。
+
+```python
+# tests/test_rag.py
+"""
+RAG 检索质量测试。
+
+使用 tests/fixtures/knowledge_base/ 里的已知文档，
+验证 TF-IDF 检索算法对不同查询的返回结果是否符合预期。
+不调用 LLM，运行速度快。
+"""
+
+import pytest
+import json
+
+
+# ── 加载测试 ──────────────────────────────────────────────────────────────────
+
+
+async def test_kb_loads_test_documents(loaded_kb):
+    """知识库应该能正确加载测试目录里的文档。"""
+    # fixtures 里有 2 个文档
+    assert len(loaded_kb._docs) == 2
+
+
+async def test_kb_documents_have_content(loaded_kb):
+    """加载的文档应该有非空内容。"""
+    for doc in loaded_kb._docs:
+        assert len(doc.text) > 10, f"文档 {doc.source} 内容为空"
+        assert doc.title, f"文档 {doc.source} 标题为空"
+
+
+async def test_kb_documents_have_correct_source(loaded_kb):
+    """文档的 source 字段应该包含文件路径。"""
+    sources = [doc.source for doc in loaded_kb._docs]
+    # 验证两个测试文档都被加载了
+    has_policy = any("test_policy" in s for s in sources)
+    has_products = any("test_products" in s for s in sources)
+    assert has_policy, "test_policy.md 没有被加载"
+    assert has_products, "test_products.md 没有被加载"
+
+
+# ── 检索准确率测试 ────────────────────────────────────────────────────────────
+
+
+async def test_retrieve_policy_by_refund_query(loaded_kb):
+    """查询退货相关问题，应该返回政策文档（而不是产品文档）。"""
+    result = await loaded_kb.execute({"query": "退货需要几天？", "top_k": 1})
+    data = json.loads(result)
+
+    assert data["found"] is True, "应该找到相关文档"
+    top_source = data["results"][0]["source"]
+    assert "test_policy" in top_source, (
+        f"退货问题应该返回政策文档，实际返回：{top_source}"
+    )
+
+
+async def test_retrieve_products_by_cpu_query(loaded_kb):
+    """查询 CPU 规格，应该返回产品文档。"""
+    result = await loaded_kb.execute({"query": "CPU 处理器核心数", "top_k": 1})
+    data = json.loads(result)
+
+    assert data["found"] is True
+    top_source = data["results"][0]["source"]
+    assert "test_products" in top_source, (
+        f"CPU 问题应该返回产品文档，实际返回：{top_source}"
+    )
+
+
+async def test_retrieve_warranty_info(loaded_kb):
+    """查询保修信息，应该返回产品文档。"""
+    result = await loaded_kb.execute({"query": "保修期多久？", "top_k": 1})
+    data = json.loads(result)
+
+    assert data["found"] is True
+    assert "test_products" in data["results"][0]["source"]
+
+
+async def test_refund_policy_content_mentions_days(loaded_kb):
+    """退款政策的检索结果应该包含具体的天数信息。"""
+    result = await loaded_kb.execute({"query": "退款多少天内处理", "top_k": 1})
+    data = json.loads(result)
+
+    assert data["found"] is True
+    content = data["results"][0]["content"]
+    # test_policy.md 里写了"48 小时"
+    assert "48" in content or "小时" in content or "天" in content, (
+        f"退款政策应该包含时间信息，实际内容：{content[:100]}"
+    )
+
+
+# ── 边界情况测试 ──────────────────────────────────────────────────────────────
+
+
+async def test_unrelated_query_returns_not_found_or_low_score(loaded_kb):
+    """与知识库内容完全无关的查询，不应该返回高相关度结果。"""
+    # 这个问题与退货/产品规格完全无关
+    result = await loaded_kb.execute({"query": "量子力学薛定谔方程", "top_k": 1})
+    data = json.loads(result)
+
+    if data.get("found"):
+        # 如果"找到"了，相关度分数应该很低
+        assert data["results"][0]["relevance"] < 0.01, (
+            f"无关查询的相关度分数过高：{data['results'][0]['relevance']}"
+        )
+
+
+async def test_top_k_respected(loaded_kb):
+    """top_k 参数应该限制返回结果的数量。"""
+    result = await loaded_kb.execute({"query": "产品", "top_k": 1})
+    data = json.loads(result)
+
+    if data.get("found"):
+        assert len(data["results"]) <= 1, "top_k=1 时最多返回 1 个结果"
+
+
+async def test_execute_empty_query_does_not_crash(loaded_kb):
+    """空查询不应该让程序崩溃。"""
+    result = await loaded_kb.execute({"query": ""})
+    data = json.loads(result)
+    # 不崩溃即可，found 可以是 True 或 False
+    assert "found" in data or "error" in data
+```
+
+---
+
+## 16.10 工具调用准确率测试 `tests/test_tool_accuracy.py`
+
+这批测试**需要调用 LLM**，验证 Agent 对特定类型的问题会选择正确的工具。
+
+```python
+# tests/test_tool_accuracy.py
+"""
+工具调用准确率测试。
+
+给 Agent 提出明确需要查知识库的问题，
+验证 Agent 实际调用了 search_knowledge_base 工具。
+
+这批测试需要调用 LLM，比单元测试慢（每个测试约 3-10 秒）。
+需要 .env 里配置了有效的 API Key。
+"""
+
+import pytest
+from agent import ask
+
+
+async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
+    """
+    问退货政策时，Agent 应该调用 search_knowledge_base 工具。
+
+    monkeypatch 临时把知识库目录换成测试目录，
+    不影响真实的 knowledge_base/ 文件夹。
+    """
+    # 临时替换 agent/api.py 里的工具注册逻辑，使用测试知识库
+    import agent.api as api_module
+    import tools.registry as reg_module
+    from tools.registry import ToolRegistry
+    from tools.knowledge_base import KnowledgeBaseTool
+    from agent.executor import ToolExecutor
+
+    def mock_build_executor_and_tools():
+        registry = ToolRegistry()
+        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
+        executor = ToolExecutor(registry)
+        return executor, registry.all_definitions()
+
+    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build_executor_and_tools)
+
+    result = await ask("我们公司的退货政策是什么？退货有什么条件？")
+
+    # 断言 Agent 调用了知识库工具
+    assert result.metrics is not None, "metrics 不应该为 None"
+    assert "search_knowledge_base" in result.metrics.tool_names_called, (
+        f"退货问题应该触发知识库工具，实际工具调用：{result.metrics.tool_names_called}"
+    )
+
+
+async def test_product_spec_question_triggers_kb_tool(test_kb_dir, monkeypatch):
+    """问产品规格时，Agent 应该调用 search_knowledge_base 工具。"""
+    import agent.api as api_module
+    from tools.registry import ToolRegistry
+    from tools.knowledge_base import KnowledgeBaseTool
+    from agent.executor import ToolExecutor
+
+    def mock_build_executor_and_tools():
+        registry = ToolRegistry()
+        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
+        executor = ToolExecutor(registry)
+        return executor, registry.all_definitions()
+
+    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build_executor_and_tools)
+
+    result = await ask("ProCoder X1 的内存是多少？")
+
+    assert result.metrics is not None
+    assert "search_knowledge_base" in result.metrics.tool_names_called, (
+        f"产品规格问题应该触发知识库工具，实际：{result.metrics.tool_names_called}"
+    )
+
+
+async def test_simple_question_does_not_need_tool():
+    """
+    普通问题（不需要查知识库的）不应该触发工具调用。
+
+    Agent 的 system prompt 说明只有内部知识才查知识库，
+    像"1+1等于几"这种常识问题应该直接回答。
+    """
+    result = await ask("1 加 1 等于几？")
+
+    assert result.metrics is not None
+    assert result.turn_count == 1, "数学问题不应该需要工具，应该一轮就完成"
+    # 可能调用了工具（如果 Agent 不确定），但更常见的是不调用
+    # 这里只验证回答里包含"2"
+    assert "2" in result.text, f"1+1 应该等于 2，实际回答：{result.text}"
+```
+
+---
+
+## 16.11 Agent 端到端集成测试 `tests/test_agent_e2e.py`
+
+```python
+# tests/test_agent_e2e.py
+"""
+Agent 端到端集成测试。
+
+验证从用户提问到最终回答的完整流程：
+  用户提问 → Agentic Loop → 工具调用 → 最终回答 + 指标收集
+
+这批测试调用真实 LLM，需要 API Key。
+"""
+
+import pytest
+from agent import ask, AskResult
+from core.metrics import SessionMetrics
+
+
+# ── 基础对话测试 ──────────────────────────────────────────────────────────────
+
+
+async def test_ask_returns_ask_result():
+    """ask() 应该返回 AskResult 类型，不崩溃。"""
+    result = await ask("用一句话解释什么是 Python")
+    assert isinstance(result, AskResult)
+
+
+async def test_ask_returns_non_empty_text():
+    """回答不应该为空。"""
+    result = await ask("用一句话解释什么是 Python")
+    assert len(result.text) > 10, f"回答太短：{result.text}"
+
+
+async def test_ask_returns_chinese_response():
+    """Agent 应该用中文回答（system prompt 里要求了）。"""
+    result = await ask("What is Python?")
+    has_chinese = any("一" <= ch <= "鿿" for ch in result.text)
+    assert has_chinese, f"应该包含中文，实际回答：{result.text[:100]}"
+
+
+# ── 指标收集测试 ──────────────────────────────────────────────────────────────
+
+
+async def test_metrics_populated_after_ask():
+    """ask() 完成后，metrics 应该被填充。"""
+    result = await ask("用一句话解释什么是机器学习")
+    assert result.metrics is not None, "metrics 不应该为 None"
+    assert isinstance(result.metrics, SessionMetrics)
+
+
+async def test_metrics_has_at_least_one_turn():
+    """至少应该有一轮 LLM 调用记录。"""
+    result = await ask("2 + 2 等于多少？")
+    assert len(result.metrics.turns) >= 1
+
+
+async def test_metrics_input_tokens_positive():
+    """输入 token 数应该大于 0。"""
+    result = await ask("你好")
+    assert result.metrics.total_input_tokens > 0
+
+
+async def test_metrics_output_tokens_positive():
+    """输出 token 数应该大于 0。"""
+    result = await ask("你好")
+    assert result.metrics.total_output_tokens > 0
+
+
+async def test_metrics_latency_positive():
+    """LLM 调用延迟应该大于 0（毫秒）。"""
+    result = await ask("你好")
+    assert result.metrics.avg_llm_latency_ms > 0
+
+
+# ── 知识库工具集成测试 ────────────────────────────────────────────────────────
+
+
+async def test_kb_query_triggers_tool_call(test_kb_dir, monkeypatch):
+    """
+    知识库相关问题应该触发工具调用，且回答基于知识库内容。
+
+    这是最重要的集成测试：验证 RAG 完整链路：
+    提问 → Agent 决定查知识库 → 检索到相关文档 → 基于文档回答
+    """
+    import agent.api as api_module
+    from tools.registry import ToolRegistry
+    from tools.knowledge_base import KnowledgeBaseTool
+    from agent.executor import ToolExecutor
+
+    def mock_build():
+        registry = ToolRegistry()
+        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
+        return ToolExecutor(registry), registry.all_definitions()
+
+    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build)
+
+    result = await ask("请介绍一下退货政策，退货有什么条件？")
+
+    assert result.metrics is not None
+    # 验证工具被调用了
+    assert result.metrics.total_tool_calls >= 1, "应该调用了至少一次工具"
+    assert "search_knowledge_base" in result.metrics.tool_names_called
+
+    # 验证回答包含知识库里的信息（test_policy.md 里写了"30 天"）
+    assert len(result.text) > 20, "回答不应该太短"
+
+
+async def test_kb_answer_contains_relevant_info(test_kb_dir, monkeypatch):
+    """
+    基于知识库的回答应该包含文档里的具体信息，而不是泛泛而谈。
+    """
+    import agent.api as api_module
+    from tools.registry import ToolRegistry
+    from tools.knowledge_base import KnowledgeBaseTool
+    from agent.executor import ToolExecutor
+
+    def mock_build():
+        registry = ToolRegistry()
+        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
+        return ToolExecutor(registry), registry.all_definitions()
+
+    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build)
+
+    result = await ask("ProCoder X1 的 CPU 规格是什么？")
+
+    assert result.metrics is not None
+    # test_products.md 里写了"8 核"
+    assert "8" in result.text or "核" in result.text or "CPU" in result.text.upper(), (
+        f"关于 CPU 的回答应该包含具体规格，实际：{result.text[:200]}"
+    )
+
+
+# ── 指标合理性测试 ────────────────────────────────────────────────────────────
+
+
+async def test_multi_turn_when_tool_used(test_kb_dir, monkeypatch):
+    """
+    当 Agent 使用工具时，turn_count 应该 >= 2
+    （第 1 轮：决定调工具；第 2 轮：基于工具结果回答）。
+    """
+    import agent.api as api_module
+    from tools.registry import ToolRegistry
+    from tools.knowledge_base import KnowledgeBaseTool
+    from agent.executor import ToolExecutor
+
+    def mock_build():
+        registry = ToolRegistry()
+        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
+        return ToolExecutor(registry), registry.all_definitions()
+
+    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build)
+
+    result = await ask("保修期多久？")
+
+    if result.metrics.total_tool_calls > 0:
+        assert result.turn_count >= 2, (
+            f"调用了工具但 turn_count={result.turn_count}，应该 >= 2"
+        )
+
+
+async def test_cost_estimate_is_reasonable():
+    """估算费用应该在合理范围内（不为 0，不超过 1 美元）。"""
+    result = await ask("你好，请问你是什么？")
+    cost = result.metrics.estimated_cost_usd
+    assert cost > 0, "费用估算不应该为 0"
+    assert cost < 1.0, f"单次问答费用超过 1 美元，异常：${cost:.5f}"
+```
+
+---
+
+## 16.12 运行测试与读懂输出
+
+### 安装测试依赖（如果还没安装）
+
+```bash
+uv add --dev pytest pytest-asyncio
+```
+
+### 运行第一层测试（不需要 LLM，速度快）
+
+```bash
+pytest tests/test_metrics.py tests/test_rag.py -v
+```
+
+预期输出（全部通过）：
+```
+tests/test_metrics.py::test_empty_metrics_zero_values PASSED
+tests/test_metrics.py::test_token_accumulation PASSED
+tests/test_metrics.py::test_avg_llm_latency PASSED
+tests/test_metrics.py::test_cache_hit_rate_no_cache PASSED
+...
+tests/test_rag.py::test_kb_loads_test_documents PASSED
+tests/test_rag.py::test_retrieve_policy_by_refund_query PASSED
+tests/test_rag.py::test_retrieve_products_by_cpu_query PASSED
+...
+==================== 20 passed in 2.31s ====================
+```
+
+### 运行第二层测试（需要 LLM，较慢）
+
+```bash
+# 确保 .env 里配置了 API Key
+pytest tests/test_tool_accuracy.py tests/test_agent_e2e.py -v
+```
+
+预期输出：
+```
+tests/test_agent_e2e.py::test_ask_returns_ask_result PASSED
+tests/test_agent_e2e.py::test_metrics_has_at_least_one_turn PASSED
+tests/test_agent_e2e.py::test_kb_query_triggers_tool_call PASSED
+...
+==================== 12 passed in 47.83s ====================
+```
+
+### 运行全部测试
+
+```bash
+pytest tests/ -v
+```
+
+### 读懂测试失败信息
+
+如果某个测试失败，pytest 会打印详细原因，例如：
+
+```
+FAILED tests/test_rag.py::test_retrieve_policy_by_refund_query
+AssertionError: 退货问题应该返回政策文档，实际返回：test_products.md
+
+解读：TF-IDF 检索了错误的文档。
+可能原因：test_policy.md 里没有「退货」相关的词，或者词汇重合度低。
+修复方向：检查 test_policy.md 的内容，确保包含「退货」「天」等关键词。
+```
+
+### 在 cli.py 里打印指标报告
+
+在 `cli.py` 里调用 `metrics.print_report()`，每次对话后看实时数据：
+
+```python
+# cli.py — 在 ask() 调用之后加两行
+
+result = await ask(question)
+print(result.text)
+if result.metrics:
+    result.metrics.print_report()   # ← 加这一行
+```
+
+运行 `python cli.py`，每次问答后会自动打印：
+
+```
+────────────────────────────────────────────────────
+  会话统计报告
+────────────────────────────────────────────────────
+  问题：我们公司的退货政策是什么？
+  会话 ID：a3f1b2c4
+────────────────────────────────────────────────────
+  LLM 调用轮次   : 2 轮
+  平均 LLM 延迟  : 1340 ms
+  总端到端延迟   : 3210 ms
+────────────────────────────────────────────────────
+  总输入 Token   : 2,341
+  总输出 Token   : 178
+  估算费用       : $0.00972 USD
+────────────────────────────────────────────────────
+  工具调用次数   : 1 次
+  平均工具延迟   : 5 ms
+    ✓ search_knowledge_base  (5 ms)
+────────────────────────────────────────────────────
+```
+
+---
+
+## 16.13 本章检查清单
+
+```
+□ 运行 pytest tests/test_metrics.py -v，全部通过（不需要 API Key）
+□ 准备了 tests/fixtures/knowledge_base/ 里的两个测试文档
+□ 运行 pytest tests/test_rag.py -v，全部通过
+□ 修改了 agent/loop.py，加入 metrics 埋点
+□ 修改了 agent/api.py，AskResult 有 metrics 字段
+□ 运行 pytest tests/test_agent_e2e.py::test_ask_returns_ask_result -v，通过
+□ 运行全部集成测试 pytest tests/ -v，无错误（或仅有预期的 skip）
+□ 修改 cli.py 加入 metrics.print_report()，对话后能看到统计报告
+```
