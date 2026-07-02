@@ -1,16 +1,30 @@
-# agent/api.py
-# 对外暴露的简洁接口：ask() 和 ask_stream()
-# cli.py、main.py、测试代码都从这里导入，不直接接触 loop.py
-
+# agent.py（完整替换）
 import asyncio
 from asyncio import Queue
 from dataclasses import dataclass
 from typing import AsyncGenerator
-
-from .loop import run_agent_loop, LoopResult
+from agent.loop import run_agent_loop
+from agent.executor import ToolExecutor
 from providers.router import get_provider
+from tools.registry import ToolRegistry
+from tools.builtin.read_file import ReadFileTool
+from tools.builtin.run_python import RunPythonTool
+from tools.builtin.search_code import SearchCodeTool
 
-SYSTEM_PROMPT = "你是一个智能助手，请用中文回答问题，回答要简洁准确。"
+SYSTEM_PROMPT = """
+你是一个专业的 Coding Agent，帮助用户完成代码相关任务。
+
+你有以下工具：
+- read_file：读取代码文件内容
+- search_code：在代码库中搜索函数名、类名或关键词
+- run_python：执行 Python 代码片段并返回结果
+
+工作原则：
+1. 先用工具了解现有代码，再给出建议，不要凭空猜测
+2. 发现问题时给出具体的文件名和行号
+3. 生成代码后主动用 run_python 验证能否正常执行
+4. 输出代码时使用代码块格式（```python）
+"""
 
 
 @dataclass
@@ -21,14 +35,23 @@ class AskResult:
     turn_count: int = 1
 
 
+# 全局工具注册（启动时初始化一次）
+_registry = ToolRegistry()
+_registry.register(ReadFileTool(workspace="."))
+_registry.register(RunPythonTool())
+_registry.register(SearchCodeTool(workspace="."))
+_executor = ToolExecutor(_registry)
+
+
 async def ask(question: str) -> AskResult:
-    """非流式调用，使用 Agentic Loop。"""
     provider = get_provider()
 
-    result: LoopResult = await run_agent_loop(
+    result = await run_agent_loop(
         prompt=question,
         provider=provider,
         system=SYSTEM_PROMPT,
+        tools=_registry.get_all_definitions(),
+        executor=_executor,
         max_turns=10,
     )
 
@@ -53,6 +76,8 @@ async def ask_stream(question: str) -> AsyncGenerator[str, None]:
             prompt=question,
             provider=provider,
             system=SYSTEM_PROMPT,
+            tools=_registry.get_all_definitions(),
+            executor=_executor,
             max_turns=10,
             on_text_delta=on_delta,
         )

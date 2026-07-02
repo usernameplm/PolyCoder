@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 
 from agent import ask, ask_stream
@@ -151,6 +151,12 @@ async def ask_stream_endpoint(question: str):
             "X-Accel-Buffering": "no",            # 禁用 Nginx 缓冲（如果用了 Nginx 反代）
         },
     )
+
+
+@app.get("/")
+async def index():
+    """返回前端测试页面"""
+    return FileResponse("static/index.html")
 
 
 # ── 直接运行的入口 ────────────────────────────────────────────────

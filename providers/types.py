@@ -98,6 +98,13 @@ class MessageStart(BaseModel):
     usage: Usage
 
 
+class ToolUseStart(BaseModel):
+    """流式传输：LLM 开始生成一个工具调用块。包含工具名和调用 ID。"""
+    type: Literal["tool_use_start"] = "tool_use_start"
+    tool_id: str
+    tool_name: str
+
+
 class MessageStop(BaseModel):
     """
     流式响应结束事件。
@@ -113,7 +120,7 @@ class MessageStop(BaseModel):
 
 
 # 流式 chunk 的联合类型
-StreamChunk = Union[TextDelta, ToolInputDelta, MessageStart, MessageStop]
+StreamChunk = Union[TextDelta, ToolInputDelta, ToolUseStart, MessageStart, MessageStop]
 
 
 # ── Provider 完整响应 ─────────────────────────────────────────────────────────

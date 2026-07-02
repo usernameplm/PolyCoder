@@ -11,7 +11,7 @@ from .base import BaseProvider
 from .types import (
     Message, ToolDefinition, ProviderResponse,
     StreamChunk, TextBlock, ToolUseBlock, Usage,
-    TextDelta, MessageStart, MessageStop,
+    TextDelta, ToolInputDelta, ToolUseStart, MessageStart, MessageStop,
 )
 
 
@@ -132,9 +132,20 @@ class AnthropicProvider(BaseProvider):
             yield MessageStart(usage=Usage())
 
             async for event in stream:
-                if event.type == "content_block_delta":
+                if event.type == "content_block_start":
+                    if event.content_block.type == "tool_use":
+                        yield ToolUseStart(
+                            tool_id=event.content_block.id,
+                            tool_name=event.content_block.name,
+                        )
+                elif event.type == "content_block_delta":
                     if hasattr(event.delta, "text"):
                         yield TextDelta(text=event.delta.text)
+                    elif hasattr(event.delta, "partial_json"):
+                        yield ToolInputDelta(
+                            tool_id=event.content_block_id,
+                            partial_json=event.delta.partial_json,
+                        )
 
             # 流结束后取最终消息（包含完整 usage）
             final = await stream.get_final_message()

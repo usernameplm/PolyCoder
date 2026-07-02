@@ -86,9 +86,8 @@ async def run_agent_loop(
 
         if on_text_delta:
             # 流式模式：边生成边通过回调传出文本
-            # 注意：工具调用参数也是流式传输的，需要累积后解析
-            pending_tool_inputs: dict[str, str] = {}  # tool_id → 累积的 JSON 字符串
-            pending_tool_meta: dict[str, tuple] = {}  # tool_id → (name,)
+            pending_tool_inputs: dict[str, str] = {}   # tool_id → 累积的 JSON 字符串
+            pending_tool_names: dict[str, str] = {}    # tool_id → tool_name
 
             async for chunk in provider.stream(
                 messages=list(state.messages),
@@ -96,11 +95,14 @@ async def run_agent_loop(
                 tools=tools or None,
                 max_tokens=max_tokens,
             ):
-                from providers.types import ToolInputDelta, MessageStart
+                from providers.types import ToolUseStart
 
                 if isinstance(chunk, TextDelta):
                     text_chunks.append(chunk.text)
                     on_text_delta(chunk.text)
+
+                elif isinstance(chunk, ToolUseStart):
+                    pending_tool_names[chunk.tool_id] = chunk.tool_name
 
                 elif isinstance(chunk, ToolInputDelta):
                     pending_tool_inputs.setdefault(chunk.tool_id, "")
@@ -108,8 +110,18 @@ async def run_agent_loop(
 
                 elif isinstance(chunk, MessageStop):
                     turn_usage = chunk.usage
-                    # 流结束后，从累积的 JSON 重建 ToolUseBlock
-                    # （这里简化处理，实际需要从流事件中获取 tool name）
+
+            # 流结束后，从累积的 JSON 重建 ToolUseBlock
+            import json
+            for tool_id, json_str in pending_tool_inputs.items():
+                try:
+                    tool_calls.append(ToolUseBlock(
+                        id=tool_id,
+                        name=pending_tool_names.get(tool_id, "unknown"),
+                        input=json.loads(json_str),
+                    ))
+                except json.JSONDecodeError:
+                    pass
 
         else:
             # 非流式模式：等待完整响应
