@@ -1,5 +1,4 @@
 """阶段 1 自动测试"""
-import asyncio
 import pytest
 from agent import ask, AskResult
 

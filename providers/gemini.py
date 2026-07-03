@@ -11,7 +11,6 @@ Gemini API 和 Anthropic/OpenAI 的主要格式差异：
   4. 工具调用：function_declarations 格式，和 OpenAI tool_calls 不同
   5. 流式：generate_content_async(stream=True) + async for chunk
 """
-import json
 import uuid
 from typing import AsyncGenerator
 import google.generativeai as genai

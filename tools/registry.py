@@ -34,19 +34,3 @@ class ToolRegistry:
         发给 LLM 时传入这个列表，LLM 就知道有哪些工具可用。
         """
         return [t.definition for t in self._tools.values()]
-
-    @classmethod
-    def default(cls) -> "ToolRegistry":
-        """
-        创建包含所有内置工具的默认注册表。
-
-        ★ 替换点：在这里添加你自己的工具。
-        """
-        from .builtin.calculator import CalculatorTool
-
-        registry = cls()
-        registry.register(CalculatorTool())
-        # 按需添加更多工具：
-        # registry.register(WeatherTool())
-        # registry.register(DatabaseTool())
-        return registry

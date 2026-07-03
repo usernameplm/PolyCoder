@@ -95,7 +95,7 @@ async def run_agent_loop(
                 tools=tools or None,
                 max_tokens=max_tokens,
             ):
-                from providers.types import ToolUseStart
+                from providers.types import ToolUseStart, ToolInputDelta
 
                 if isinstance(chunk, TextDelta):
                     text_chunks.append(chunk.text)

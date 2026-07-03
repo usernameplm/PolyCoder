@@ -10,6 +10,8 @@ from tools.registry import ToolRegistry
 from tools.builtin.read_file import ReadFileTool
 from tools.builtin.run_python import RunPythonTool
 from tools.builtin.search_code import SearchCodeTool
+from tools.builtin.list_dir import ListDirTool
+from tools.builtin.write_file import WriteFileTool
 
 SYSTEM_PROMPT = """
 你是一个专业的 Coding Agent，帮助用户完成代码相关任务。
@@ -18,6 +20,8 @@ SYSTEM_PROMPT = """
 - read_file：读取代码文件内容
 - search_code：在代码库中搜索函数名、类名或关键词
 - run_python：执行 Python 代码片段并返回结果
+- list_dir：列出目录结构，了解项目文件布局
+- write_file：将代码写入文件
 
 工作原则：
 1. 先用工具了解现有代码，再给出建议，不要凭空猜测
@@ -40,6 +44,8 @@ _registry = ToolRegistry()
 _registry.register(ReadFileTool(workspace="."))
 _registry.register(RunPythonTool())
 _registry.register(SearchCodeTool(workspace="."))
+_registry.register(ListDirTool())
+_registry.register(WriteFileTool())
 _executor = ToolExecutor(_registry)
 
 
