@@ -3716,7 +3716,7 @@ class SubAgent(ABC):
 
 ### Agent 1：代码生成 `sub_agents/code_writer.py`
 
-```python
+````python
 # sub_agents/code_writer.py
 from tools.builtin.read_file import ReadFileTool
 from tools.builtin.run_python import RunPythonTool
@@ -3754,7 +3754,7 @@ class CodeWriterAgent(SubAgent):
     @property
     def tools(self):
         return [ReadFileTool(), RunPythonTool()]
-```
+````
 
 ---
 
@@ -3805,7 +3805,7 @@ class CodeReviewerAgent(SubAgent):
 
 ### Agent 3：调试修复 `sub_agents/debugger.py`
 
-```python
+````python
 # sub_agents/debugger.py
 from tools.builtin.read_file import ReadFileTool
 from tools.builtin.run_python import RunPythonTool
@@ -3846,13 +3846,13 @@ class DebuggerAgent(SubAgent):
     @property
     def tools(self):
         return [ReadFileTool(), RunPythonTool(), SearchCodeTool()]
-```
+````
 
 ---
 
 ### Agent 4：测试生成 `sub_agents/test_writer.py`
 
-```python
+````python
 # sub_agents/test_writer.py
 from tools.builtin.read_file import ReadFileTool
 from tools.builtin.run_python import RunPythonTool
@@ -3895,13 +3895,13 @@ import pytest
     @property
     def tools(self):
         return [ReadFileTool(), RunPythonTool()]
-```
+````
 
 ---
 
 ## 6.6 任务规划器 `coordinator/planner.py`
 
-```python
+````python
 # coordinator/planner.py
 """
 任务规划器：调用 LLM，把用户请求拆分成结构化任务计划（JSON）。
@@ -4017,7 +4017,7 @@ def _parse_plan(text: str) -> tuple[list[TaskSpec], str | None]:
     ]
 
     return specs, None
-```
+````
 
 ---
 
