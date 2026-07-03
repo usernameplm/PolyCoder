@@ -13,25 +13,19 @@ from .blackboard import Blackboard, Task
 
 class SwarmAgent(ABC):
 
-    def __init__(self, blackboard: Blackboard):
+    def __init__(self, blackboard: Blackboard, agent_id: str | None = None):
         self.blackboard = blackboard
-        self.agent_id = f"{self.name}-{id(self) % 10000}"
+        self.agent_id = agent_id or f"{type(self).__name__}-{id(self) % 10000}"
         self._running = False
 
     @property
     @abstractmethod
-    def name(self) -> str:
-        """Agent 类型名称。"""
-        ...
-
-    @property
-    @abstractmethod
-    def handles(self) -> list[str]:
+    def task_types(self) -> list[str]:
         """这个 Agent 处理哪些类型的任务。"""
         ...
 
     @abstractmethod
-    async def process(self, task: Task) -> str:
+    async def handle(self, task: Task) -> str:
         """
         处理一个任务，返回结果字符串。
 
@@ -42,17 +36,17 @@ class SwarmAgent(ABC):
     async def start(self):
         """启动 Agent，持续监听白板上的任务。"""
         self._running = True
-        print(f"[{self.agent_id}] 已启动，监听任务类型：{self.handles}")
+        print(f"[{self.agent_id}] 已启动，监听任务类型：{self.task_types}")
 
         while self._running:
             claimed_any = False
 
-            for task_type in self.handles:
+            for task_type in self.task_types:
                 task = await self.blackboard.claim(task_type, self.agent_id)
                 if task:
                     claimed_any = True
                     try:
-                        result = await self.process(task)
+                        result = await self.handle(task)
                         await self.blackboard.complete(task.id, result)
                     except Exception as e:
                         await self.blackboard.fail(task.id, str(e))
