@@ -19,7 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 
-from agent import ask, ask_stream
+from agent import ask_stream
+from coordinator.agent import CoordinatorAgent
 
 
 # ── 请求/响应数据格式定义 ──────────────────────────────────────────
@@ -36,8 +37,9 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     """POST /ask 的响应体格式"""
-    text: str = Field(description="Agent 的回答")
-    usage: dict = Field(description="Token 用量：{input_tokens, output_tokens}")
+    text: str = Field(default="", description="Agent 的回答")
+    usage: dict = Field(default_factory=dict, description="Token 用量")
+    error: str | None = Field(default=None, description="错误信息")
 
 
 # ── 应用生命周期（启动/关闭钩子）────────────────────────────────────
@@ -84,29 +86,30 @@ async def health_check():
     return {"status": "ok", "timestamp": int(time.time())}
 
 
+# 全局 Coordinator 实例（启动时初始化一次）
+_coordinator = CoordinatorAgent()
+
+
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(req: AskRequest) -> AskResponse:
     """
-    完整响应接口：等 Claude 写完，一次性返回全部内容。
+    完整响应接口：通过 Coordinator 规划任务 → 分发执行 → 聚合结果。
 
     请求体：{"question": "你的问题"}
-    响应体：{"text": "回答", "usage": {"input_tokens": N, "output_tokens": N}}
+    响应体：{"text": "回答", "usage": {...}, "error": null}
     """
     start = time.time()
     print(f"[/ask] 收到请求: {req.question[:60]}")
 
-    result = await ask(req.question)
-
-    elapsed_ms = round((time.time() - start) * 1000)
-    print(f"[/ask] 完成，耗时 {elapsed_ms}ms")
-
-    return AskResponse(
-        text=result.text,
-        usage={
-            "input_tokens": result.input_tokens,
-            "output_tokens": result.output_tokens,
-        },
-    )
+    try:
+        result = await _coordinator.run(req.question)
+        elapsed_ms = round((time.time() - start) * 1000)
+        print(f"[/ask] 完成，耗时 {elapsed_ms}ms")
+        return AskResponse(text=result)
+    except Exception as e:
+        elapsed_ms = round((time.time() - start) * 1000)
+        print(f"[/ask] 出错，耗时 {elapsed_ms}ms：{e}")
+        return AskResponse(error=str(e))
 
 
 @app.get("/ask/stream")

@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PolyCoder Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; display: flex; flex-direction: column; height: 100vh; }
@@ -13,12 +14,27 @@
         .status.online { background: #4caf50; }
         .status.offline { background: #f44336; }
         #chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-        .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
-        .msg.user { align-self: flex-end; background: #007aff; color: #fff; }
+        .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; line-height: 1.6; word-break: break-word; }
+        .msg.user { align-self: flex-end; background: #007aff; color: #fff; white-space: pre-wrap; }
         .msg.assistant { align-self: flex-start; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .msg.assistant pre { background: #1e1e1e; color: #d4d4d4; padding: 12px 14px; border-radius: 6px; overflow-x: auto; margin: 8px 0; font-size: 13px; white-space: pre; }
-        .msg.assistant code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 13px; }
-        .msg.assistant pre code { padding: 0; background: none; color: inherit; }
+
+        /* Markdown 渲染样式 */
+        .msg.assistant h1, .msg.assistant h2, .msg.assistant h3 { margin: 12px 0 6px; font-size: 16px; }
+        .msg.assistant h4, .msg.assistant h5 { margin: 8px 0 4px; font-size: 14px; }
+        .msg.assistant p { margin: 4px 0; }
+        .msg.assistant ul, .msg.assistant ol { padding-left: 20px; margin: 4px 0; }
+        .msg.assistant li { margin: 2px 0; }
+        .msg.assistant pre { background: #1e1e1e; color: #d4d4d4; padding: 12px 14px; border-radius: 6px; overflow-x: auto; margin: 8px 0; font-size: 13px; line-height: 1.5; }
+        .msg.assistant pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+        .msg.assistant code { background: #f0f0f0; padding: 2px 5px; border-radius: 3px; font-size: 13px; }
+        .msg.assistant table { border-collapse: collapse; margin: 8px 0; width: 100%; }
+        .msg.assistant th, .msg.assistant td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; font-size: 13px; }
+        .msg.assistant th { background: #f5f5f5; font-weight: 600; }
+        .msg.assistant strong { font-weight: 600; }
+        .msg.assistant blockquote { border-left: 3px solid #ddd; padding-left: 12px; margin: 8px 0; color: #666; }
+        .msg.assistant hr { border: none; border-top: 1px solid #eee; margin: 12px 0; }
+        .msg.assistant a { color: #007aff; }
+
         .toolbar { display: flex; gap: 8px; padding: 10px 16px; background: #fff; border-top: 1px solid #ddd; align-items: center; }
         #input { flex: 1; padding: 10px 14px; border: 1px solid #ccc; border-radius: 20px; font-size: 14px; outline: none; resize: none; }
         #input:focus { border-color: #007aff; }
@@ -29,6 +45,7 @@
         button:disabled { opacity: 0.5; cursor: not-allowed; }
         #loading-indicator { display: none; text-align: center; color: #999; font-size: 13px; padding: 8px; }
         #loading-indicator.active { display: block; }
+        .footer-time { font-size: 11px; color: #999; margin-top: 8px; }
     </style>
 </head>
 <body>
@@ -48,7 +65,14 @@
     </div>
 
     <script>
-        const BASE = 'http://localhost:8002';
+        const BASE = window.location.origin;
+        let markedReady = false;
+
+        // 等待 marked 加载完成
+        if (typeof marked !== 'undefined') {
+            marked.setOptions({ breaks: true, gfm: true });
+            markedReady = true;
+        }
 
         // 健康检查
         fetch(BASE + '/health')
@@ -64,7 +88,6 @@
                 el.className = 'status offline';
             });
 
-        // Enter 发送，Shift+Enter 换行
         document.getElementById('input').addEventListener('keydown', function(e) {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
@@ -72,10 +95,22 @@
             }
         });
 
+        function renderMarkdown(text) {
+            if (typeof marked !== 'undefined' && marked.parse) {
+                return marked.parse(text);
+            }
+            // fallback: 纯文本
+            return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
         function addMsg(role, text) {
             const div = document.createElement('div');
             div.className = 'msg ' + role;
-            div.textContent = text;
+            if (role === 'assistant') {
+                div.innerHTML = text ? renderMarkdown(text) : '';
+            } else {
+                div.textContent = text;
+            }
             document.getElementById('chat').appendChild(div);
             div.scrollIntoView({ behavior: 'smooth' });
             return div;
@@ -99,6 +134,14 @@
             const assistantDiv = addMsg('assistant', '');
             const start = Date.now();
 
+            function finish(text) {
+                const timeStr = (Date.now() - start) / 1000;
+                assistantDiv.innerHTML =
+                    (text ? renderMarkdown(text) : '（空响应）') +
+                    '<div class="footer-time">' + timeStr.toFixed(1) + 's</div>';
+                assistantDiv.scrollIntoView({ behavior: 'smooth' });
+            }
+
             try {
                 if (stream) {
                     const url = BASE + '/ask/stream?question=' + encodeURIComponent(question);
@@ -111,7 +154,6 @@
                     while (true) {
                         const { done, value } = await reader.read();
                         if (done) {
-                            // 处理 buffer 中剩余的数据
                             if (buffer.startsWith('data: ')) {
                                 const d = buffer.slice(6);
                                 if (d !== '[DONE]') {
@@ -134,13 +176,14 @@
                                 const json = JSON.parse(data);
                                 if (json.type === 'text_delta') {
                                     text += json.text;
-                                    assistantDiv.textContent = text;
+                                    // 流式模式下用纯文本展示，避免未闭合的 Markdown 语法闪烁
+                                    assistantDiv.innerHTML = renderMarkdown(text);
                                     assistantDiv.scrollIntoView({ behavior: 'smooth' });
                                 }
                             } catch(e) {}
                         }
                     }
-                    assistantDiv.textContent = text + '\n\n[' + (Date.now() - start) / 1000 + 's]';
+                    finish(text);
                 } else {
                     const resp = await fetch(BASE + '/ask', {
                         method: 'POST',
@@ -148,14 +191,18 @@
                         body: JSON.stringify({ question }),
                     });
                     if (!resp.ok) {
-                        assistantDiv.textContent = '错误：HTTP ' + resp.status;
+                        assistantDiv.innerHTML = '错误：HTTP ' + resp.status;
                         return;
                     }
                     const data = await resp.json();
-                    assistantDiv.textContent = data.text + '\n\n[' + (Date.now() - start) / 1000 + 's]';
+                    if (data.error) {
+                        assistantDiv.innerHTML = '<span style="color:red">错误：' + data.error + '</span>';
+                    } else {
+                        finish(data.text);
+                    }
                 }
             } catch (e) {
-                assistantDiv.textContent = '请求失败：' + e.message;
+                assistantDiv.innerHTML = '<span style="color:red">请求失败：' + e.message + '</span>';
             }
             setButtons(false);
         }
