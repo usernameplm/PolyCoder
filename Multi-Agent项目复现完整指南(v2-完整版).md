@@ -60,7 +60,7 @@ Provider 层（3-4）：★ 新增，取代 claude-agent-sdk
 | 依赖 | 版本要求 | 说明 |
 |------|---------|------|
 | Python | 3.11+ | 核心运行环境 |
-| Redis | 7.0+（可选） | 阶段 10 之前不需要 |
+| Redis | 7.0+（可选） | 第 7 章（白板持久化）、第 10 章（会话持久化）会用到，两处都有降级处理，不装也能跑 |
 | Docker | 24.0+（可选） | 阶段 13 才用到 |
 | Node.js | **不需要** | v2 已完全去掉此依赖 |
 
@@ -89,8 +89,7 @@ opentelemetry-sdk>=1.25.0
 prometheus-client>=0.21.0
 
 # 存储
-redis>=5.0.0
-aioredis>=2.0.0
+redis>=5.0.0                # 5.x 起自带 redis.asyncio，异步能力已内置，不需要再单独装 aioredis
 
 # 飞书
 lark-oapi>=1.6.0
@@ -180,7 +179,7 @@ settings = Settings()
 | 依赖 | 版本要求 | 说明 |
 |------|---------|------|
 | Python | 3.11+ | 核心运行环境 |
-| Redis | 7.0+（可选） | 第 10 章之前不需要 |
+| Redis | 7.0+（可选） | 第 7 章（白板持久化）、第 10 章（会话持久化）会用到，两处都有降级处理，不装也能跑 |
 | Docker | 24.0+（可选） | 第 13 章才用到 |
 | Node.js | **不需要** | v2 已完全去掉此依赖 |
 
@@ -215,8 +214,7 @@ opentelemetry-sdk>=1.25.0   # OpenTelemetry 链路追踪
 prometheus-client>=0.21.0   # Prometheus 指标暴露
 
 # ── 存储 ──────────────────────────────────────────────────────────
-redis>=5.0.0                # Redis 客户端
-aioredis>=2.0.0             # 异步 Redis 客户端
+redis>=5.0.0                # Redis 客户端（5.x 起自带 redis.asyncio 异步支持，aioredis 已停止维护，不需要再装）
 
 # ── 飞书集成 ──────────────────────────────────────────────────────
 lark-oapi>=1.6.0            # 飞书开放平台官方 Python SDK
@@ -4682,31 +4680,279 @@ if __name__ == "__main__":
 
 ## 7.6 把白板状态写入 Redis（持久化）
 
+> 本节面向"零基础"读者，把每一步拆到能直接照抄命令的程度。如果你只想先跑通 Swarm 本身，
+> 这一节可以整节跳过——`Blackboard` 不装 Redis 也能正常工作，只是进程一重启，
+> 所有任务状态就没了。
+
+### 7.6.0 为什么要用 Redis？先搞清楚问题是什么
+
+回头看 `swarm/blackboard.py`：所有任务都存在 `self._tasks` 这个 Python 字典里。
+字典是存在**进程内存**里的——一旦这个 Python 进程被杀掉（崩溃、重启、`Ctrl+C`），
+内存被操作系统收回，字典里的数据**全部消失**，无法恢复。
+
+Redis 是一个独立运行的、常驻后台的"内存数据库"服务。关键区别：它是**另一个进程**，
+甚至可以在另一台机器上。你的 Swarm 程序只是通过网络连接过去"存一下 / 取一下"数据。
+所以即使 Swarm 程序重启了，只要 Redis 服务本身没关，数据还在——这就是"持久化"的意思。
+
+可以把 Redis 想象成一个只认"键值对"的超快哈希表，装在网络那头：
+`redis_client.set("某个键", "某段字符串")`，之后随时 `redis_client.get("某个键")` 取回来，
+换一个进程、换一台机器都能取。
+
+### 7.6.1 安装并启动 Redis（Windows 环境，推荐用 Docker）
+
+Redis 官方不提供 Windows 原生安装包，最省事的方式是用 Docker 跑一个 Redis 容器：
+
+1. 安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)（如果还没装），装完确保它在后台运行（系统托盘能看到鲸鱼图标）。
+2. 打开终端（PowerShell 或本项目用的 Git Bash），执行：
+
+   ```bash
+   docker run -d --name redis-dev -p 6379:6379 redis:7-alpine
+   ```
+
+   命令拆解（新手逐字看）：
+   - `docker run` —— 启动一个新容器
+   - `-d` —— 后台运行（不占着当前终端窗口）
+   - `--name redis-dev` —— 给这个容器起个好记的名字，之后可以用 `docker start/stop redis-dev` 控制它
+   - `-p 6379:6379` —— 把容器内部的 `6379` 端口（Redis 默认端口）映射到你电脑的 `6379` 端口，这样电脑上的 Python 程序才能连上
+   - `redis:7-alpine` —— 使用官方 Redis 7 镜像的 `alpine`（最小体积）版本
+
+3. 确认启动成功：
+
+   ```bash
+   docker ps
+   ```
+
+   能看到一行 `redis-dev`，`STATUS` 列显示 `Up ...` 就说明跑起来了。
+
+> 以后每次开机想再用 Redis，不用重新 `docker run`（那会报"容器名已存在"），
+> 直接 `docker start redis-dev` 就行；不想用了执行 `docker stop redis-dev`。
+>
+> 备选方案（不想装 Docker）：Windows 下装 [WSL2](https://learn.microsoft.com/windows/wsl/install)，
+> 进去之后就是一个 Linux 环境，`sudo apt install redis-server` 再 `redis-server` 即可，效果一样。
+
+### 7.6.2 验证 Redis 能连上（用 redis-cli 手动操作）
+
+`redis-cli` 是 Redis 自带的命令行客户端，专门用来手动查、改数据，调试时非常有用。
+容器里已经自带这个工具，直接借用：
+
+```bash
+docker exec -it redis-dev redis-cli ping
+```
+
+正常应该返回 `PONG`。如果报错 / 卡住，说明容器没起来，回 7.6.1 用 `docker ps` 排查。
+
+顺手练习一下"存"和"取"，建立直觉——这也是之后 Python 代码在做的事，只是换成了程序调用：
+
+```bash
+docker exec -it redis-dev redis-cli set hello world
+docker exec -it redis-dev redis-cli get hello
+# 应该打印：world
+```
+
+### 7.6.3 安装 Python 客户端库
+
+`requirements.txt` 里只需要一行（0.2 节已同步更新，去掉了旧文档里多余的 `aioredis`）：
+
+```bash
+pip install "redis>=5.0.0"
+```
+
+**新手常踩的坑**：网上很多教程会让你额外 `pip install aioredis`。这是因为很早以前，
+`redis` 这个包只支持"同步"调用（会阻塞程序），异步能力要靠另一个叫 `aioredis` 的包补充。
+但从 `redis-py` 5.x 版本开始，异步能力已经合并进 `redis` 包本身（`redis.asyncio` 模块），
+`aioredis` 项目已经停止维护。所以现在**只装 `redis` 一个包就够了**，装了 `aioredis`
+也不会报错，但完全用不到，容易让人误以为两者缺一不可——本节及配套代码统一只用 `redis`。
+
+### 7.6.4 创建 Redis 客户端连接
+
+之前第 10 章的 `SessionStore` 例子里有一句注释「实际中应该在应用启动时初始化
+`redis_client`」——这一节把这句注释真正落成代码。新建一个小文件专门负责"连接"这一件事：
+
+```python
+# swarm/redis_client.py
+"""
+创建 Redis 异步客户端。所有需要用 Redis 的模块（Blackboard、SessionStore）
+都从这里拿同一个客户端实例，不要各自建各自的连接。
+"""
+import os
+import redis.asyncio as redis
+
+
+def create_redis_client() -> redis.Redis:
+    """
+    从环境变量读取连接信息（对应附录 B 的 REDIS_HOST / REDIS_PORT / REDIS_PASSWORD）。
+    """
+    return redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", "6379")),
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,   # 让 Redis 返回的数据直接是 str，不是 bytes
+    )
+```
+
+逐行解释：
+- `redis.asyncio` —— `redis` 包里专门给 `async/await` 代码用的一套接口，和 Blackboard 里
+  `async def` 的写法配套；如果写的是不带 `async` 的普通脚本，改成 `import redis` 用
+  `redis.Redis(...)` 即可，用法基本一致。
+- `os.getenv("REDIS_HOST", "localhost")` —— 优先读 `.env` 里的 `REDIS_HOST`，没配就默认
+  连本机 `localhost`（也就是我们 7.6.1 里用 Docker 映射出来的地址）。
+- `decode_responses=True` —— **强烈建议加上**。默认情况下 Redis 客户端返回的是
+  `bytes`（比如 `b'{"a": 1}'`），拿去 `json.loads()` 之前还要手动 `.decode("utf-8")`，
+  加上这个参数后直接拿到 `str`，少一步，也少一个新手容易忘记处理的报错来源。
+
+在 `.env` 里加上（本机跑 Docker，密码留空即可）：
+
+```dotenv
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=
+```
+
+### 7.6.5 Blackboard 新增 save_to_redis / load_from_redis
+
+相比旧版本，这里补上了异常处理：Redis 连不上时不应该让整个 Swarm 崩掉，而是打日志、
+降级为"纯内存模式"继续跑（和第 10 章 `SessionStore` 的降级逻辑保持一致）。
+
 ```python
 # swarm/blackboard.py 新增方法（在 Blackboard 类里）
+import json
+import dataclasses
 
 async def save_to_redis(self, redis_client):
-    """把当前白板状态保存到 Redis，支持重启后恢复。"""
-    import json
-    import dataclasses
-    tasks_data = {tid: dataclasses.asdict(t) for tid, t in self._tasks.items()}
-    await redis_client.set("blackboard:tasks", json.dumps(tasks_data))
+    """
+    把当前白板状态保存到 Redis，支持重启后恢复。
+
+    Redis 只能存字符串/字节，不能直接存 Python 对象，所以要先把
+    Task（dataclass）转成 dict（dataclasses.asdict），再转成 JSON 字符串（json.dumps）。
+    """
+    try:
+        async with self._lock:
+            tasks_data = {tid: dataclasses.asdict(t) for tid, t in self._tasks.items()}
+        await redis_client.set("blackboard:tasks", json.dumps(tasks_data))
+    except Exception as e:
+        # Redis 挂了不应该让 Swarm 崩溃，打日志降级为纯内存模式即可
+        print(f"[Blackboard] 保存到 Redis 失败（降级为纯内存模式）：{e}")
 
 async def load_from_redis(self, redis_client):
-    """从 Redis 恢复白板状态。"""
-    import json
-    data = await redis_client.get("blackboard:tasks")
-    if data:
-        tasks_data = json.loads(data)
-        async with self._lock:
-            for tid, t_dict in tasks_data.items():
-                # 只恢复未完成的任务（已完成的不需要再处理）
-                if t_dict["status"] in ("pending", "claimed"):
-                    t_dict["status"] = "pending"   # 重新放回 pending（claimed 的任务可能已失败）
-                    t_dict["owner"] = None
-                    self._tasks[tid] = Task(**t_dict)
-        print(f"[Blackboard] 从 Redis 恢复了 {len(self._tasks)} 个任务")
+    """从 Redis 恢复白板状态（进程启动时调用一次）。"""
+    try:
+        data = await redis_client.get("blackboard:tasks")
+    except Exception as e:
+        print(f"[Blackboard] 连接 Redis 失败，跳过恢复，从空白板启动：{e}")
+        return
+
+    if not data:
+        print("[Blackboard] Redis 里没有历史任务数据，从空白板启动")
+        return
+
+    tasks_data = json.loads(data)   # data 已经是 str（因为建连时设了 decode_responses=True）
+    async with self._lock:
+        for tid, t_dict in tasks_data.items():
+            # 只恢复未完成的任务；claimed 的任务说明上次可能是处理到一半就被杀掉了，
+            # 重新放回 pending，让某个 Agent 重新认领执行一遍
+            if t_dict["status"] in ("pending", "claimed"):
+                t_dict["status"] = "pending"
+                t_dict["owner"] = None
+                self._tasks[tid] = Task(**t_dict)
+    print(f"[Blackboard] 从 Redis 恢复了 {len(self._tasks)} 个未完成任务")
 ```
+
+### 7.6.6 接入 Swarm 启动流程
+
+把 7.5 节的 `swarm/main.py` 改成：启动时先恢复，运行期间定期备份，退出前再存一次、
+最后关闭连接。
+
+```python
+# swarm/main.py — 带 Redis 持久化的 Swarm 启动示例
+import asyncio
+from .blackboard import Blackboard
+from .redis_client import create_redis_client
+from .review_agent import ReviewSwarmAgent
+
+
+async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 5.0):
+    """后台循环：每隔 interval 秒把白板状态备份到 Redis，直到被取消。"""
+    while True:
+        await asyncio.sleep(interval)
+        await blackboard.save_to_redis(redis_client)
+
+
+async def run_swarm():
+    blackboard = Blackboard()
+    redis_client = create_redis_client()
+
+    # 1. 启动时先尝试从 Redis 恢复上次未完成的任务
+    await blackboard.load_from_redis(redis_client)
+
+    # 2. 创建 Agent 并启动（同类型多个，实现负载均衡）
+    agents = [
+        ReviewSwarmAgent(blackboard),
+        ReviewSwarmAgent(blackboard),
+    ]
+    agent_tasks = [asyncio.create_task(agent.start()) for agent in agents]
+
+    # 3. 启动后台定期备份任务，不阻塞主流程
+    save_task = asyncio.create_task(periodic_save(blackboard, redis_client))
+
+    # 4. 发布任务到白板
+    t1 = await blackboard.post("code_review", "def login(u, p): return db.execute(f'SELECT * FROM users WHERE name={u}')")
+    t2 = await blackboard.post("code_review", "def upload(file): os.system(f'mv {file.name} /uploads/')")
+
+    await asyncio.sleep(30)   # 实际中应该等待特定任务完成，而不是死等固定时间
+
+    result1 = blackboard.get_task(t1)
+    print(f"任务1结果：{result1.result if result1 else 'pending'}")
+
+    # 5. 收尾：停 Agent、停后台备份任务、退出前再存一次、关闭连接
+    for agent in agents:
+        agent.stop()
+    await asyncio.gather(*agent_tasks, return_exceptions=True)
+
+    save_task.cancel()
+    await blackboard.save_to_redis(redis_client)   # 退出前最后再存一次，避免丢掉最新几秒的变化
+    await redis_client.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_swarm())
+```
+
+为什么用"定期备份"而不是"每次 post/complete/fail 都存一次"：后者对 Redis 的写入压力
+更大（任务多的时候几乎每次状态变化都要写一次网络请求），教学上先用简单的定时任务即可；
+生产场景可以按需改成状态变化时立即存，二者不冲突，可以都要（定时兜底 + 关键节点立即存）。
+
+### 7.6.7 手把手验证："杀掉进程再重启，任务还在"
+
+这是验证持久化真的生效的最直接方式：
+
+1. 确认 Redis 容器在跑：`docker ps` 看到 `redis-dev` 状态 `Up`。
+2. 运行 `python -m swarm.main`，发布任务后**不要等它跑完**，等终端打印过一次
+   `periodic_save` 触发的日志（或者直接等 5 秒以上，对应 `interval=5.0`），
+   然后按 `Ctrl+C` 强行中断进程，模拟"崩溃"。
+3. 用 `redis-cli` 直接查看 Redis 里存了什么：
+
+   ```bash
+   docker exec -it redis-dev redis-cli get blackboard:tasks
+   ```
+
+   应该能看到一大段 JSON 字符串，里面是任务的 `id` / `type` / `status` 等字段。
+4. 重新运行 `python -m swarm.main`，观察启动日志，应该出现：
+
+   ```
+   [Blackboard] 从 Redis 恢复了 N 个未完成任务
+   ```
+
+   看到这行，说明"进程重启、任务不丢"的持久化闭环跑通了。
+
+### 7.6.8 常见问题排查
+
+| 现象 | 原因 | 解决方法 |
+|------|------|---------|
+| `ConnectionRefusedError` / `Connection refused (6379)` | Redis 没启动，或者端口没映射对 | `docker ps` 确认容器状态；停了就 `docker start redis-dev` |
+| `redis.exceptions.AuthenticationError` | `.env` 里配了 `REDIS_PASSWORD`，但 Redis 服务本身没设密码（或反过来） | 本机 Docker 跑的 Redis 默认没密码，`.env` 里 `REDIS_PASSWORD` 留空即可 |
+| `TypeError: Object of type Task is not JSON serializable` | 忘了先用 `dataclasses.asdict()` 把 `Task` 转成 dict，就直接 `json.dumps(task)` | 检查 `save_to_redis` 里是否先 `asdict` 再 `json.dumps` |
+| 重启后日志没打印"恢复了 N 个任务"，Redis 里也查不到 key | `periodic_save` 还没跑到第一次（`interval` 设太长）就被 `Ctrl+C` 杀掉了 | 调小 `interval` 测试，或者等够 `interval` 秒再中断 |
+| `docker: command not found` | 没装 Docker Desktop，或装了但没加进终端 PATH | 重新安装 Docker Desktop，安装后重开一个终端窗口 |
 
 ---
 
@@ -4723,7 +4969,11 @@ async def load_from_redis(self, redis_client):
 
 □ 停止所有 Agent 后 start() 协程正常退出（不残留后台任务）
 
-□ （可选）Redis 持久化：重启后未完成任务重新出现在 pending 队列
+□ （可选）Redis 持久化：
+  1. docker exec -it redis-dev redis-cli ping 返回 PONG
+  2. 运行中 docker exec -it redis-dev redis-cli get blackboard:tasks 能看到 JSON 数据
+  3. Ctrl+C 杀掉进程后重新启动，日志出现「从 Redis 恢复了 N 个未完成任务」，
+     且未完成任务重新出现在 pending 队列（而不是永久消失）
 ```
 
 ---
@@ -7035,7 +7285,7 @@ my-agent/
 | `AuthenticationError: 401` | API Key 不正确或未设置 | 检查 `.env` 中对应 Provider 的 Key |
 | `ModuleNotFoundError: anthropic` | 依赖未安装 | `pip install -r requirements.txt` |
 | `context_length_exceeded` | 对话历史超出 Token 限制 | 启用第 8 章的历史压缩 |
-| `Connection refused (6379)` | Redis 未启动 | `redis-server` 或 `brew services start redis` |
+| `Connection refused (6379)` | Redis 未启动 | Windows/Docker：`docker start redis-dev`；Mac：`brew services start redis`（见 7.6 节） |
 | `Connection refused (11434)` | Ollama 未启动 | `ollama serve` |
 | `ValueError: 不支持的 Provider` | `LLM_PROVIDER` 拼写错误 | 检查 `.env`，可选值见附录 B |
 | `AssertionError: 有工具调用但未提供 ToolExecutor` | `run_agent_loop` 忘传 `executor` | 初始化 `ToolExecutor` 并传入 |
