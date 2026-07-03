@@ -4280,6 +4280,31 @@ curl -X POST http://localhost:8002/ask \
 - 不同 Agent 需要根据自身负载**动态认领任务**
 - 任务之间的依赖关系**事先不确定**（运行时才知道）
 
+### 7.1.1 接入方式：两个入口，而不是一个开关
+
+Coordinator 和 Swarm 不是同一个问题的两种实现方式，不存在"哪个更好、切换过去"的关系——
+它们对应的调用模式本身就不同（一次性问答 vs 持续任务流），所以**两个模式都保留**，
+但通过**不同的 HTTP 入口**区分，而不是加一个全局配置项让用户"切换模式"：
+
+- **`POST /ask`**：继续走 Coordinator（第 6 章）。用户问一句话，规划 → 分发 → 聚合 → 返回，
+  一次请求一次结果，边界清晰、好调试，适合当前的对话场景。
+- **`POST /swarm/tasks`**（本章新增，见 7.7 节）：走 Blackboard（本章）。适合"后台代码审查 /
+  调试任务队列"这类持续跑的功能——调用方把任务丢进白板就可以立刻拿到 `task_id` 返回，
+  真正的处理是常驻的 Swarm Agent 在后台异步认领执行的，调用方之后再用 `task_id`
+  查询状态/结果。
+
+为什么不做成一个全局开关（比如 `.env` 里配 `AGENT_MODE=coordinator|swarm`，所有请求走同一个
+`/ask` 再内部分流）：
+
+1. **两者的响应模型完全不同**——Coordinator 是"请求 → 等待 → 拿到最终结果"的同步语义；
+   Swarm 是"提交任务 → 立即拿到 task_id → 之后轮询/查询结果"的异步语义。硬塞进同一个接口，
+   调用方还要猜这次响应到底是最终结果还是一个任务 ID，接口契约会变得含糊。
+2. **调用方通常一开始就知道自己要什么**——写前端聊天框的人要的是同步问答，写后台批处理
+   /流水线的人要的是任务队列，没有人会在运行时纠结"这次调用到底该用哪种模式"，所以
+   "由调用方选择接口"比"由配置项选择模式"更贴近真实使用方式。
+3. **少一套状态维护**——全局开关意味着任何时候两套实现都要同时初始化、同时保持一致，
+   本质上并不会省代码；分成两个入口后，`/ask` 和 `/swarm/tasks` 各自独立演化，互不影响。
+
 ---
 
 ## 7.2 任务白板 `swarm/blackboard.py`
@@ -4956,7 +4981,117 @@ if __name__ == "__main__":
 
 ---
 
-## 7.7 本章检查清单
+## 7.7 接入 FastAPI：`POST /swarm/tasks` 入口
+
+前面 7.5/7.6 节的 `swarm/main.py` 是一个独立跑的 asyncio 脚本（`python -m swarm.main`），
+跟 `main.py` 里跑着的 FastAPI 服务是两个进程，互不相关。要落地 7.1.1 节说的"不同入口"，
+需要把 Blackboard 和常驻的 Swarm Agent 接进 `main.py` 的生命周期，新增一个独立于
+`/ask` 的接口组：
+
+```python
+# main.py 顶部新增 import（跟原有的 fastapi/pydantic import 放一起）
+import asyncio
+from typing import Any
+
+from fastapi import HTTPException
+```
+
+```python
+# main.py 新增：Swarm 相关的请求/响应模型
+
+class SwarmTaskRequest(BaseModel):
+    """POST /swarm/tasks 的请求体格式"""
+    task_type: str = Field(..., description="任务类型，如 code_review", examples=["code_review"])
+    payload: str = Field(..., min_length=1, description="任务内容（自由格式，如一段代码）")
+
+
+class SwarmTaskResponse(BaseModel):
+    """POST /swarm/tasks 的响应体格式：只返回 task_id，不等待任务执行完成"""
+    task_id: str
+
+
+class SwarmTaskStatusResponse(BaseModel):
+    """GET /swarm/tasks/{task_id} 的响应体格式"""
+    id: str
+    status: str                 # pending | claimed | done | failed
+    owner: str | None = None
+    result: Any = None
+    error: str | None = None
+```
+
+```python
+# main.py 的 lifespan 里新增：启动时创建白板 + 常驻 Agent，关闭时停掉 Agent
+from swarm.blackboard import Blackboard
+from swarm.reviewer_agent import ReviewerSwarmAgent
+from swarm.debugger_agent import DebuggerSwarmAgent
+
+_blackboard = Blackboard()
+_swarm_agent_tasks: list[asyncio.Task] = []
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("服务启动中...")
+    # 常驻 Swarm Agent：跟 FastAPI 服务同生命周期，不需要每次请求创建
+    agents = [ReviewerSwarmAgent(_blackboard), DebuggerSwarmAgent(_blackboard)]
+    _swarm_agent_tasks.extend(asyncio.create_task(a.start()) for a in agents)
+    yield
+    for task in _swarm_agent_tasks:
+        task.cancel()
+    await asyncio.gather(*_swarm_agent_tasks, return_exceptions=True)
+    print("服务已关闭。")
+```
+
+```python
+# main.py 新增接口：提交任务立即返回 task_id，不等待执行完成——这是跟 /ask 的核心区别
+@app.post("/swarm/tasks", response_model=SwarmTaskResponse)
+async def post_swarm_task(req: SwarmTaskRequest) -> SwarmTaskResponse:
+    """
+    提交一个任务到白板，交给后台常驻的 Swarm Agent 异步认领执行。
+    不像 /ask 那样等结果——调用方拿到 task_id 后自己决定什么时候来查。
+    """
+    task_id = await _blackboard.post(req.task_type, req.payload)
+    return SwarmTaskResponse(task_id=task_id)
+
+
+@app.get("/swarm/tasks/{task_id}", response_model=SwarmTaskStatusResponse)
+async def get_swarm_task(task_id: str) -> SwarmTaskStatusResponse:
+    """查询某个任务当前的状态/结果，配合 /swarm/tasks 轮询使用。"""
+    task = _blackboard.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+    return SwarmTaskStatusResponse(
+        id=task.id, status=task.status, owner=task.owner,
+        result=task.result, error=task.error,
+    )
+
+
+@app.get("/swarm/tasks")
+async def list_swarm_tasks() -> dict:
+    """查看白板整体状态摘要，如 {"pending": 2, "done": 5}，运维/监控用。"""
+    return _blackboard.summary()
+```
+
+调用方式跟 `/ask` 的对比一目了然——`/ask` 一次调用就有最终答案，`/swarm/tasks` 分两步：
+
+```bash
+# 1. 提交任务，立即拿到 task_id（不等处理完成）
+curl -X POST http://localhost:8002/swarm/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"task_type": "code_review", "payload": "def f(x): return x+1"}'
+# {"task_id": "a1b2c3d4"}
+
+# 2. 之后随时查状态/结果
+curl http://localhost:8002/swarm/tasks/a1b2c3d4
+# {"id": "a1b2c3d4", "status": "done", "owner": "...", "result": "...", "error": null}
+```
+
+`/ask` 的代码（6.9 节）完全不用改——两个入口各自独立，互不干扰，这正是 7.1.1 节说的
+"由调用方选接口决定模式"而不是共用一个接口再靠开关分流。
+
+---
+
+## 7.8 本章检查清单
 
 ```
 □ Blackboard 的 claim() 是原子操作（并发认领同一任务不会出现竞态）
@@ -4974,6 +5109,11 @@ if __name__ == "__main__":
   2. 运行中 docker exec -it redis-dev redis-cli get blackboard:tasks 能看到 JSON 数据
   3. Ctrl+C 杀掉进程后重新启动，日志出现「从 Redis 恢复了 N 个未完成任务」，
      且未完成任务重新出现在 pending 队列（而不是永久消失）
+
+□ /ask 和 /swarm/tasks 两个入口互不影响：
+  1. POST /swarm/tasks 立即返回 task_id（不会等任务跑完才响应）
+  2. GET /swarm/tasks/{task_id} 能查到 pending → done 的状态变化
+  3. 这期间正常调用 POST /ask，Coordinator 路径的响应时间不受 Swarm 任务影响
 ```
 
 ---
@@ -7457,10 +7597,11 @@ Commit 命名规范：
 - 以 Anthropic 消息格式为内部标准，OpenAI 的 `tool_calls` / Gemini 的 `function_call` 统一转换
 - 生产环境可按成本 / 性能动态切换 Provider
 
-### 亮点 3：多 Agent 编排：Coordinator + Swarm 双模式
+### 亮点 3：多 Agent 编排：Coordinator + Swarm 双模式，两个入口而非一个开关
 
-- **Coordinator 模式**：LeadAgent 只做意图理解和任务分发，专家 Agent 无状态、可水平扩展
-- **Swarm 模式**：持久化 Agent 团队共享 Blackboard 白板，任务自动认领，支持并行执行
+- **Coordinator 模式**（`POST /ask`）：LeadAgent 只做意图理解和任务分发，专家 Agent 无状态、可水平扩展，同步返回最终结果
+- **Swarm 模式**（`POST /swarm/tasks`）：持久化 Agent 团队共享 Blackboard 白板，任务自动认领，支持并行执行，异步提交任务、按 task_id 查询结果
+- 两种模式不是靠配置项切换，而是各占一个独立 HTTP 入口，调用方按自己的调用模式（同步问答 / 异步任务队列）直接选接口
 - 拓扑排序实现有向无环图（DAG）任务依赖调度，互不依赖的子任务自动并行
 
 ### 亮点 4：工程级上下文管理
