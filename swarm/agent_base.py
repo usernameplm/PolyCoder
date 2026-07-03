@@ -15,8 +15,12 @@ class SwarmAgent(ABC):
 
     def __init__(self, blackboard: Blackboard, agent_id: str | None = None):
         self.blackboard = blackboard
+        # 允许子类传固定 agent_id（方便看日志）；不传则自动生成一个，
+        # 保证同一类型开多个实例做负载均衡时 ID 不会撞在一起
         self.agent_id = agent_id or f"{type(self).__name__}-{id(self) % 10000}"
         self._running = False
+        # 把自己声明的 task_types 登记到白板，供 post() 校验任务类型是否有人处理
+        self.blackboard.register_consumer(self.task_types)
 
     @property
     @abstractmethod

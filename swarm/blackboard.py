@@ -37,13 +37,33 @@ class Blackboard:
         self._tasks: dict[str, Task] = {}
         self._lock = asyncio.Lock()
         self._new_task_event = asyncio.Event()   # 有新任务时触发，唤醒等待的 Agent
+        self._known_types: set[str] = set()       # 已注册消费者的任务类型，post() 时校验用
+
+    def register_consumer(self, task_types: list[str]):
+        """
+        登记"有 Agent 能处理这些任务类型"。
+
+        由 SwarmAgent.__init__ 在创建实例时自动调用（见 agent_base.py），
+        不需要手动调用。post() 发布任务时会检查类型是否在这个集合里，
+        避免出现"发布了但没有任何 Agent 会认领"的任务永远卡在 pending。
+        """
+        self._known_types.update(task_types)
 
     async def post(self, task_type: str, payload: Any) -> str:
         """
         发布一个新任务到白板。返回任务 ID。
 
         任何 Agent 或外部代码都可以调用这个方法发布任务。
+
+        如果 task_type 不在任何已注册 Agent 的 task_types 里，说明发布了
+        一个没人处理的任务类型（比如手写字符串时的笔误），直接抛异常，
+        而不是让任务静默地永远停在 pending。
         """
+        if self._known_types and task_type not in self._known_types:
+            raise ValueError(
+                f"未知任务类型：'{task_type}'。已注册消费者的类型：{sorted(self._known_types)}"
+            )
+
         task_id = str(uuid.uuid4())[:8]   # 短 ID，方便日志查看
         task = Task(id=task_id, type=task_type, payload=payload)
 

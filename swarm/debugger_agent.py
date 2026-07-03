@@ -5,6 +5,7 @@ Swarm 模式下的调试修复 Agent。
 """
 from .blackboard import Blackboard
 from .agent_base import SwarmAgent
+from .task_types import TASK_TYPE_DEBUG, TASK_TYPE_TEST_WRITE
 
 
 class DebuggerSwarmAgent(SwarmAgent):
@@ -14,7 +15,7 @@ class DebuggerSwarmAgent(SwarmAgent):
 
     @property
     def task_types(self) -> list[str]:
-        return ["debug"]
+        return [TASK_TYPE_DEBUG]
 
     async def handle(self, task) -> str:
         payload = task.payload
@@ -53,7 +54,7 @@ class DebuggerSwarmAgent(SwarmAgent):
 
         # 修复完成后，自动发布 test_write 任务
         await self.blackboard.post(
-            task_type="test_write",
+            task_type=TASK_TYPE_TEST_WRITE,
             payload={
                 "code": result,
                 "file": filename,

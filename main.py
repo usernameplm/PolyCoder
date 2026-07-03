@@ -19,8 +19,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 
+import asyncio
+from swarm.blackboard import Blackboard
+from swarm.reviewer_agent import ReviewerSwarmAgent
+from swarm.debugger_agent import DebuggerSwarmAgent
+from swarm.test_writer_agent import TestWriterSwarmAgent
+from swarm.task_types import TaskType
+
 from agent import ask_stream
 from coordinator.agent import CoordinatorAgent
+
+from typing import Any
 
 
 # ── 请求/响应数据格式定义 ──────────────────────────────────────────
@@ -42,7 +51,27 @@ class AskResponse(BaseModel):
     error: str | None = Field(default=None, description="错误信息")
 
 
+class SwarmAskRequest(BaseModel):
+    """POST /swarm/ask 的请求体格式"""
+    task_type: TaskType = Field(..., description="任务类型，范围见 swarm/task_types.py", examples=["code_review"])
+    payload: dict = Field(..., description="任务内容，字段随 task_type 变化，如 {'code': '...', 'file': 'a.py'}")
+    timeout: float = Field(default=30.0, ge=1.0, le=120.0, description="最长等待秒数，超时仍未完成则返回当前状态（一般是 pending）")
+
+
+class SwarmAskResponse(BaseModel):
+    """POST /swarm/ask 的响应体格式"""
+    task_id: str
+    status: str                 # pending | claimed | done | failed
+    result: Any = None
+    error: str | None = None
+
+
 # ── 应用生命周期（启动/关闭钩子）────────────────────────────────────
+
+# 全局白板 + Swarm Agent 后台任务（跟 _coordinator 一样，启动时初始化一次）
+_blackboard = Blackboard()
+_swarm_agent_tasks: list[asyncio.Task] = []
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -53,7 +82,20 @@ async def lifespan(app: FastAPI):
     print("服务启动中...")
     print(f"API 文档地址：http://localhost:8002/docs")
     print(f"流式测试：curl -N 'http://localhost:8002/ask/stream?question=你好'")
+
+    # 常驻 Swarm Agent：跟 FastAPI 服务同生命周期，不是每次请求创建/销毁
+    agents = [
+        ReviewerSwarmAgent(_blackboard),
+        DebuggerSwarmAgent(_blackboard),
+        TestWriterSwarmAgent(_blackboard),
+    ]
+    _swarm_agent_tasks.extend(asyncio.create_task(a.start()) for a in agents)
+
     yield
+
+    for task in _swarm_agent_tasks:
+        task.cancel()
+    await asyncio.gather(*_swarm_agent_tasks, return_exceptions=True)
     print("服务已关闭。")
 
 
@@ -153,6 +195,33 @@ async def ask_stream_endpoint(question: str):
             "Cache-Control": "no-cache",          # 不缓存，保证实时性
             "X-Accel-Buffering": "no",            # 禁用 Nginx 缓冲（如果用了 Nginx 反代）
         },
+    )
+
+@app.post("/swarm/ask", response_model=SwarmAskResponse)
+async def swarm_ask_endpoint(req: SwarmAskRequest) -> SwarmAskResponse:
+    """
+    用法跟 /ask 类似：提交一个任务、等结果、拿到最终状态再返回。
+    跟 /ask 的区别在于编排方式——这里任务是发布到 Blackboard，由常驻的
+    Swarm Agent 通过 claim() 认领执行的，不是主 Agent 直接调用子 Agent。
+    """
+    try:
+        task_id = await _blackboard.post(req.task_type, req.payload)
+    except ValueError as e:
+        # 正常情况下 task_type 已经被 TaskType（Literal）挡在 API 校验层，
+        # 这里兜底的是"合法类型但没有 Agent 注册"这种内部配置错误
+        return SwarmAskResponse(task_id="", status="failed", error=str(e))
+
+    # Blackboard 目前只在"有新任务发布"时唤醒等待者，没有"某个任务完成"的专属信号，
+    # 所以这里用最简单的方式实现"等结果"：固定间隔轮询任务状态，直到 done/failed 或超时
+    deadline = time.time() + req.timeout
+    task = _blackboard.get_task(task_id)
+    while task.status in ("pending", "claimed") and time.time() < deadline:
+        await asyncio.sleep(0.3)
+        task = _blackboard.get_task(task_id)
+
+    return SwarmAskResponse(
+        task_id=task_id, status=task.status,
+        result=task.result, error=task.error,
     )
 
 

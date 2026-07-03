@@ -46,22 +46,85 @@
         #loading-indicator { display: none; text-align: center; color: #999; font-size: 13px; padding: 8px; }
         #loading-indicator.active { display: block; }
         .footer-time { font-size: 11px; color: #999; margin-top: 8px; }
+
+        /* 模式切换 tab */
+        .tabs { display: flex; gap: 6px; margin-left: auto; }
+        .tab-btn { padding: 4px 12px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.3); background: transparent; color: #ccc; font-size: 12px; }
+        .tab-btn.active { background: #007aff; color: #fff; border-color: #007aff; }
+
+        /* Swarm 面板 */
+        #swarm-panel { display: none; flex: 1; overflow-y: auto; padding: 16px; }
+        #swarm-panel.active { display: block; }
+        #chat.hidden, .toolbar.hidden, #loading-indicator.hidden { display: none; }
+        .swarm-form { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); max-width: 720px; margin: 0 auto 16px; display: flex; flex-direction: column; gap: 10px; }
+        .swarm-form label { font-size: 12px; color: #666; font-weight: 600; }
+        .swarm-form select, .swarm-form input[type=text], .swarm-form input[type=number], .swarm-form textarea {
+            width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; font-family: inherit; outline: none;
+        }
+        .swarm-form select:focus, .swarm-form input:focus, .swarm-form textarea:focus { border-color: #007aff; }
+        .swarm-form textarea { font-family: "SFMono-Regular", Consolas, Menlo, monospace; min-height: 140px; resize: vertical; }
+        .swarm-row { display: flex; gap: 10px; }
+        .swarm-row > div { flex: 1; }
+        #btn-swarm-submit { background: #ff9500; color: #fff; align-self: flex-start; }
+        .swarm-result { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); max-width: 720px; margin: 0 auto; }
+        .swarm-result .badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 12px; color: #fff; margin-left: 8px; }
+        .badge.pending, .badge.claimed { background: #ff9500; }
+        .badge.done { background: #34c759; }
+        .badge.failed { background: #f44336; }
+        .swarm-result pre { background: #1e1e1e; color: #d4d4d4; padding: 12px 14px; border-radius: 6px; overflow-x: auto; margin: 8px 0; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
     </style>
 </head>
 <body>
     <header>
         <h1>PolyCoder</h1>
         <span id="status" class="status offline">checking...</span>
+        <div class="tabs">
+            <button class="tab-btn active" id="tab-chat" onclick="switchMode('chat')">Chat</button>
+            <button class="tab-btn" id="tab-swarm" onclick="switchMode('swarm')">Swarm</button>
+        </div>
     </header>
 
     <div id="chat"></div>
     <div id="loading-indicator">正在思考中...</div>
 
-    <div class="toolbar">
+    <div class="toolbar" id="chat-toolbar">
         <textarea id="input" rows="1" placeholder="输入你的问题..."></textarea>
         <button id="btn-ask" onclick="ask(false)">Ask</button>
         <button id="btn-stream" onclick="ask(true)">Stream</button>
         <button id="btn-clear" onclick="clearChat()">清空</button>
+    </div>
+
+    <div id="swarm-panel">
+        <div class="swarm-form">
+            <div>
+                <label>任务类型 task_type</label>
+                <select id="swarm-task-type">
+                    <option value="code_review">code_review（代码审查，Critical 问题会自动派生 debug → test_write）</option>
+                    <option value="debug">debug（调试修复，完成后自动派生 test_write）</option>
+                    <option value="test_write">test_write（生成单元测试，可直接测试或由 debug 派生）</option>
+                </select>
+            </div>
+            <div class="swarm-row">
+                <div>
+                    <label>文件名 file</label>
+                    <input type="text" id="swarm-file" placeholder="a.py" value="a.py">
+                </div>
+                <div>
+                    <label>重点关注 focus（仅 code_review 用）</label>
+                    <input type="text" id="swarm-focus" placeholder="如 security，留空为全面审查">
+                </div>
+                <div style="max-width: 140px;">
+                    <label>超时秒数 timeout</label>
+                    <input type="number" id="swarm-timeout" value="30" min="1" max="120">
+                </div>
+            </div>
+            <div>
+                <label>代码内容 code</label>
+                <textarea id="swarm-code" placeholder="粘贴要审查/调试的代码..."></textarea>
+            </div>
+            <button id="btn-swarm-submit" onclick="submitSwarmTask()">提交任务</button>
+        </div>
+        <div class="swarm-result" id="swarm-result" style="display:none;"></div>
     </div>
 
     <script>
@@ -209,6 +272,81 @@
 
         function clearChat() {
             document.getElementById('chat').innerHTML = '';
+        }
+
+        // ── Swarm 模式 ──────────────────────────────────────────────
+
+        function switchMode(mode) {
+            const isChat = mode === 'chat';
+            document.getElementById('tab-chat').classList.toggle('active', isChat);
+            document.getElementById('tab-swarm').classList.toggle('active', !isChat);
+            document.getElementById('chat').classList.toggle('hidden', !isChat);
+            document.getElementById('chat-toolbar').classList.toggle('hidden', !isChat);
+            if (isChat) document.getElementById('loading-indicator').classList.remove('hidden');
+            document.getElementById('swarm-panel').classList.toggle('active', !isChat);
+        }
+
+        function statusText(status) {
+            return { pending: '排队中', claimed: '处理中', done: '已完成', failed: '失败' }[status] || status;
+        }
+
+        async function submitSwarmTask() {
+            const taskType = document.getElementById('swarm-task-type').value;
+            const code = document.getElementById('swarm-code').value;
+            const file = document.getElementById('swarm-file').value.trim() || 'a.py';
+            const focus = document.getElementById('swarm-focus').value.trim();
+            const timeout = parseFloat(document.getElementById('swarm-timeout').value) || 30;
+
+            if (!code.trim()) {
+                alert('请先粘贴要提交的代码');
+                return;
+            }
+
+            const payload = { code, file };
+            if (taskType === 'code_review' && focus) payload.focus = focus;
+
+            const btn = document.getElementById('btn-swarm-submit');
+            btn.disabled = true;
+            btn.textContent = '提交中...';
+
+            const resultBox = document.getElementById('swarm-result');
+            resultBox.style.display = 'block';
+            resultBox.innerHTML = '<div style="color:#999;">任务已提交，等待 Swarm Agent 认领与处理...</div>';
+
+            const start = Date.now();
+            try {
+                const resp = await fetch(BASE + '/swarm/ask', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_type: taskType, payload, timeout }),
+                });
+                const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+
+                if (!resp.ok) {
+                    resultBox.innerHTML = '<span style="color:red">错误：HTTP ' + resp.status + '</span>';
+                    return;
+                }
+
+                const data = await resp.json();
+                let html = '<div><strong>task_id:</strong> ' + data.task_id +
+                    ' <span class="badge ' + data.status + '">' + statusText(data.status) + '</span>' +
+                    ' <span style="color:#999; font-size:12px;">(' + elapsed + 's)</span></div>';
+
+                if (data.error) {
+                    html += '<div style="color:red; margin-top:8px;">错误：' + data.error + '</div>';
+                } else if (data.result) {
+                    html += '<pre>' + String(data.result)
+                        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
+                } else {
+                    html += '<div style="color:#999; margin-top:8px;">尚未完成（可能仍在 pending/claimed，可调大 timeout 后重试）。</div>';
+                }
+                resultBox.innerHTML = html;
+            } catch (e) {
+                resultBox.innerHTML = '<span style="color:red">请求失败：' + e.message + '</span>';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '提交任务';
+            }
         }
     </script>
 </body>

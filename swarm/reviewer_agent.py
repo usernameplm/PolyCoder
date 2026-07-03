@@ -8,6 +8,7 @@ Swarm 模式下的代码审查 Agent。
 import asyncio
 from .blackboard import Blackboard
 from .agent_base import SwarmAgent
+from .task_types import TASK_TYPE_CODE_REVIEW, TASK_TYPE_DEBUG
 
 
 class ReviewerSwarmAgent(SwarmAgent):
@@ -18,7 +19,7 @@ class ReviewerSwarmAgent(SwarmAgent):
     @property
     def task_types(self) -> list[str]:
         """声明这个 Agent 能处理哪些类型的任务。"""
-        return ["code_review"]
+        return [TASK_TYPE_CODE_REVIEW]
 
     async def handle(self, task) -> str:
         """
@@ -65,7 +66,7 @@ class ReviewerSwarmAgent(SwarmAgent):
         # 如果发现严重问题，自动发布 debug 任务（这就是 Swarm 的涌现式行为）
         if "NEEDS_FIX:true" in result:
             debug_task_id = await self.blackboard.post(
-                task_type="debug",
+                task_type=TASK_TYPE_DEBUG,
                 payload={
                     "code": code,
                     "file": filename,

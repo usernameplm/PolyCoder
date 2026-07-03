@@ -4354,13 +4354,33 @@ class Blackboard:
         self._tasks: dict[str, Task] = {}
         self._lock = asyncio.Lock()
         self._new_task_event = asyncio.Event()   # 有新任务时触发，唤醒等待的 Agent
+        self._known_types: set[str] = set()       # 已注册消费者的任务类型，post() 时校验用
+
+    def register_consumer(self, task_types: list[str]):
+        """
+        登记"有 Agent 能处理这些任务类型"。
+
+        由 SwarmAgent.__init__ 在创建实例时自动调用（见 7.3 节的 agent_base.py），
+        不需要手动调用。post() 发布任务时会检查类型是否在这个集合里，
+        避免出现"发布了但没有任何 Agent 会认领"的任务永远卡在 pending。
+        """
+        self._known_types.update(task_types)
 
     async def post(self, task_type: str, payload: Any) -> str:
         """
         发布一个新任务到白板。返回任务 ID。
 
         任何 Agent 或外部代码都可以调用这个方法发布任务。
+
+        如果 task_type 不在任何已注册 Agent 的 task_types 里，说明发布了
+        一个没人处理的任务类型（比如手写字符串时的笔误），直接抛异常，
+        而不是让任务静默地永远停在 pending。
         """
+        if self._known_types and task_type not in self._known_types:
+            raise ValueError(
+                f"未知任务类型：'{task_type}'。已注册消费者的类型：{sorted(self._known_types)}"
+            )
+
         task_id = str(uuid.uuid4())[:8]   # 短 ID，方便日志查看
         task = Task(id=task_id, type=task_type, payload=payload)
 
@@ -4428,6 +4448,29 @@ class Blackboard:
         return dict(counts)
 ```
 
+**`_known_types` / `register_consumer()` 是干什么的？零基础也要懂这一段的动机**：
+
+刚开始写 Swarm 的时候，`post()` 是不做任何检查的——只要有人调用
+`await blackboard.post("随便什么字符串", 数据)`，任务就会被塞进 `self._tasks` 字典，
+状态是 `pending`，然后**永远停在这里**，除非正好有个 Agent 声明了同名的 `task_types`
+去认领它。真实踩过的坑：`DebuggerSwarmAgent`（7.4b 节）修复完代码后会自动发布一个
+`task_type="test_write"` 的任务，但当时 `swarm/` 目录下没有任何 Agent 声明处理
+`"test_write"`——任务发出去了，日志也打印了"已发布"，但**没有任何异常、没有任何提示**，
+只有翻白板数据才能发现这个任务一直卡在 `pending`。
+
+`_known_types` 就是为了在"发布时"就能发现这类问题：它是一个集合，记录"当前有哪些
+任务类型是有 Agent 会处理的"。`register_consumer(task_types)` 负责往这个集合里添加，
+调用时机是**每个 SwarmAgent 实例被创建的时候**（见 7.3 节 `SwarmAgent.__init__`
+里的那一行调用，不需要手动维护一份额外的注册表）。这样 `post()` 里就能加一句
+「如果 `task_type` 不在 `_known_types` 里，直接抛异常」——把"发布了没人处理的任务"
+从"运行时悄悄卡死"变成"发布那一刻就报错"，7.5.3 节会看到 `main.py` 怎么接住这个异常
+返回给调用方，而不是让服务直接崩掉。
+
+顺带解释一下 `if self._known_types and task_type not in self._known_types` 里为什么
+要加 `self._known_types and` 这个前半句：如果一个 Agent 都还没创建（`_known_types`
+是空集合），这个检查会直接跳过，不会误报"没人处理"——毕竟这时候确实还没轮到检查的
+时候（比如测试代码里可能想在没启动任何 Agent 的情况下单独测 `post()` 本身）。
+
 ---
 
 ## 7.3 Swarm Agent 基类 `swarm/agent_base.py`
@@ -4454,6 +4497,8 @@ class SwarmAgent(ABC):
         # 保证同一类型开多个实例做负载均衡时 ID 不会撞在一起
         self.agent_id = agent_id or f"{type(self).__name__}-{id(self) % 10000}"
         self._running = False
+        # 把自己声明的 task_types 登记到白板，供 post() 校验任务类型是否有人处理
+        self.blackboard.register_consumer(self.task_types)
 
     @property
     @abstractmethod
@@ -4503,7 +4548,96 @@ class SwarmAgent(ABC):
 > `DebuggerSwarmAgent` 也是按这两个名字实现的——如果你本地的 `swarm/agent_base.py`
 > 还是旧版本（`name`/`handles`/`process`），子类会因为方法名不匹配报
 > `TypeError: Can't instantiate abstract class ... with abstract method`，
-> 记得同步改成上面这版。
+> 记得同步改成上面这版。另外注意 `__init__` 最后新增的
+> `self.blackboard.register_consumer(self.task_types)` 这一行——它是 7.2 节
+> `_known_types` 校验能生效的前提，如果子类没有调用 `super().__init__(...)`
+> （比如自己重写了一个 `__init__` 却忘了调用父类的），这一步就不会执行，
+> 这个 Agent 声明的 `task_types` 也就不会被白板知道，会出现"明明写了 `task_types`
+> 但 `post()` 还是报未知类型"的诡异现象——排查时先检查这一点。
+
+---
+
+## 7.3b 任务类型的唯一定义来源 `swarm/task_types.py`
+
+7.2 节的 `_known_types` 解决了"发布了没人处理的任务会静默卡死"这一个问题，但还留了
+一个隐患：**任务类型本身还是裸字符串**。`main.py` 的请求体、`Blackboard.Task.type`、
+每个 `SwarmAgent.task_types` 里都是各自手写 `"code_review"` / `"debug"` /
+`"test_write"` 这样的字符串，没有任何地方规定"合法的类型只有这三种"——如果某个
+Agent 手写时打错一个字（比如写成 `"test_write "`，多了个空格，或者 `"testwrite"`
+少了个下划线），Python 不会报任何语法错误，只会在运行时表现成"这个任务又没人处理了"，
+排查起来跟 7.2 节说的坑几乎一样麻烦，只是触发原因从"忘了写 Agent"变成了"写错了字符串"。
+
+解决思路很直接：把"到底有哪些合法的任务类型"这件事**只写在一个地方**，其他所有
+用到任务类型的代码都从这一个地方导入，而不是各自重复敲字符串——这样输入错误会
+在 `import` 或者 `Literal` 类型校验阶段就被发现，而不是等到运行时才发现任务卡住了：
+
+```python
+# swarm/task_types.py
+"""
+Swarm 模式下所有合法任务类型的唯一定义来源。
+
+之前的问题：task_type 在 API 层（SwarmAskRequest）、白板（Task.type）、
+各 SwarmAgent 的 task_types 声明里都是裸字符串，三处互不校验——
+DebuggerSwarmAgent 发布了一个 "test_write" 任务，但没有任何 Agent
+声明处理这个类型，任务永远卡在 pending，也不会报错。
+
+这里把"合法范围"集中定义一次，API 校验和 Blackboard 运行时校验都引用
+同一份定义，新增任务类型时只需要改这一个文件。
+"""
+from typing import Literal
+
+TASK_TYPE_CODE_REVIEW = "code_review"
+TASK_TYPE_DEBUG = "debug"
+TASK_TYPE_TEST_WRITE = "test_write"
+
+# 供 Pydantic 请求体做值域校验：传入范围外的字符串会在 API 层直接 422，
+# 不会等到进了白板才发现没人处理。
+TaskType = Literal["code_review", "debug", "test_write"]
+
+ALL_TASK_TYPES: tuple[str, ...] = (
+    TASK_TYPE_CODE_REVIEW,
+    TASK_TYPE_DEBUG,
+    TASK_TYPE_TEST_WRITE,
+)
+```
+
+逐段解释，专门讲给没接触过 `Literal` 的读者：
+
+- **为什么不直接用普通字符串常量就够了**（比如只写 `TASK_TYPE_DEBUG = "debug"`）：
+  常量能防止*代码里*手写打错字（写 `TASK_TYPE_DEBUG` 打错了 Python 会直接报
+  `NameError`，比字符串打错字要显眼得多），但常量本身不能拦住"外部调用方通过
+  HTTP 请求传了一个乱七八糟的字符串"这种情况——那是 7.5.1 节 `TaskType` 要解决的
+  另一层问题。
+- **`Literal["code_review", "debug", "test_write"]` 是什么**：这是 Python
+  `typing` 模块提供的一种类型标注，意思是"这个变量的取值只能是这几个字符串中的
+  一个，不能是任意 `str`"。单独写在业务代码里它不会自动帮你做检查（Python 本身
+  不强制类型标注），但 **Pydantic**（`main.py` 用来定义请求体的库）认识
+  `Literal`，会在校验请求体的时候真正拿它当"合法值枚举"来用——这就是 7.5.1 节
+  `SwarmAskRequest.task_type: TaskType` 能在 API 层直接返回 422 的原理，本节先
+  只关注这个类型是在哪定义的。
+- **为什么 `TASK_TYPE_XXX` 常量和 `TaskType`（`Literal`）要同时留着，不是重复**：
+  前者是给*写代码的人*用的（`from .task_types import TASK_TYPE_DEBUG`，IDE 能自动
+  补全、拼错会报错），后者是给*Pydantic 做请求体校验*用的（HTTP 请求体本质是
+  JSON 字符串，Pydantic 需要一个"合法字符串范围"的类型标注才能在校验阶段拦截，
+  不能拿 Python 常量做这件事）——两者服务的是同一份"合法范围"，但用在不同层，
+  所以都保留，且都从这一个文件派生，保证不会出现"改了一处、另一处忘了改"的情况。
+- **`ALL_TASK_TYPES` 目前谁在用**：本次改动里暂时没有代码直接用到这个元组（比如
+  遍历打印所有合法类型），先留着是因为它比 `Literal["code_review", ...]` 更容易
+  在运行时被代码遍历使用（`Literal` 的可选值要用
+  `typing.get_args(TaskType)` 才能在运行时取出来，不如直接遍历一个元组直观）——
+  如果之后要写一个"打印当前支持哪些任务类型"的接口或日志，直接用这个元组即可，
+  不需要再额外定义一份。
+
+新增任务类型时的操作步骤（新手可以照抄这个顺序）：
+
+1. 在 `swarm/task_types.py` 里加一行 `TASK_TYPE_XXX = "xxx"`，同时把 `"xxx"`
+   加进 `TaskType` 的 `Literal[...]` 列表和 `ALL_TASK_TYPES` 元组。
+2. 写一个新的 `SwarmAgent` 子类，`task_types` 属性里返回 `[TASK_TYPE_XXX]`
+   （参考 7.4/7.4b/7.4c 节的写法）。
+3. 在 `main.py` 的 `lifespan` 里把这个新 Agent 加进 `agents` 列表（7.5.2 节）。
+
+漏了第 2、3 步中的任何一步，7.2 节的 `_known_types` 校验都会在 `post()` 时立刻
+报错提示"未知任务类型"，不会再出现本章开头说的那种"静默卡死"。
 
 ---
 
@@ -4522,6 +4656,7 @@ Swarm 模式下的代码审查 Agent。
 import asyncio
 from .blackboard import Blackboard
 from .agent_base import SwarmAgent
+from .task_types import TASK_TYPE_CODE_REVIEW, TASK_TYPE_DEBUG
 
 
 class ReviewerSwarmAgent(SwarmAgent):
@@ -4532,7 +4667,7 @@ class ReviewerSwarmAgent(SwarmAgent):
     @property
     def task_types(self) -> list[str]:
         """声明这个 Agent 能处理哪些类型的任务。"""
-        return ["code_review"]
+        return [TASK_TYPE_CODE_REVIEW]
 
     async def handle(self, task) -> str:
         """
@@ -4579,7 +4714,7 @@ class ReviewerSwarmAgent(SwarmAgent):
         # 如果发现严重问题，自动发布 debug 任务（这就是 Swarm 的涌现式行为）
         if "NEEDS_FIX:true" in result:
             debug_task_id = await self.blackboard.post(
-                task_type="debug",
+                task_type=TASK_TYPE_DEBUG,
                 payload={
                     "code": code,
                     "file": filename,
@@ -4591,6 +4726,12 @@ class ReviewerSwarmAgent(SwarmAgent):
 
         return result
 ```
+
+跟旧版本比，唯一的区别是把 `task_type="debug"` 这种手写字符串换成了
+`task_type=TASK_TYPE_DEBUG`（从 7.3b 节的 `swarm/task_types.py` 导入）——
+逻辑完全没变，纯粹是把"合法字符串"这件事交给一个地方统一管理，如果以后
+`TASK_TYPE_DEBUG` 对应的字符串值需要改，只需要改 `task_types.py` 这一处，
+不需要满项目搜索所有硬编码的 `"debug"`。
 
 ---
 
@@ -4604,6 +4745,7 @@ Swarm 模式下的调试修复 Agent。
 """
 from .blackboard import Blackboard
 from .agent_base import SwarmAgent
+from .task_types import TASK_TYPE_DEBUG, TASK_TYPE_TEST_WRITE
 
 
 class DebuggerSwarmAgent(SwarmAgent):
@@ -4613,7 +4755,7 @@ class DebuggerSwarmAgent(SwarmAgent):
 
     @property
     def task_types(self) -> list[str]:
-        return ["debug"]
+        return [TASK_TYPE_DEBUG]
 
     async def handle(self, task) -> str:
         payload = task.payload
@@ -4652,7 +4794,7 @@ class DebuggerSwarmAgent(SwarmAgent):
 
         # 修复完成后，自动发布 test_write 任务
         await self.blackboard.post(
-            task_type="test_write",
+            task_type=TASK_TYPE_TEST_WRITE,
             payload={
                 "code": result,
                 "file": filename,
@@ -4662,6 +4804,137 @@ class DebuggerSwarmAgent(SwarmAgent):
         print(f"[{self.agent_id}] 修复完成，已发布 test_write 任务")
         return result
 ```
+
+跟 7.4 节一样，这里也只是把裸字符串换成 `task_types.py` 里的常量，`task_type=TASK_TYPE_TEST_WRITE`
+对应的字符串值还是 `"test_write"`，行为完全不变。
+
+> **这一行曾经是本章最大的一个坑**：`DebuggerSwarmAgent` 会自动发布一个
+> `test_write` 任务，但如果 `swarm/` 目录下**没有任何 Agent 声明 `task_types`
+> 包含这个类型**、`main.py` 的 `lifespan`（7.5.2 节）里也没有实例化对应的 Agent，
+> 这个任务会被正常发布（日志会打印"已发布 test_write 任务"），但**永远没有人认领**，
+> 状态永远停在 `pending`——不报错、不提示，只能靠人工翻白板数据才能发现。7.4c 节
+> 的 `TestWriterSwarmAgent` 就是为了补上这个缺口；配合 7.2 节 `_known_types` 的
+> 校验，现在如果再出现"发布了没人处理的类型"，`post()` 会直接抛异常，不会再是
+> 静默卡死。
+
+---
+
+## 7.4c 测试生成 Swarm Agent `swarm/test_writer_agent.py`
+
+`review → debug` 这条链路本来在 `DebuggerSwarmAgent` 修复完代码后就结束了，但
+`debugger_agent.py` 里其实已经顺手发布了一个 `test_write` 任务（7.4b 节代码块的
+最后几行）——这是"提前设计好、但当时没有 Agent 去接"的一个任务类型。
+`TestWriterSwarmAgent` 就是补上的这个消费者，认领 `test_write` 任务，调用 LLM
+为修复后的代码生成 pytest 单元测试，让 `code_review → debug → test_write`
+这条链路第一次真正跑完整：
+
+```python
+# swarm/test_writer_agent.py
+"""
+Swarm 模式下的测试生成 Agent。
+认领 DebuggerSwarmAgent 自动发布的 test_write 任务，链路收尾：
+review → debug → test_write。
+"""
+from .blackboard import Blackboard
+from .agent_base import SwarmAgent
+from .task_types import TASK_TYPE_TEST_WRITE
+
+
+class TestWriterSwarmAgent(SwarmAgent):
+
+    def __init__(self, blackboard: Blackboard, agent_id: str = "test-writer-1"):
+        super().__init__(blackboard, agent_id)
+
+    @property
+    def task_types(self) -> list[str]:
+        return [TASK_TYPE_TEST_WRITE]
+
+    async def handle(self, task) -> str:
+        """
+        处理一个 test_write 任务。
+
+        task.payload 格式（由 DebuggerSwarmAgent 发布，见 debugger_agent.py）：
+        {
+            "code": "修复后的代码（DebuggerSwarmAgent 的完整输出，含说明文字）",
+            "file": "文件名",
+            "origin_task": "最初 code_review 任务的 id（仅用于追溯，不参与生成逻辑）"
+        }
+        """
+        payload = task.payload
+        code = payload.get("code", "")
+        filename = payload.get("file", "unknown.py")
+
+        print(f"[{self.agent_id}] 开始为 {filename} 生成测试")
+
+        from providers.router import get_provider
+        from providers.types import Message, TextBlock
+
+        provider = get_provider()
+
+        system = """
+你是一名测试工程师，专注于编写高质量的 pytest 单元测试。
+
+测试覆盖原则：
+1. 正常路径（happy path）
+2. 边界条件：空值、最大值、最小值、空列表等
+3. 异常路径：非法参数、外部依赖失败时的行为
+4. 安全场景（如涉及用户输入）：SQL 注入、XSS 尝试
+
+输出格式：
+```python
+# test_xxx.py
+import pytest
+# ... 完整测试代码
+```
+测试覆盖说明：列出覆盖了哪些场景
+"""
+        prompt = (
+            f"文件：{filename}\n\n"
+            f"以下是修复后的代码（可能夹杂修复说明文字，重点关注其中的代码块）：\n"
+            f"{code}\n\n"
+            "请为这段代码编写 pytest 单元测试。"
+        )
+
+        response = await provider.chat(
+            messages=[Message(role="user", content=[TextBlock(text=prompt)])],
+            system=system,
+        )
+
+        result = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                result += block.text
+
+        print(f"[{self.agent_id}] 测试生成完成")
+        return result
+```
+
+这个类的结构跟 7.4/7.4b 节的 `ReviewerSwarmAgent`/`DebuggerSwarmAgent` 完全是
+同一个模板，逐点对照着看：
+
+- **`task_types` 只声明了一个类型** `[TASK_TYPE_TEST_WRITE]`——跟前两个 Agent
+  一样，一个 Agent 可以声明处理多种类型（`task_types` 返回的是列表），这里只是
+  当前只需要处理这一种。
+- **`handle()` 里没有再发布新任务**——`review → debug → test_write` 这条链到
+  这一步就结束了，测试生成完之后直接 `return result`，不会再触发下一个自动派生
+  的任务。如果以后想让链路更长（比如生成测试后自动跑一遍测试、根据结果再触发
+  一轮修复），可以参考 7.4/7.4b 节 `handle()` 结尾调用 `self.blackboard.post(...)`
+  的写法，在这里也加一段。
+- **依然没有工具调用（Tool Calling）**——跟 `swarm/` 目录下其它 Agent 一样，
+  这里是直接把 `payload["code"]` 拼进 prompt 交给 LLM，全程没有 `open()` 读文件、
+  没有执行代码。如果想对照"能调用工具的测试生成 Agent"是什么样的，可以看
+  `sub_agents/test_writer.py`（Coordinator 模式下的实现，用了 `ReadFileTool`/
+  `RunPythonTool`）——两者测试覆盖的设计原则（正常路径/边界条件/异常路径/安全场景）
+  是一致的，只是 Swarm 版本更简单，不依赖工具执行。
+- **`payload.get("code", "")` 里的 `code` 到底是什么**：注意看 7.4b 节
+  `DebuggerSwarmAgent.handle()` 最后发布 `test_write` 任务时传的
+  `"code": result`——这个 `result` 是 LLM 修复代码后的**完整输出**，可能夹杂
+  "Bug 根因"、"修复说明"这些说明文字，不是纯粹的代码。所以这里 prompt 里特意写了
+  "可能夹杂修复说明文字，重点关注其中的代码块"，提醒 LLM 自己从中提取需要测试的
+  代码部分，而不是假设这个字段一定是干净的源代码。
+
+记得在 7.5.2 节的 `lifespan` 里把这个新 Agent 加进 `agents` 列表——只是写好这个类
+本身不会自动生效，`SwarmAgent` 必须被实例化、调用 `start()` 才会真正开始轮询白板。
 
 ---
 
@@ -4677,11 +4950,12 @@ Swarm Agent 接进 `main.py` 现有的 `lifespan`，跟 Coordinator 用同一个
 ```python
 # main.py 新增：Swarm 相关的请求/响应模型
 from typing import Any
+from swarm.task_types import TaskType
 
 
 class SwarmAskRequest(BaseModel):
     """POST /swarm/ask 的请求体格式"""
-    task_type: str = Field(..., description="任务类型，如 code_review / debug", examples=["code_review"])
+    task_type: TaskType = Field(..., description="任务类型，范围见 swarm/task_types.py", examples=["code_review"])
     payload: dict = Field(..., description="任务内容，字段随 task_type 变化，如 {'code': '...', 'file': 'a.py'}")
     timeout: float = Field(default=30.0, ge=1.0, le=120.0, description="最长等待秒数，超时仍未完成则返回当前状态（一般是 pending）")
 
@@ -4694,6 +4968,22 @@ class SwarmAskResponse(BaseModel):
     error: str | None = None
 ```
 
+`task_type` 的类型从裸 `str` 换成了 `TaskType`（7.3b 节 `swarm/task_types.py` 里定义的
+`Literal["code_review", "debug", "test_write"]`）。这一个改动的效果是：请求体里
+`task_type` 传入范围外的字符串时，**FastAPI/Pydantic 会在进入 `swarm_ask_endpoint`
+函数体之前就直接拒绝请求**，返回 `422 Unprocessable Entity`，错误信息里会带出合法
+取值范围，比如：
+
+```json
+{"detail":[{"type":"literal_error","loc":["body","task_type"],
+  "msg":"Input should be 'code_review', 'debug' or 'test_write'", "...": "..."}]}
+```
+
+注意这跟 7.3b 节 `Blackboard.post()` 里的校验不是同一层——这里的 422 是"请求格式
+本身不合法"，请求还没进到业务代码；`post()` 里的 `ValueError` 校验的是"字符串格式
+合法，但没有 Agent 声明处理这个类型"，这属于服务内部的配置遗漏，两层校验分别堵住
+不同来源的问题，7.5.3 节会看到 `post()` 抛出的 `ValueError` 具体是怎么被接住的。
+
 ### 7.5.2 lifespan 里常驻启动 Swarm Agent
 
 ```python
@@ -4702,6 +4992,7 @@ import asyncio
 from swarm.blackboard import Blackboard
 from swarm.reviewer_agent import ReviewerSwarmAgent
 from swarm.debugger_agent import DebuggerSwarmAgent
+from swarm.test_writer_agent import TestWriterSwarmAgent
 
 
 # 全局白板 + Swarm Agent 后台任务（跟 _coordinator 一样，启动时初始化一次）
@@ -4716,7 +5007,11 @@ async def lifespan(app: FastAPI):
     print(f"流式测试：curl -N 'http://localhost:8002/ask/stream?question=你好'")
 
     # 常驻 Swarm Agent：跟 FastAPI 服务同生命周期，不是每次请求创建/销毁
-    agents = [ReviewerSwarmAgent(_blackboard), DebuggerSwarmAgent(_blackboard)]
+    agents = [
+        ReviewerSwarmAgent(_blackboard),
+        DebuggerSwarmAgent(_blackboard),
+        TestWriterSwarmAgent(_blackboard),
+    ]
     _swarm_agent_tasks.extend(asyncio.create_task(a.start()) for a in agents)
 
     yield
@@ -4726,6 +5021,17 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(*_swarm_agent_tasks, return_exceptions=True)
     print("服务已关闭。")
 ```
+
+`agents` 列表比之前多了一个 `TestWriterSwarmAgent(_blackboard)`——对应 7.4c 节新增的
+Agent。这里有个容易被忽略但很关键的顺序问题：`ReviewerSwarmAgent`/`DebuggerSwarmAgent`/
+`TestWriterSwarmAgent` 三个实例化语句执行时，各自的 `__init__`（7.3 节）都会同步调用
+`self.blackboard.register_consumer(self.task_types)`，也就是说**这三行代码执行完，
+白板的 `_known_types` 就已经包含了全部三种任务类型**，跟这三个实例是否已经
+`start()` 起来轮询无关（`_swarm_agent_tasks.extend(...)` 那一行才是真正开始轮询）。
+如果这里漏写了 `TestWriterSwarmAgent(_blackboard)` 这一行（就是 7.4b 节提到的
+"曾经的坑"当时的状态），`_known_types` 里就不会有 `"test_write"`，`DebuggerSwarmAgent`
+发布 `test_write` 任务时 7.3b 节的校验就会直接抛 `ValueError`——这正是本次修复
+补上的那一行。
 
 ### 7.5.3 `POST /swarm/ask` 接口
 
@@ -4741,7 +5047,12 @@ async def swarm_ask_endpoint(req: SwarmAskRequest) -> SwarmAskResponse:
     跟 /ask 的区别在于编排方式——这里任务是发布到 Blackboard，由常驻的
     Swarm Agent 通过 claim() 认领执行的，不是主 Agent 直接调用子 Agent。
     """
-    task_id = await _blackboard.post(req.task_type, req.payload)
+    try:
+        task_id = await _blackboard.post(req.task_type, req.payload)
+    except ValueError as e:
+        # 正常情况下 task_type 已经被 TaskType（Literal）挡在 API 校验层，
+        # 这里兜底的是"合法类型但没有 Agent 注册"这种内部配置错误
+        return SwarmAskResponse(task_id="", status="failed", error=str(e))
 
     # Blackboard 目前只在"有新任务发布"时唤醒等待者，没有"某个任务完成"的专属信号，
     # 所以这里用最简单的方式实现"等结果"：固定间隔轮询任务状态，直到 done/failed 或超时
@@ -4756,6 +5067,17 @@ async def swarm_ask_endpoint(req: SwarmAskRequest) -> SwarmAskResponse:
         result=task.result, error=task.error,
     )
 ```
+
+新增的 `try/except ValueError` 接住的是 7.3b 节 `Blackboard.post()` 里那句
+`raise ValueError(f"未知任务类型：...")`。正常使用时这段代码几乎不会被触发——
+外部传入的非法字符串已经被 7.5.1 节的 `TaskType`（`Literal`）挡在 Pydantic 校验层，
+根本进不到这个函数体里面；这里兜底的是"请求体格式合法（`task_type` 确实是
+`code_review`/`debug`/`test_write` 三者之一），但当前进程里没有任何 Agent 声明
+处理它"这种**内部配置错误**，比如某次改动删掉了 `TestWriterSwarmAgent` 但忘了同步
+从 `TaskType` 的 `Literal` 里去掉 `"test_write"`。捕获后返回
+`SwarmAskResponse(task_id="", status="failed", error=str(e))`，调用方拿到的是一个
+正常的 `200` 响应、`status="failed"`，而不是没处理异常导致的 `500` 服务器错误——
+这是一个"服务内部确实出了配置问题，但不应该把整个请求处理流程搞挂"的防御性写法。
 
 超时之后 `status` 还是 `pending`/`claimed` 也不算错误——说明任务确实还在跑（比如
 LLM 调用比较慢，或者 `review → debug → test_write` 这种自动派生的任务链还没走完），
@@ -4779,6 +5101,33 @@ curl -X POST http://localhost:8002/swarm/ask \
 `/swarm/ask` 这次调用只等最初那个 `code_review` 任务的结果，不会等到派生的
 `debug` 任务也跑完，这也是 Swarm"涌现式协作"和 Coordinator"预先规划好任务图"
 的直观区别（对比 6.3.1 节 Coordinator 的 JSON 任务计划，那里任务依赖是预先定好的）。
+
+**验证 7.5.1 节的 API 层校验**：故意传一个不在 `TaskType` 范围里的字符串，确认会被
+Pydantic 直接拦下、返回 422，而不是进入业务逻辑：
+
+```bash
+curl -s -X POST http://127.0.0.1:8002/swarm/ask \
+  -H "Content-Type: application/json" \
+  -d '{"task_type":"foo_bar","payload":{"code":"x=1","file":"a.py"}}'
+# {"detail":[{"type":"literal_error","loc":["body","task_type"],
+#   "msg":"Input should be 'code_review', 'debug' or 'test_write'", ...}]}
+# HTTP 422
+```
+
+**验证 7.4c 节新增的 `TestWriterSwarmAgent` 能被单独直接调用**（不一定非要走
+`code_review → debug` 派生出来，`test_write` 本身也是一个合法的、可以直接提交的
+任务类型）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8002/swarm/ask \
+  -H "Content-Type: application/json" \
+  -d '{"task_type":"test_write","payload":{"code":"def add(a,b): return a+b","file":"calc.py"},"timeout":40}'
+# {"task_id":"...", "status":"done", "result":"```python\n# test_calc.py\n...", "error":null}
+```
+
+能看到 `status` 变成 `"done"`、`result` 里是生成的 pytest 代码，说明 `test_write`
+这个任务类型现在有 Agent 会认领并跑完，不会再像本章开头描述的那样永远停在
+`pending`。
 
 ---
 
@@ -4994,7 +5343,11 @@ async def lifespan(app: FastAPI):
     await _blackboard.load_from_redis(_redis_client)
 
     # 2. 常驻 Swarm Agent
-    agents = [ReviewerSwarmAgent(_blackboard), DebuggerSwarmAgent(_blackboard)]
+    agents = [
+        ReviewerSwarmAgent(_blackboard),
+        DebuggerSwarmAgent(_blackboard),
+        TestWriterSwarmAgent(_blackboard),
+    ]
     _swarm_agent_tasks.extend(asyncio.create_task(a.start()) for a in agents)
 
     # 3. 后台定期备份，不阻塞主流程
@@ -5110,8 +5463,23 @@ curl http://localhost:8002/swarm/tasks/a1b2c3d4
 □ Agent 失败时 status == "failed"，error 字段有错误信息
 
 □ swarm/agent_base.py 的抽象接口（task_types / handle）跟
-  reviewer_agent.py / debugger_agent.py 的实现一致，
+  reviewer_agent.py / debugger_agent.py / test_writer_agent.py 的实现一致，
   实例化 ReviewerSwarmAgent(blackboard) 不报 TypeError（参考 7.3 节末尾的提醒）
+
+□ task_type 值域校验（7.3b / 7.5.1 节）：
+  1. 提交一个不在 swarm/task_types.py 的 TaskType 范围内的 task_type（如 "foo_bar"），
+     收到 HTTP 422，错误信息里带出合法取值范围
+  2. swarm/blackboard.py 的 register_consumer() 已在 SwarmAgent.__init__ 里
+     自动调用，_known_types 集合里能看到三个 Agent 各自声明的类型
+
+□ test_write 链路补全（7.4c 节）：
+  1. main.py 的 lifespan 的 agents 列表里有 ReviewerSwarmAgent / DebuggerSwarmAgent /
+     TestWriterSwarmAgent 三个实例
+  2. 直接提交 task_type="test_write" 能收到 status == "done" 的结果（不需要先走
+     code_review → debug 派生）
+  3. 提交会被判定为 Critical 的 code_review 任务后，观察终端日志，能看到完整链路：
+     code_review 完成 → 自动派生 debug 任务 → debug 完成 → 自动派生 test_write 任务 →
+     test_write 完成，每一步都有对应 Agent 认领（不再有任务永远停在 pending 且无人处理）
 
 □ 只启动一个 `python main.py` 进程，/ask 和 /swarm/ask 都能访问到：
   1. POST /ask 走 Coordinator，一次调用拿到最终答案
