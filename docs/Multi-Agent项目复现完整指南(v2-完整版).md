@@ -4353,8 +4353,8 @@ class Blackboard:
     def __init__(self):
         self._tasks: dict[str, Task] = {}
         self._lock = asyncio.Lock()
-        self._new_task_event = asyncio.Event()   # 有新任务时触发，唤醒等待的 Agent
-        self._known_types: set[str] = set()       # 已注册消费者的任务类型，post() 时校验用
+        self._new_task_cond = asyncio.Condition()  # 有新任务时 notify_all，唤醒等待的 Agent
+        self._known_types: set[str] = set()        # 已注册消费者的任务类型，post() 时校验用
 
     def register_consumer(self, task_types: list[str]):
         """
@@ -4388,8 +4388,8 @@ class Blackboard:
             self._tasks[task_id] = task
 
         # 通知所有等待中的 Agent 有新任务了
-        self._new_task_event.set()
-        self._new_task_event.clear()
+        async with self._new_task_cond:
+            self._new_task_cond.notify_all()
 
         print(f"[Blackboard] 新任务 {task_id}（类型：{task_type}）")
         return task_id
@@ -4431,7 +4431,8 @@ class Blackboard:
     async def wait_for_task(self, timeout: float = 5.0):
         """等待新任务到来（供 Agent 的轮询循环使用）。"""
         try:
-            await asyncio.wait_for(self._new_task_event.wait(), timeout=timeout)
+            async with self._new_task_cond:
+                await asyncio.wait_for(self._new_task_cond.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             pass
 
