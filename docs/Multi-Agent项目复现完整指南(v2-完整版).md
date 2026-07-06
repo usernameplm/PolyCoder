@@ -6394,42 +6394,185 @@ class SkillSearcher:
 
 ---
 
-## 9.5 在 Agent 调用时动态加载 Skills
+## 9.5 在两套架构的子 Agent 中集成 Skill 加载
+
+本项目有两套并行的架构，各自都有子 Agent 需要集成 Skill：
+
+| 架构 | 入口 | 子 Agent 位置 | 基类 |
+|------|------|---------------|------|
+| Coordinator | `POST /ask` | `sub_agents/*.py` | `sub_agents/base.py → SubAgent` |
+| Swarm | `POST /swarm/ask` | `swarm/*_agent.py` | `swarm/agent_base.py → SwarmAgent` |
+
+两套子 Agent 有相同的痛点：固定的 system prompt 无法覆盖所有领域。例如：
+
+- Reviewer 审查的代码可能涉及数据库、异步、API 等不同领域
+- Debugger 修复的 Bug 可能需要参照不同的错误处理规范
+- TestWriter 针对不同模块需要遵循不同的测试策略
+
+### 方案：公共 Skill 增强函数
+
+创建一个公共模块，两套基类都调用它：
 
 ```python
-# 在 agent.py 或 sub_agents/base.py 的 run() 里
-
+# skills/enhancer.py
+"""
+Skill 增强模块：给 system prompt 动态拼接相关团队规范。
+两套架构的基类（SubAgent、SwarmAgent）都调用这个函数。
+"""
 from skills.searcher import SkillSearcher
 
+# 全局单例，避免重复加载和计算 IDF
 _searcher = SkillSearcher(skills_dir="skills/")
 
-async def ask_with_skills(question: str) -> str:
-    """按需加载 Skill 的 Agent 调用。"""
-    # 搜索相关 Skill
-    matched_skills = _searcher.search(question, top_k=2)
 
-    # 组合 system prompt
-    base_system = "你是一个智能助手，请用中文回答问题。"
-    if matched_skills:
-        skill_contents = "\n\n---\n\n".join(s.content for s in matched_skills)
-        system_prompt = f"{base_system}\n\n{skill_contents}"
-        print(f"[Skills] 加载了 {len(matched_skills)} 个 Skill：{[s.name for s in matched_skills]}")
-    else:
-        system_prompt = base_system
+def enhance_system_prompt(base_system: str, context: str, agent_name: str = "") -> str:
+    """
+    根据任务上下文搜索相关 Skill，拼接到 system prompt 后面。
 
-    provider = get_provider()
-    result = await run_agent_loop(
-        prompt=question,
-        provider=provider,
-        system=system_prompt,
-        max_turns=5,
+    参数：
+        base_system  原始 system prompt
+        context      搜索用的文本（任务描述、文件名、代码片段等拼接）
+        agent_name   调用者标识（打日志用）
+    """
+    matched = _searcher.search(context, top_k=2)
+    if not matched:
+        return base_system
+
+    skill_section = "\n\n---\n\n".join(
+        f"【团队规范 - {s.name}】\n{s.content}" for s in matched
     )
-    return result.text
+    print(f"[{agent_name or 'Skills'}] 加载 Skill：{[s.name for s in matched]}")
+    return f"{base_system}\n\n以下是团队规范，请在工作中遵守：\n\n{skill_section}"
 ```
 
 ---
 
-## 9.6 创建 Coding Agent 的 Skill 文件
+### Coordinator 架构集成：修改 `sub_agents/base.py`
+
+```python
+# sub_agents/base.py 的 run() 方法中
+
+from skills.enhancer import enhance_system_prompt
+
+class SubAgent(ABC):
+    # ...name、system_prompt、tools 属性不变...
+
+    async def run(self, task: str, context: dict | None = None) -> str:
+        full_task = task
+        if context:
+            context_str = "\n".join(f"【{k}的结果】\n{v}" for k, v in context.items())
+            full_task = f"{task}\n\n参考信息（来自前置任务）：\n{context_str}"
+
+        # ★ 新增：用任务描述搜索相关 Skill，动态增强 system prompt
+        system = enhance_system_prompt(
+            base_system=self.system_prompt,
+            context=full_task[:300],     # 取前 300 字符作为搜索依据
+            agent_name=self.name,
+        )
+
+        provider = get_provider()
+        # ...后续 run_agent_loop() 调用改为使用 system 而非 self.system_prompt...
+        result = await run_agent_loop(
+            prompt=full_task,
+            provider=provider,
+            system=system,              # ← 这里从 self.system_prompt 改为 system
+            tools=...,
+            executor=...,
+            max_turns=10,
+        )
+        return result.text
+```
+
+**效果**：当用户通过 `/ask` 问"帮我写一个 Redis 缓存的 API 接口"，Coordinator
+规划为 `code_writer` 任务，`code_writer` 在执行时会匹配到 `api-design.md` 和
+`env-config.md` Skill，自动遵循项目的路由命名规则和配置管理流程。
+
+---
+
+### Swarm 架构集成：修改 `swarm/agent_base.py`
+
+```python
+# swarm/agent_base.py（新增部分）
+
+from skills.enhancer import enhance_system_prompt
+
+class SwarmAgent(ABC):
+    # ...原有 __init__、task_types、handle 等不变...
+
+    def _enhance_system(self, base_system: str, context: str) -> str:
+        """Skill 增强的便捷入口（调用公共模块）。"""
+        return enhance_system_prompt(base_system, context, agent_name=self.agent_id)
+```
+
+### Swarm 子 Agent 调用示例（以 ReviewerAgent 为例）
+
+```python
+# swarm/reviewer_agent.py 的 handle() 方法中
+
+async def handle(self, task) -> str:
+    payload = task.payload
+    code = payload.get("code", "")
+    filename = payload.get("file", "unknown.py")
+    focus = payload.get("focus", "全面审查")
+
+    base_system = """
+你是一名资深代码审查工程师。
+审查维度：SQL 注入、命令注入、硬编码密码、逻辑错误、边界条件、性能问题。
+每个问题输出：[Critical/Warning/Suggestion] 行号 - 问题描述 - 建议修复。
+发现 Critical 级别问题时，最后一行输出 NEEDS_FIX:true，否则输出 NEEDS_FIX:false。
+"""
+    # ★ 新增：用文件名 + focus + 代码片段作为搜索上下文
+    search_context = f"{filename} {focus} {code[:200]}"
+    system = self._enhance_system(base_system, search_context)
+
+    # ...后续 provider.chat() 调用不变，只是 system 参数用增强后的版本...
+```
+
+---
+
+### 整体流程图
+
+```
+用户请求
+    │
+    ├─ POST /ask（Coordinator 架构）
+    │       ↓
+    │   planner.py → 规划子任务
+    │       ↓
+    │   dispatcher.py → 分发给 sub_agents
+    │       ↓
+    │   SubAgent.run()
+    │       ├── enhance_system_prompt(self.system_prompt, task[:300])
+    │       └── run_agent_loop(system=增强后的prompt)
+    │
+    └─ POST /swarm/ask（Swarm 架构）
+            ↓
+        Blackboard.post() → 发布任务
+            ↓
+        SwarmAgent.start() → 认领任务 → handle()
+            ├── self._enhance_system(base_system, context)
+            └── provider.chat(system=增强后的prompt)
+```
+
+**两套架构共用 `skills/` 目录下的同一组 Skill 文件**，只是加载时机不同：
+- Coordinator：在 `SubAgent.run()` 调用 `run_agent_loop()` 之前
+- Swarm：在 `handle()` 调用 `provider.chat()` 之前
+
+---
+
+## 9.6 团队规范 Skill 文件
+
+本节的 Skill 不是定义"Agent 是什么"（那是 system prompt 的事），而是定义
+**"团队怎么做事"**——编码规范、流程约定、架构决策。它们通过 9.5 的机制被子 Agent
+在工作时按需加载。
+
+每个 Skill 文件放在 `skills/` 目录下，被 `load_skills()` 扫描加载。当子 Agent
+处理任务时，`_enhance_system_prompt()` 根据任务内容搜索最相关的 Skill 并拼接。
+
+**适用场景举例**：
+- Reviewer 审查含 `asyncio` 的代码 → 加载 `async-patterns.md`，按规范检查是否有 Event 竞态
+- Debugger 修复 Redis 连接问题 → 加载 `error-handling.md`，按规范输出降级策略
+- TestWriter 为 API 端点写测试 → 加载 `api-design.md`，知道该测哪些状态码
 
 ```bash
 mkdir -p skills
@@ -6437,264 +6580,89 @@ mkdir -p skills
 
 ---
 
-**`skills/code-review.md`**（内容见 9.2 节）
-
----
-
-**`skills/debugging.md`**：
-
-````markdown
----
-name: debugging
-description: 调试专家，擅长复现 Bug、定位根因并给出修复方案
-triggers:
-  - debug
-  - 调试
-  - 报错
-  - bug
-  - 错误
-  - 异常
-  - traceback
-  - 修复
----
-
-## 你的角色
-
-你是一名专业调试工程师，使用二分法和最小可复现原则定位 Bug。
-
-## 调试流程
-
-1. 用 read_file 读取出错的文件，理解代码逻辑
-2. 用 run_python 构造**最小可复现的测试用例**，确认能复现 Bug
-3. 用 search_code 追踪调用链，定位根因
-4. 构造修复方案，再次用 run_python 验证修复有效
-5. 确认修复没有引入新问题
-
-## 输出格式
-
-**Bug 根因**：（一句话）
-**影响范围**：（哪些场景受影响）
-**修复方案**：
-```python
-# 修复后的代码
-```
-**验证结果**：（附上 run_python 输出）
-````
-
----
-
-**`skills/test-writing.md`**：
-
-````markdown
----
-name: test-writing
-description: 测试工程师，生成高覆盖率的 pytest 单元测试
-triggers:
-  - 测试
-  - test
-  - 单元测试
-  - pytest
-  - 测试用例
-  - coverage
-  - 覆盖率
----
-
-## 你的角色
-
-你是一名测试工程师，专注于编写高质量、高覆盖率的单元测试。
-
-## 测试覆盖原则（必须包含）
-
-1. **Happy path**：功能正常工作的场景
-2. **边界条件**：空值、None、最大值、最小值、空列表
-3. **异常路径**：非法参数、外部依赖失败
-4. **安全场景**（如涉及用户输入）：注入尝试
-
-## 工作流程
-
-1. 用 read_file 读取源码，理解函数签名、入参和返回值
-2. 编写 pytest 风格测试，每个测试函数只测一个场景
-3. 用 run_python 执行测试，确认全部通过（如果失败要分析是测试写错了还是被测代码有 Bug）
-
-## 输出格式
-
-```python
-# test_xxx.py
-import pytest
-# 完整测试代码
-```
-测试覆盖说明：列出覆盖了哪些场景
-运行结果：附上 run_python 执行输出
-````
-
----
-
-**`skills/code-generation.md`**：
-
-````markdown
----
-name: code-generation
-description: 代码生成专家，根据自然语言需求生成高质量、可运行的代码
-triggers:
-  - 帮我写
-  - 实现
-  - 生成代码
-  - 写一个
-  - 新增功能
-  - 开发
----
-
-## 你的角色
-
-你是一名资深软件工程师，根据需求生成符合最佳实践的代码。
-
-## 工作流程
-
-1. 如果涉及已有项目，先用 read_file / list_dir 了解项目结构和代码风格
-2. 根据需求设计接口（函数签名、参数类型、返回值）
-3. 实现代码，遵循已有代码风格
-4. 用 run_python 验证代码能正常运行
-5. 如有错误，自动修复并重新验证
-
-## 代码质量要求
-
-- 所有函数必须有类型注解（Type Hints）
-- 公共函数必须有 docstring
-- 不引入不必要的第三方依赖
-- 输入参数必须做基本验证
-
-## 输出格式
-
-**设计思路**：（2-3 句说明）
-```python
-# 完整实现代码
-```
-**使用示例**：（附上一个调用示例和预期输出）
-````
-
----
-
-## 9.6b 团队规范类 Skill 文件（通用入口 Agent 专用）
-
-9.6 节的 4 个 Skill 都是"Agent 能力类"——定义 Agent 如何执行某种任务。但 Skill
-系统更大的价值在于**团队规范类 Skill**：把团队内部的工程标准、约定、流程写成 Skill
-文件，让通用入口 Agent（`/ask` 背后的 Coordinator 或 CLI 对话模式）在回答时自动
-遵守你们的规范，而不是用 LLM 的通用知识随便答。
-
-**为什么不直接写死在子 Agent 的 system prompt 里？**
-
-子 Agent（reviewer、debugger、test_writer）的职责是固定的——它们本身就是"活的
-Skill"。但通用入口 Agent 面对的是**任意问题**：用户可能问"帮我建个表"、也可能问
-"这个异步代码怎么改"、也可能问"帮我提交一下代码"。把所有领域的规范都塞进通用
-Agent 的 system prompt 不现实，用 Skill 按需加载才是正解。
-
----
-
-**`skills/git-workflow.md`**：
-
-````markdown
----
-name: git-workflow
-description: Git 工作流规范，包括分支命名、提交信息格式和 PR 流程
-triggers:
-  - git
-  - 提交
-  - commit
-  - 分支
-  - branch
-  - merge
-  - PR
-  - pull request
----
-
-## Git 分支命名规范
-
-- 功能分支：`feat/<模块>-<简述>`，如 `feat/swarm-redis-persist`
-- 修复分支：`fix/<issue号>-<简述>`，如 `fix/127-claim-race`
-- 重构分支：`refactor/<简述>`
-
-## Commit Message 格式（Conventional Commits）
-
-```
-<type>(<scope>): <subject>
-
-<body>（可选，说明 why）
-```
-
-type 取值：feat | fix | refactor | test | docs | chore
-scope 取值：swarm | coordinator | provider | tools | api
-
-示例：
-- `feat(swarm): add post_derived for task lineage tracking`
-- `fix(blackboard): use Condition instead of Event to prevent notification loss`
-
-## PR 规范
-
-- 标题不超过 70 字符，格式同 commit message
-- 描述里必须包含：改了什么、为什么改、怎么测的
-- 一个 PR 只做一件事，不混杂无关改动
-````
-
----
-
 **`skills/error-handling.md`**：
+
+> **触发场景**：Reviewer 审查到 try/except 代码时自动加载；Debugger 修复异常处理相关 Bug 时加载。
+> 本 Skill 内容直接对应项目中 `periodic_save()` 的降级设计和 `sandbox.py` 的自定义异常。
 
 ````markdown
 ---
 name: error-handling
-description: 团队异常处理规范，定义何时捕获、何时抛出、日志格式
+description: 本项目的异常处理规范——降级策略、日志格式、自定义异常
 triggers:
   - 异常
   - 错误处理
   - try
   - except
   - raise
-  - 异常处理
-  - error handling
+  - 降级
+  - error
+  - 失败
 ---
 
-## 核心原则
+## 分层捕获原则
 
-1. **不吞异常**：`except: pass` 是禁止的，最少要打日志
-2. **区分可重试和不可重试**：
-   - 可重试：网络超时、连接被拒、速率限制 → 用 tenacity 重试
-   - 不可重试：参数错误、权限不足、资源不存在 → 直接抛出
-3. **边界层捕获，内部层抛出**：
-   - HTTP 接口层（main.py）：捕获并转为合适的 HTTP 状态码
-   - 业务逻辑层（agent/、swarm/）：抛出明确的异常类，不自行捕获
+本项目的分层结构决定了异常在哪里捕获：
+
+| 层 | 文件 | 策略 |
+|----|------|------|
+| HTTP 接口层 | `main.py` | 捕获 → 转为 HTTPException（404/409/422） |
+| Swarm 层 | `swarm/*.py` | 不捕获，让 `agent_base.py` 的 `start()` 统一 `fail()` |
+| 工具层 | `sandbox.py` | 抛出明确异常（`PathTraversalError`） |
+| 外部依赖 | Redis/LLM API | 捕获 → 降级 + 单次日志 |
+
+## 降级模式（已验证有效）
+
+参考 `main.py` 中 `periodic_save()` 的实现：
+
+```python
+fail_count = 0
+while True:
+    try:
+        await blackboard.save_to_redis(redis)
+        fail_count = 0
+    except Exception as e:
+        fail_count += 1
+        if fail_count == 1:
+            print(f"[Save] Redis 保存失败：{e}")  # 只打一次
+        if fail_count >= 3:
+            await asyncio.sleep(60)  # 连续失败则降速
+            continue
+    await asyncio.sleep(5)
+```
+
+核心：**不刷屏、不崩溃、自动降速**。
 
 ## 日志格式
 
 ```python
-# 正确：包含上下文信息
-print(f"[{模块名}] 操作失败：{具体原因}，task_id={id}")
+# 正确：模块名 + 操作 + 原因 + 上下文 ID
+print(f"[Blackboard] 保存到 Redis 失败（降级为纯内存模式）：{e}")
+print(f"[{self.agent_id}] 任务 {task.id} 处理失败：{e}")
 
-# 错误：无用的泛化日志
-print("出错了")
+# 错误：
+print("出错了")              # 没有上下文
+print(f"Error: {e}")         # 不知道是哪个模块
 ```
 
-## 自定义异常命名
+## 自定义异常
 
-- 继承 `ValueError`：输入参数不合法
-- 继承 `RuntimeError`：运行时状态异常
-- 类名必须以 `Error` 结尾，如 `PathTraversalError`、`TaskTypeUnknownError`
-
-## 降级处理
-
-外部依赖（Redis、LLM API）不可用时：
-- 打印一次警告日志（不重复刷屏）
-- 降级到备选方案（内存模式 / 默认响应）
-- 不让整个服务崩溃
+- 继承 `ValueError`：用户输入不合法 → `PathTraversalError`
+- 继承 `RuntimeError`：运行时状态异常 → `TaskTypeUnknownError`
+- 类名必须以 `Error` 结尾
 ````
 
 ---
 
 **`skills/async-patterns.md`**：
 
+> **触发场景**：审查或修改含 `asyncio`/`async`/`await` 的代码时加载。
+> 本 Skill 内容直接对应项目中 Blackboard 的 Event 竞态修复、`periodic_save()` 的后台任务模式。
+
 ````markdown
 ---
 name: async-patterns
-description: 异步编程规范，涵盖 asyncio 常用模式和踩坑指南
+description: 本项目的 asyncio 规范——白板并发、后台任务、已踩过的坑
 triggers:
   - 异步
   - async
@@ -6702,251 +6670,342 @@ triggers:
   - asyncio
   - 并发
   - 协程
-  - 事件循环
+  - Lock
+  - Event
+  - Condition
 ---
 
-## 何时用异步
+## 本项目的异步架构
 
-- I/O 密集操作（网络请求、文件读写、数据库查询）→ **用 async**
-- CPU 密集操作（大量计算）→ **用线程池 / 进程池**，不要阻塞事件循环
-
-## 常用模式
-
-### 并行执行多个独立任务
-```python
-results = await asyncio.gather(task_a(), task_b(), task_c())
+```
+main.py (FastAPI + uvicorn 事件循环)
+  ├── lifespan()
+  │     ├── asyncio.create_task(periodic_save())   ← 后台常驻
+  │     └── asyncio.create_task(agent.start())     ← SwarmAgent 常驻循环
+  └── HTTP 处理函数（与 Agent 共用同一事件循环）
 ```
 
-### 超时控制
+## 后台常驻任务模板
+
 ```python
-try:
-    result = await asyncio.wait_for(slow_operation(), timeout=10.0)
-except asyncio.TimeoutError:
-    # 处理超时
+# 参考 main.py 的 periodic_save()
+async def background_loop():
+    while True:
+        try:
+            await do_work()
+        except Exception as e:
+            print(f"[Loop] 错误：{e}")
+        await asyncio.sleep(interval)
+
+# 启动
+_task = asyncio.create_task(background_loop())
+# 关闭
+_task.cancel()
+await asyncio.gather(_task, return_exceptions=True)
 ```
 
-### 后台常驻任务
-```python
-task = asyncio.create_task(background_loop())
-# 服务关闭时：
-task.cancel()
-await asyncio.gather(task, return_exceptions=True)
-```
+## 白板并发的关键约束
 
-## 常见陷阱
+1. **claim() 必须在 Lock 内完成读+写**：从"找到 pending 任务"到"标记为 claimed"
+   是原子操作，否则两个 Agent 会同时认领同一个任务。
 
-1. **忘记 await**：协程不 await 就不会执行，也不报错，只有一个 RuntimeWarning
-2. **在 async 函数里用 time.sleep()**：会阻塞整个事件循环，必须用 `await asyncio.sleep()`
-3. **Lock 跨 await 使用**：`asyncio.Lock` 不能跨 await 边界保证原子性的多步操作，每次 await 都可能让出控制权
-4. **Event.set() + Event.clear() 竞态**：用 Condition 替代（本项目 Blackboard 踩过的坑）
-````
+2. **通知新任务用 Condition，不用 Event**：
+   ```python
+   # ✗ 有竞态（本项目踩过的坑）
+   self._event.set()
+   self._event.clear()   # 如果 Agent 在 set 和 clear 之间还没醒来，通知丢失
 
----
+   # ✓ 正确做法
+   async with self._condition:
+       self._condition.notify_all()
+   ```
 
-**`skills/database.md`**：
+3. **不要在 Lock 内做 I/O**：
+   ```python
+   # ✗ 持锁时间过长
+   async with self._lock:
+       data = await redis.get(...)    # 网络 I/O 阻塞其他协程获取锁
 
-````markdown
----
-name: database
-description: 数据库设计与查询规范，包括建表、索引和迁移
-triggers:
-  - 数据库
-  - SQL
-  - 建表
-  - 索引
-  - 迁移
-  - migration
-  - 查询
-  - ORM
----
+   # ✓ 先读再锁
+   data = await redis.get(...)
+   async with self._lock:
+       self._tasks[tid] = Task(**data)
+   ```
 
-## 建表规范
+## asyncio.sleep vs time.sleep
 
-- 主键：使用 `id BIGINT AUTO_INCREMENT`，不用 UUID 做主键（索引性能差）
-- 时间字段：必须有 `created_at`、`updated_at`，使用 `TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
-- 命名：表名蛇形复数（`user_accounts`），字段名蛇形单数（`user_name`）
-- 字符集：统一 `utf8mb4`，排序规则 `utf8mb4_unicode_ci`
+- `await asyncio.sleep(5)` → 让出控制权，其他协程可以运行
+- `time.sleep(5)` → 阻塞整个事件循环，所有 Agent 都卡住 5 秒
 
-## 查询规范
-
-- **绝对禁止字符串拼接 SQL**——必须使用参数化查询
-- 禁止 `SELECT *`，明确列出需要的字段
-- 分页必须用 `LIMIT + OFFSET` 或游标分页，不能全表返回
-- 批量操作用 `executemany`，不要循环单条插入
-
-## 索引策略
-
-- WHERE 条件里的字段优先加索引
-- 联合索引遵循最左前缀原则
-- 不在低基数字段（如 `status` 只有 3 种值）上单独建索引
-
-## 迁移规范
-
-- 每次迁移一个文件，文件名格式：`001_create_users.sql`
-- 新增列必须有默认值（避免锁全表）
-- 不在迁移脚本里删列或改列类型（单独做，先确认无引用）
+本项目全部使用 `asyncio.sleep`，任何出现 `time.sleep` 的代码都是 Bug。
 ````
 
 ---
 
 **`skills/api-design.md`**：
 
+> **触发场景**：审查或生成 FastAPI 端点代码时加载。
+> 本 Skill 内容直接对应 `main.py` 中已实现的 `/swarm/tasks` 系列端点。
+
 ````markdown
 ---
 name: api-design
-description: RESTful API 设计规范，包括路由命名、状态码和响应格式
+description: 本项目 FastAPI 端点设计规范——路由、状态码、响应模型
 triggers:
   - 接口
   - API
   - REST
   - 路由
   - endpoint
-  - 状态码
+  - FastAPI
   - HTTP
+  - 状态码
 ---
 
-## 路由命名
+## 已有端点参考（main.py）
 
-- 资源用名词复数：`/tasks`、`/users`
-- 层级关系用嵌套：`/tasks/{id}/apply`
-- 动作用 HTTP 方法表达，不要出现动词路由（`/getTask` ✗，`GET /tasks/{id}` ✓）
-
-## HTTP 方法语义
-
-| 方法 | 语义 | 幂等 |
+| 方法 | 路由 | 用途 |
 |------|------|------|
-| GET | 读取资源，不产生副作用 | 是 |
-| POST | 创建资源 / 触发操作 | 否 |
-| PUT | 全量替换资源 | 是 |
-| PATCH | 局部更新资源 | 否 |
-| DELETE | 删除资源 | 是 |
+| POST | `/ask` | 通用对话入口 |
+| POST | `/swarm/ask` | 发布 Swarm 任务 |
+| GET | `/swarm/tasks/{task_id}` | 按 ID 查任务状态 |
+| GET | `/swarm/tasks` | 任务列表摘要 |
+| POST | `/swarm/tasks/{task_id}/apply` | 将已完成任务的代码写入文件 |
 
-## 状态码使用
+## 路由命名规则
 
-- 200：成功
-- 201：创建成功（POST 创建新资源时用）
-- 400：请求格式错误 / 参数不合法
-- 404：资源不存在
-- 409：状态冲突（如任务未完成时尝试 apply）
-- 422：请求格式正确但语义错误（Pydantic 校验失败）
-- 500：服务器内部错误（代码 Bug，不应在正常流程出现）
+- 资源名词复数：`/tasks`、`/sessions`
+- 层级嵌套表示从属：`/swarm/tasks/{id}/apply`
+- 操作用 HTTP 方法，不用动词路由（`/getTask` ✗）
 
-## 响应格式
+## 状态码使用（本项目已有的模式）
 
-成功：直接返回资源 JSON
-```json
-{"task_id": "abc", "status": "done", "result": "..."}
+```python
+# 404 - 资源不存在
+if not task:
+    raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+
+# 409 - 状态冲突
+if task.status != "done":
+    raise HTTPException(status_code=409, detail=f"任务状态为 {task.status}，只有 done 状态可以 apply")
 ```
 
-失败：使用 FastAPI 的 HTTPException，统一 detail 字段
-```json
-{"detail": "任务 abc 不存在"}
+## 响应模型（Pydantic）
+
+每个端点必须有明确的 Response 模型：
+
+```python
+class SwarmAskResponse(BaseModel):
+    task_id: str
+    status: str
+    result: str | None = None
+    derived_task_ids: list[str] = []
 ```
 
-## 分页
+禁止直接返回 `dict`——Pydantic 模型提供自动校验和 OpenAPI 文档。
 
-- 使用 `?page=1&size=20`，默认 page=1, size=20
-- 响应里带 `total` 总数，方便前端计算总页数
+## 新增端点的清单
+
+1. 在 `main.py` 定义 Request/Response 模型
+2. 实现端点函数
+3. 在 `static/index.html` 加对应的前端调用
+4. 手动用 curl 或浏览器测试一遍
 ````
 
 ---
 
 **`skills/env-config.md`**：
 
+> **触发场景**：涉及 `.env`、`Settings`、新增配置项时加载。
+> 本 Skill 直接对应项目中 `core/config.py` 的 Pydantic Settings 机制和之前踩过的"extra fields forbidden"坑。
+
 ````markdown
 ---
 name: env-config
-description: 环境变量与配置管理规范，新增配置的标准流程
+description: 本项目配置管理规范——.env + Pydantic Settings 联动流程
 triggers:
   - 环境变量
   - 配置
   - .env
   - settings
   - config
-  - 新增配置
+  - Settings
+  - Pydantic
 ---
+
+## 本项目的配置机制
+
+```
+.env 文件（实际值）
+    ↓ 被 Pydantic 自动读取
+core/config.py → Settings 类（声明字段 + 类型 + 默认值）
+    ↓ 被业务代码引用
+from core.config import settings
+settings.redis_host  # "localhost"
+```
+
+## ⚠️ 已知陷阱（本项目踩过）
+
+Pydantic Settings 默认 **`extra = "forbid"`**——如果 `.env` 里有字段但 `Settings`
+类没有声明，启动直接报错：
+
+```
+pydantic_core._pydantic_core.ValidationError:
+  Extra inputs are not permitted [type=extra_forbidden]
+```
+
+**解决方案：新增环境变量必须同时改两处**（缺一个就炸）。
 
 ## 新增配置项的标准流程
 
-每新增一个配置项，必须同时改 3 个地方（缺一不可）：
+每新增一个配置项，必须同步修改：
 
-1. **`.env`**：加上实际的值（带注释说明用途）
-2. **`core/config.py` 的 `Settings` 类**：加上对应字段（含类型和默认值）
-3. **文档**：在附录 B 的配置项说明里加一行
+1. **`.env`**：加值（带注释）
+   ```bash
+   # Redis 连接配置
+   REDIS_HOST=localhost
+   REDIS_PORT=6379
+   ```
+
+2. **`core/config.py`**：加字段（含类型 + 默认值）
+   ```python
+   class Settings(BaseSettings):
+       redis_host: str = "localhost"
+       redis_port: int = 6379
+   ```
 
 ## 命名规范
 
-- 全大写，下划线分隔：`REDIS_HOST`、`LLM_PROVIDER`
-- 前缀按模块分组：`REDIS_`、`OPENAI_`、`ANTHROPIC_`
-- 布尔值用 `true`/`false`（字符串），Settings 里声明为 `bool` 类型自动转换
+- `.env` 里全大写：`REDIS_HOST`、`LLM_PROVIDER`
+- `Settings` 类里蛇形小写：`redis_host`、`llm_provider`
+- Pydantic 自动映射（大小写不敏感）
 
 ## 默认值原则
 
-- 本地开发能跑起来的默认值（如 `REDIS_HOST=localhost`）
-- 密钥类字段默认空字符串，启动时不报错但调用时才报错
-- 端口类字段有合理默认值（如 `APP_PORT=8002`）
-
-## 敏感配置
-
-- `.env` 文件永远不提交到 Git（已在 .gitignore 里）
-- 生产环境通过环境变量注入，不依赖文件
-- 日志里打印配置信息时，密钥只显示前 4 位 + `***`
+- 本地能跑的默认值（`localhost`、`6379`、`8002`）
+- 密钥默认空字符串 `""`：启动不报错，调用时才报错
+- 禁止把生产密钥写进代码或 `.env` 模板
 ````
 
 ---
 
 **`skills/prompt-engineering.md`**：
 
+> **触发场景**：修改子 Agent 的 system prompt 或新增 Agent 时加载。
+> 本 Skill 直接对应 `reviewer_agent.py` 和 `debugger_agent.py` 中 system prompt 的结构。
+
 ````markdown
 ---
 name: prompt-engineering
-description: Agent 提示词编写规范，确保 system prompt 结构化、输出可控
+description: 本项目 Agent 提示词规范——结构模板和输出解析约定
 triggers:
   - 提示词
   - prompt
   - system prompt
   - 系统提示
   - Agent 指令
+  - NEEDS_FIX
 ---
 
-## System Prompt 结构模板
+## 本项目 system prompt 结构
+
+每个子 Agent 的 system prompt 必须包含：
 
 ```
-## 你的角色
-（一句话定位：你是什么、专长什么）
-
-## 工作流程
-（编号步骤，告诉 LLM 先做什么后做什么）
-
-## 输出格式
-（严格约定输出结构，方便下游解析）
-
-## 约束条件
-（明确的禁止项和边界）
+1. 角色定位（一句话）
+2. 工作流程（编号步骤）
+3. 输出格式（精确模板，含解析标记）
+4. 约束（禁止项）
 ```
+
+示例（reviewer_agent.py 的实际 system prompt）：
+```
+你是一名资深代码审查工程师。
+审查维度：SQL 注入、命令注入、硬编码密码、逻辑错误、边界条件、性能问题。
+每个问题输出：[Critical/Warning/Suggestion] 行号 - 问题描述 - 建议修复。
+发现 Critical 级别问题时，最后一行输出 NEEDS_FIX:true，否则输出 NEEDS_FIX:false。
+```
+
+## 输出解析约定
+
+本项目通过**约定格式标记**来让代码提取 LLM 的结构化输出：
+
+| 标记 | 用途 | 解析方 |
+|------|------|--------|
+| `NEEDS_FIX:true/false` | Reviewer 决定是否派生 debug 任务 | `reviewer_agent.py` 用 `in` 判断 |
+| ` ```python ... ``` ` | 代码块 | `code_extractor.py` 用正则提取 |
+| `Bug 根因：xxx` | Debugger 的诊断结论 | 人读 / 前端展示 |
 
 ## 关键原则
 
-1. **角色先行**：第一段就明确身份，LLM 会在整个对话中保持角色一致性
-2. **流程编号**：用数字步骤而非散文描述，LLM 更容易按顺序执行
-3. **输出格式必须显式约定**：需要结构化输出时，给出精确模板（含占位符）
-4. **用"必须"/"禁止"而非"尽量"/"建议"**：模糊措辞导致 LLM 自行判断
+1. **用"必须"/"禁止"**，不用"建议"/"尽量"——模糊措辞让 LLM 自行发挥
+2. **输出格式写死**——方便下游代码用字符串匹配 / 正则提取
+3. **一个 Agent 只干一件事**——不要让 reviewer 又审查又修复
 
-## 常见反模式
+## 新增 Agent 时的检查清单
 
-| 反模式 | 问题 | 改进 |
-|--------|------|------|
-| "请尽量详细" | 输出不可控，可能很长 | "用 3-5 句话总结" |
-| "如果可以的话" | LLM 可能选择不做 | "必须执行以下步骤" |
-| 没有输出格式约定 | 每次输出结构不同 | 明确给出 JSON/Markdown 模板 |
-| 把所有要求写在一段话里 | LLM 容易漏掉 | 拆成编号列表 |
+- [ ] system prompt 有没有明确输出格式？
+- [ ] 下游代码能不能稳定解析这个输出？
+- [ ] 异常情况（LLM 不遵守格式）有没有兜底？
+````
 
-## 需要解析输出时的技巧
+---
 
-在输出格式里加入明确的标记，方便代码用正则/字符串匹配提取：
-- `NEEDS_FIX:true` / `NEEDS_FIX:false`（本项目 reviewer_agent 的做法）
-- 用 ```python 围栏包裹代码（方便 code_extractor.py 抽取）
-- 关键字段放在独立行开头（如 `Bug 根因：xxx`）
+**`skills/security.md`**：
+
+> **触发场景**：审查涉及文件操作、用户输入、路径拼接的代码时加载。
+> 本 Skill 直接对应 `sandbox.py` 的路径遍历防护设计。
+
+````markdown
+---
+name: security
+description: 本项目安全规范——路径遍历防护、输入校验、沙箱写入
+triggers:
+  - 安全
+  - 路径
+  - path
+  - 注入
+  - sandbox
+  - 遍历
+  - traversal
+  - 用户输入
+  - 文件写入
+---
+
+## 路径遍历防护（已实现）
+
+本项目通过 `sandbox.py` 的 `resolve_safe_path()` 防止 LLM 输出的文件路径逃出
+工作目录：
+
+```python
+def resolve_safe_path(workspace: Path, relative: str) -> Path:
+    target = (workspace / relative).resolve()
+    if not str(target).startswith(str(workspace.resolve())):
+        raise PathTraversalError(f"路径 {relative} 逃出了工作区")
+    return target
+```
+
+**核心逻辑**：`.resolve()` 会把 `../../../etc/passwd` 解析为绝对路径，然后
+`startswith` 检查是否还在 workspace 下。
+
+## 必须使用沙箱的场景
+
+| 场景 | 正确做法 | 错误做法 |
+|------|----------|----------|
+| apply 端点写入代码 | `write_text_sandboxed(workspace, path, code)` | `open(path, 'w').write(code)` |
+| 任何用户/LLM 提供的路径 | 先过 `resolve_safe_path()` | 直接拼接使用 |
+
+## 输入校验原则
+
+- LLM 的输出视为**不可信输入**（它可能输出 `../../../../etc/crontab`）
+- 用户通过 API 传入的 `file_path` 也是不可信的
+- 只有代码里硬编码的路径（如 `skills/` 目录）才可信
+
+## 禁止事项
+
+- 禁止 `os.system()`、`subprocess.run(shell=True)` + 用户输入
+- 禁止 `eval()`、`exec()` 执行 LLM 输出
+- 禁止把密钥放在代码里或 Git 历史里
 ````
 
 ---
@@ -6954,17 +7013,21 @@ triggers:
 ## 9.7 本章检查清单
 
 ```
-□ skills/ 目录至少有一个 SKILL.md 文件，格式正确（有 frontmatter）
+□ skills/ 目录有 5+ 个 .md 文件，格式正确（有 frontmatter：name、description、triggers）
 
-□ load_skills() 能正确解析 frontmatter 的 name、description、triggers 字段
+□ load_skills() 能正确解析所有 Skill 文件，打印加载数量
 
-□ SkillSearcher.search("代码审查") 返回 code-review 这个 Skill
+□ SkillSearcher.search("asyncio 竞态") 返回 async-patterns Skill
 
 □ 触发词匹配比 TF-IDF 匹配优先（score 差异体现在日志中）
 
-□ 加载 Skill 后的 system prompt 包含 Skill 的内容
+□ SwarmAgent 基类有 _enhance_system_prompt() 方法
 
-□ 无相关 Skill 时不崩溃，使用基础 system prompt
+□ ReviewerAgent 审查含 "async" 的代码时，日志显示加载了 async-patterns Skill
+
+□ 无相关 Skill 时不崩溃，子 Agent 使用原始 system prompt
+
+□ Skill 内容出现在 LLM 实际收到的 system prompt 中（可通过打印验证）
 ```
 
 **全部打勾之后，进入第 10 章。**
