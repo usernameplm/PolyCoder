@@ -65,7 +65,8 @@ class ReviewerSwarmAgent(SwarmAgent):
 
         # 如果发现严重问题，自动发布 debug 任务（这就是 Swarm 的涌现式行为）
         if "NEEDS_FIX:true" in result:
-            debug_task_id = await self.blackboard.post(
+            debug_task_id = await self.blackboard.post_derived(
+                parent_task_id=task.id,
                 task_type=TASK_TYPE_DEBUG,
                 payload={
                     "code": code,

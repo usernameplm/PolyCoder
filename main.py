@@ -26,6 +26,8 @@ from swarm.debugger_agent import DebuggerSwarmAgent
 from swarm.test_writer_agent import TestWriterSwarmAgent
 from swarm.task_types import TaskType
 from swarm.redis_client import create_redis_client
+from swarm.code_extractor import extract_python_code
+from swarm.sandbox import resolve_safe_path, PathTraversalError
 
 from agent import ask_stream
 from coordinator.agent import CoordinatorAgent
@@ -65,6 +67,19 @@ class SwarmAskResponse(BaseModel):
     status: str                 # pending | claimed | done | failed
     result: Any = None
     error: str | None = None
+    derived_task_ids: list[str] = Field(default_factory=list, description="这个任务自动派生出的子任务 ID 列表，可用 GET /swarm/tasks/{id} 逐个查询")
+
+
+class ApplyRequest(BaseModel):
+    """POST /swarm/tasks/{task_id}/apply 的请求体格式"""
+    path: str = Field(..., min_length=1, description="写入的目标路径，相对工作目录（SWARM_WORKSPACE），如 'out/auth.fixed.py'")
+
+
+class ApplyResponse(BaseModel):
+    """POST /swarm/tasks/{task_id}/apply 的响应体格式"""
+    path: str
+    bytes_written: int
+    source: str
 
 
 # ── 应用生命周期（启动/关闭钩子）────────────────────────────────────
@@ -251,6 +266,7 @@ async def swarm_ask_endpoint(req: SwarmAskRequest) -> SwarmAskResponse:
     return SwarmAskResponse(
         task_id=task_id, status=task.status,
         result=task.result, error=task.error,
+        derived_task_ids=task.derived_task_ids,
     )
 
 
@@ -263,6 +279,7 @@ async def get_swarm_task(task_id: str) -> SwarmAskResponse:
     return SwarmAskResponse(
         task_id=task.id, status=task.status,
         result=task.result, error=task.error,
+        derived_task_ids=task.derived_task_ids,
     )
 
 
@@ -270,6 +287,36 @@ async def get_swarm_task(task_id: str) -> SwarmAskResponse:
 async def list_swarm_tasks() -> dict:
     """白板整体状态摘要，如 {"pending": 2, "done": 5}，运维/监控用，不是业务调用入口。"""
     return _blackboard.summary()
+
+
+@app.post("/swarm/tasks/{task_id}/apply", response_model=ApplyResponse)
+async def apply_swarm_task(task_id: str, req: ApplyRequest) -> ApplyResponse:
+    """
+    把任务结果里的代码块真正写到磁盘。
+    """
+    task = _blackboard.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+
+    if task.status != "done":
+        raise HTTPException(status_code=409, detail=f"任务 {task_id} 当前状态是 {task.status}，未完成不能落地")
+
+    if not isinstance(task.result, str) or not task.result.strip():
+        raise HTTPException(status_code=400, detail=f"任务 {task_id} 没有可写入的文本结果")
+
+    code, source = extract_python_code(task.result)
+    if code is None:
+        raise HTTPException(status_code=400, detail="任务结果里没有找到可抽取的代码块（可能是 code_review 这类审查意见，本身不含代码）")
+
+    try:
+        target = resolve_safe_path(req.path)
+    except PathTraversalError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(code, encoding="utf-8")
+
+    return ApplyResponse(path=str(target), bytes_written=len(code.encode("utf-8")), source=source)
 
 
 @app.get("/")

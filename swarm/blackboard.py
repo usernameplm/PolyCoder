@@ -25,6 +25,7 @@ class Task:
     owner: str | None = None # 认领这个任务的 Agent ID
     result: Any = None       # 任务完成后的结果
     error: str | None = None # 任务失败时的错误信息
+    derived_task_ids: list[str] = field(default_factory=list)  # 由这个任务自动派生出的子任务 ID
 
 
 class Blackboard:
@@ -119,6 +120,27 @@ class Blackboard:
             await asyncio.wait_for(self._new_task_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             pass
+
+    async def post_derived(self, parent_task_id: str, task_type: str, payload: Any) -> str:
+        """
+        Agent 处理任务时自动派生新任务用这个方法，而不是直接调 post()。
+
+        效果跟 post() 完全一样（一样会经过 _known_types 校验、一样会唤醒等待中的
+        Agent），多做的唯一一件事是：把新生成的 child_id 记到父任务的
+        derived_task_ids 里，让"这个任务后来触发了什么"变得可查询，而不是只存在于
+        日志里。
+        """
+        child_id = await self.post(task_type, payload)
+
+        async with self._lock:
+            parent = self._tasks.get(parent_task_id)
+            if parent is not None:
+                parent.derived_task_ids.append(child_id)
+            else:
+                print(f"[Blackboard] post_derived: 父任务 {parent_task_id} 不存在，"
+                      f"子任务 {child_id} 仍正常发布，但不会出现在任何 derived_task_ids 里")
+
+        return child_id
 
     def get_task(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)

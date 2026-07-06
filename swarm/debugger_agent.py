@@ -53,7 +53,8 @@ class DebuggerSwarmAgent(SwarmAgent):
                 result += block.text
 
         # 修复完成后，自动发布 test_write 任务
-        await self.blackboard.post(
+        test_write_task_id = await self.blackboard.post_derived(
+            parent_task_id=task.id,
             task_type=TASK_TYPE_TEST_WRITE,
             payload={
                 "code": result,
@@ -61,5 +62,5 @@ class DebuggerSwarmAgent(SwarmAgent):
                 "origin_task": task.id,
             }
         )
-        print(f"[{self.agent_id}] 修复完成，已发布 test_write 任务")
+        print(f"[{self.agent_id}] 修复完成，已发布 test_write 任务 {test_write_task_id}")
         return result

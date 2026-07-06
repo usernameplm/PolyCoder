@@ -72,6 +72,16 @@
         .badge.done { background: #34c759; }
         .badge.failed { background: #f44336; }
         .swarm-result pre { background: #1e1e1e; color: #d4d4d4; padding: 12px 14px; border-radius: 6px; overflow-x: auto; margin: 8px 0; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
+        .derived-list { margin: 8px 0; padding: 0; list-style: none; }
+        .derived-list li { margin: 4px 0; }
+        .derived-list a { color: #007aff; cursor: pointer; text-decoration: underline; font-size: 13px; }
+        .apply-section { margin-top: 12px; padding: 10px; background: #f9f9f9; border-radius: 6px; display: flex; gap: 8px; align-items: center; }
+        .apply-section input { flex: 1; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+        .apply-section button { padding: 6px 14px; background: #5856d6; color: #fff; border: none; border-radius: 4px; font-size: 13px; cursor: pointer; }
+        .apply-section button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .apply-result { margin-top: 8px; font-size: 12px; padding: 6px 10px; border-radius: 4px; }
+        .apply-result.success { background: #e8f5e9; color: #2e7d32; }
+        .apply-result.error { background: #fbe9e7; color: #c62828; }
     </style>
 </head>
 <body>
@@ -290,6 +300,83 @@
             return { pending: '排队中', claimed: '处理中', done: '已完成', failed: '失败' }[status] || status;
         }
 
+        function renderTaskResult(data, elapsed) {
+            let html = '<div><strong>task_id:</strong> ' + data.task_id +
+                ' <span class="badge ' + data.status + '">' + statusText(data.status) + '</span>' +
+                ' <span style="color:#999; font-size:12px;">(' + elapsed + 's)</span></div>';
+
+            if (data.error) {
+                html += '<div style="color:red; margin-top:8px;">错误：' + data.error + '</div>';
+            } else if (data.result) {
+                html += '<pre>' + String(data.result)
+                    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
+            } else {
+                html += '<div style="color:#999; margin-top:8px;">尚未完成（可能仍在 pending/claimed，可调大 timeout 后重试）。</div>';
+            }
+
+            if (data.derived_task_ids && data.derived_task_ids.length > 0) {
+                html += '<div style="margin-top:8px;"><strong>派生任务：</strong></div><ul class="derived-list">';
+                for (const did of data.derived_task_ids) {
+                    html += '<li><a onclick="queryTask(\'' + did + '\')">' + did + '</a></li>';
+                }
+                html += '</ul>';
+            }
+
+            if (data.status === 'done' && data.result) {
+                html += '<div class="apply-section" id="apply-section-' + data.task_id + '">' +
+                    '<span style="font-size:12px;color:#666;">写盘路径：</span>' +
+                    '<input type="text" id="apply-path-' + data.task_id + '" placeholder="out/fixed.py" value="out/' + (data.task_id) + '.py">' +
+                    '<button onclick="applyTask(\'' + data.task_id + '\')">Apply 落地</button>' +
+                    '</div><div id="apply-result-' + data.task_id + '"></div>';
+            }
+
+            return html;
+        }
+
+        async function queryTask(taskId) {
+            const resultBox = document.getElementById('swarm-result');
+            resultBox.style.display = 'block';
+            resultBox.innerHTML = '<div style="color:#999;">正在查询任务 ' + taskId + ' ...</div>';
+
+            const start = Date.now();
+            try {
+                const resp = await fetch(BASE + '/swarm/tasks/' + taskId);
+                const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+                if (!resp.ok) {
+                    resultBox.innerHTML = '<span style="color:red">错误：HTTP ' + resp.status + '</span>';
+                    return;
+                }
+                const data = await resp.json();
+                resultBox.innerHTML = renderTaskResult(data, elapsed);
+            } catch (e) {
+                resultBox.innerHTML = '<span style="color:red">查询失败：' + e.message + '</span>';
+            }
+        }
+
+        async function applyTask(taskId) {
+            const pathInput = document.getElementById('apply-path-' + taskId);
+            const resultDiv = document.getElementById('apply-result-' + taskId);
+            const path = pathInput.value.trim();
+            if (!path) { alert('请填写目标路径'); return; }
+
+            resultDiv.innerHTML = '<span style="color:#999;font-size:12px;">写盘中...</span>';
+            try {
+                const resp = await fetch(BASE + '/swarm/tasks/' + taskId + '/apply', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path }),
+                });
+                const data = await resp.json();
+                if (resp.ok) {
+                    resultDiv.innerHTML = '<div class="apply-result success">写盘成功：' + data.path + '（' + data.bytes_written + ' bytes，来源：' + data.source + '）</div>';
+                } else {
+                    resultDiv.innerHTML = '<div class="apply-result error">失败：' + (data.detail || JSON.stringify(data)) + '</div>';
+                }
+            } catch (e) {
+                resultDiv.innerHTML = '<div class="apply-result error">请求失败：' + e.message + '</div>';
+            }
+        }
+
         async function submitSwarmTask() {
             const taskType = document.getElementById('swarm-task-type').value;
             const code = document.getElementById('swarm-code').value;
@@ -328,19 +415,7 @@
                 }
 
                 const data = await resp.json();
-                let html = '<div><strong>task_id:</strong> ' + data.task_id +
-                    ' <span class="badge ' + data.status + '">' + statusText(data.status) + '</span>' +
-                    ' <span style="color:#999; font-size:12px;">(' + elapsed + 's)</span></div>';
-
-                if (data.error) {
-                    html += '<div style="color:red; margin-top:8px;">错误：' + data.error + '</div>';
-                } else if (data.result) {
-                    html += '<pre>' + String(data.result)
-                        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
-                } else {
-                    html += '<div style="color:#999; margin-top:8px;">尚未完成（可能仍在 pending/claimed，可调大 timeout 后重试）。</div>';
-                }
-                resultBox.innerHTML = html;
+                resultBox.innerHTML = renderTaskResult(data, elapsed);
             } catch (e) {
                 resultBox.innerHTML = '<span style="color:red">请求失败：' + e.message + '</span>';
             } finally {
