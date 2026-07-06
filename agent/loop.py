@@ -19,6 +19,7 @@ from providers.types import (
 )
 from .state import LoopState
 from .executor import ToolExecutor
+from .context import should_compress, compress_messages
 
 
 # ── 终止原因常量 ───────────────────────────────────────────────────────────────
@@ -69,6 +70,17 @@ async def run_agent_loop(
 
     # ── 主循环 ─────────────────────────────────────────────────────────────────
     while True:
+
+        # [检查] 上下文压缩：Token 超限时自动压缩早期历史
+        current_messages = list(state.messages)
+        if should_compress(current_messages):
+            current_messages = await compress_messages(current_messages, provider)
+            state = LoopState(
+                messages=tuple(current_messages),
+                turn_count=state.turn_count,
+                total_usage=state.total_usage,
+                last_transition="compressed",
+            )
 
         # [检查] 轮次限制
         if state.turn_count >= max_turns:
