@@ -14,12 +14,25 @@ import json
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 
-from agent import ask, ask_stream
+import asyncio
+from swarm.blackboard import Blackboard
+from swarm.reviewer_agent import ReviewerSwarmAgent
+from swarm.debugger_agent import DebuggerSwarmAgent
+from swarm.test_writer_agent import TestWriterSwarmAgent
+from swarm.task_types import TaskType
+from swarm.redis_client import create_redis_client
+from swarm.code_extractor import extract_python_code
+from swarm.sandbox import resolve_safe_path, PathTraversalError
+
+from agent import ask_stream
+from coordinator.agent import CoordinatorAgent
+
+from typing import Any
 
 
 # ── 请求/响应数据格式定义 ──────────────────────────────────────────
@@ -36,22 +49,97 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     """POST /ask 的响应体格式"""
-    text: str = Field(description="Agent 的回答")
-    usage: dict = Field(description="Token 用量：{input_tokens, output_tokens}")
+    text: str = Field(default="", description="Agent 的回答")
+    usage: dict = Field(default_factory=dict, description="Token 用量")
+    error: str | None = Field(default=None, description="错误信息")
+
+
+class SwarmAskRequest(BaseModel):
+    """POST /swarm/ask 的请求体格式"""
+    task_type: TaskType = Field(..., description="任务类型，范围见 swarm/task_types.py", examples=["code_review"])
+    payload: dict = Field(..., description="任务内容，字段随 task_type 变化，如 {'code': '...', 'file': 'a.py'}")
+    timeout: float = Field(default=30.0, ge=1.0, le=120.0, description="最长等待秒数，超时仍未完成则返回当前状态（一般是 pending）")
+
+
+class SwarmAskResponse(BaseModel):
+    """POST /swarm/ask 的响应体格式"""
+    task_id: str
+    status: str                 # pending | claimed | done | failed
+    result: Any = None
+    error: str | None = None
+    derived_task_ids: list[str] = Field(default_factory=list, description="这个任务自动派生出的子任务 ID 列表，可用 GET /swarm/tasks/{id} 逐个查询")
+
+
+class ApplyRequest(BaseModel):
+    """POST /swarm/tasks/{task_id}/apply 的请求体格式"""
+    path: str = Field(..., min_length=1, description="写入的目标路径，相对工作目录（SWARM_WORKSPACE），如 'out/auth.fixed.py'")
+
+
+class ApplyResponse(BaseModel):
+    """POST /swarm/tasks/{task_id}/apply 的响应体格式"""
+    path: str
+    bytes_written: int
+    source: str
 
 
 # ── 应用生命周期（启动/关闭钩子）────────────────────────────────────
 
+# 全局白板 + Swarm Agent 后台任务（跟 _coordinator 一样，启动时初始化一次）
+_blackboard = Blackboard()
+_swarm_agent_tasks: list[asyncio.Task] = []
+_redis_client = create_redis_client()
+_swarm_save_task: asyncio.Task | None = None
+
+
+async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 5.0):
+    """后台循环：每隔 interval 秒把白板状态备份到 Redis，直到被取消。"""
+    fail_count = 0
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await redis_client.ping()
+            fail_count = 0
+            await blackboard.save_to_redis(redis_client)
+        except Exception:
+            fail_count += 1
+            if fail_count == 1:
+                print("[periodic_save] Redis 不可用，降级为纯内存模式（后续不再重复打印）")
+            if fail_count >= 3:
+                await asyncio.sleep(60)  # Redis 持续不可用时放慢重试频率
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    yield 前：服务启动时执行（初始化资源）
-    yield 后：服务关闭时执行（释放资源）
-    """
+    global _swarm_save_task
+
     print("服务启动中...")
     print(f"API 文档地址：http://localhost:8002/docs")
     print(f"流式测试：curl -N 'http://localhost:8002/ask/stream?question=你好'")
+
+    # 1. 启动时先尝试从 Redis 恢复上次未完成的任务
+    await _blackboard.load_from_redis(_redis_client)
+
+    # 2. 常驻 Swarm Agent
+    agents = [
+        ReviewerSwarmAgent(_blackboard),
+        DebuggerSwarmAgent(_blackboard),
+        TestWriterSwarmAgent(_blackboard),
+    ]
+    _swarm_agent_tasks.extend(asyncio.create_task(a.start()) for a in agents)
+
+    # 3. 后台定期备份，不阻塞主流程
+    _swarm_save_task = asyncio.create_task(periodic_save(_blackboard, _redis_client))
+
     yield
+
+    # 4. 收尾：停 Agent、停后台备份任务、退出前再存一次、关闭连接
+    for task in _swarm_agent_tasks:
+        task.cancel()
+    await asyncio.gather(*_swarm_agent_tasks, return_exceptions=True)
+
+    _swarm_save_task.cancel()
+    await _blackboard.save_to_redis(_redis_client)
+    await _redis_client.close()
     print("服务已关闭。")
 
 
@@ -84,29 +172,30 @@ async def health_check():
     return {"status": "ok", "timestamp": int(time.time())}
 
 
+# 全局 Coordinator 实例（启动时初始化一次）
+_coordinator = CoordinatorAgent()
+
+
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(req: AskRequest) -> AskResponse:
     """
-    完整响应接口：等 Claude 写完，一次性返回全部内容。
+    完整响应接口：通过 Coordinator 规划任务 → 分发执行 → 聚合结果。
 
     请求体：{"question": "你的问题"}
-    响应体：{"text": "回答", "usage": {"input_tokens": N, "output_tokens": N}}
+    响应体：{"text": "回答", "usage": {...}, "error": null}
     """
     start = time.time()
     print(f"[/ask] 收到请求: {req.question[:60]}")
 
-    result = await ask(req.question)
-
-    elapsed_ms = round((time.time() - start) * 1000)
-    print(f"[/ask] 完成，耗时 {elapsed_ms}ms")
-
-    return AskResponse(
-        text=result.text,
-        usage={
-            "input_tokens": result.input_tokens,
-            "output_tokens": result.output_tokens,
-        },
-    )
+    try:
+        result = await _coordinator.run(req.question)
+        elapsed_ms = round((time.time() - start) * 1000)
+        print(f"[/ask] 完成，耗时 {elapsed_ms}ms")
+        return AskResponse(text=result)
+    except Exception as e:
+        elapsed_ms = round((time.time() - start) * 1000)
+        print(f"[/ask] 出错，耗时 {elapsed_ms}ms：{e}")
+        return AskResponse(error=str(e))
 
 
 @app.get("/ask/stream")
@@ -151,6 +240,89 @@ async def ask_stream_endpoint(question: str):
             "X-Accel-Buffering": "no",            # 禁用 Nginx 缓冲（如果用了 Nginx 反代）
         },
     )
+
+@app.post("/swarm/ask", response_model=SwarmAskResponse)
+async def swarm_ask_endpoint(req: SwarmAskRequest) -> SwarmAskResponse:
+    """
+    用法跟 /ask 类似：提交一个任务、等结果、拿到最终状态再返回。
+    跟 /ask 的区别在于编排方式——这里任务是发布到 Blackboard，由常驻的
+    Swarm Agent 通过 claim() 认领执行的，不是主 Agent 直接调用子 Agent。
+    """
+    try:
+        task_id = await _blackboard.post(req.task_type, req.payload)
+    except ValueError as e:
+        # 正常情况下 task_type 已经被 TaskType（Literal）挡在 API 校验层，
+        # 这里兜底的是"合法类型但没有 Agent 注册"这种内部配置错误
+        return SwarmAskResponse(task_id="", status="failed", error=str(e))
+
+    # Blackboard 目前只在"有新任务发布"时唤醒等待者，没有"某个任务完成"的专属信号，
+    # 所以这里用最简单的方式实现"等结果"：固定间隔轮询任务状态，直到 done/failed 或超时
+    deadline = time.time() + req.timeout
+    task = _blackboard.get_task(task_id)
+    while task.status in ("pending", "claimed") and time.time() < deadline:
+        await asyncio.sleep(0.3)
+        task = _blackboard.get_task(task_id)
+
+    return SwarmAskResponse(
+        task_id=task_id, status=task.status,
+        result=task.result, error=task.error,
+        derived_task_ids=task.derived_task_ids,
+    )
+
+
+@app.get("/swarm/tasks/{task_id}", response_model=SwarmAskResponse)
+async def get_swarm_task(task_id: str) -> SwarmAskResponse:
+    """按 task_id 补查任务最新状态，配合 /swarm/ask 超时后的场景使用。"""
+    task = _blackboard.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+    return SwarmAskResponse(
+        task_id=task.id, status=task.status,
+        result=task.result, error=task.error,
+        derived_task_ids=task.derived_task_ids,
+    )
+
+
+@app.get("/swarm/tasks")
+async def list_swarm_tasks() -> dict:
+    """白板整体状态摘要，如 {"pending": 2, "done": 5}，运维/监控用，不是业务调用入口。"""
+    return _blackboard.summary()
+
+
+@app.post("/swarm/tasks/{task_id}/apply", response_model=ApplyResponse)
+async def apply_swarm_task(task_id: str, req: ApplyRequest) -> ApplyResponse:
+    """
+    把任务结果里的代码块真正写到磁盘。
+    """
+    task = _blackboard.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+
+    if task.status != "done":
+        raise HTTPException(status_code=409, detail=f"任务 {task_id} 当前状态是 {task.status}，未完成不能落地")
+
+    if not isinstance(task.result, str) or not task.result.strip():
+        raise HTTPException(status_code=400, detail=f"任务 {task_id} 没有可写入的文本结果")
+
+    code, source = extract_python_code(task.result)
+    if code is None:
+        raise HTTPException(status_code=400, detail="任务结果里没有找到可抽取的代码块（可能是 code_review 这类审查意见，本身不含代码）")
+
+    try:
+        target = resolve_safe_path(req.path)
+    except PathTraversalError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(code, encoding="utf-8")
+
+    return ApplyResponse(path=str(target), bytes_written=len(code.encode("utf-8")), source=source)
+
+
+@app.get("/")
+async def index():
+    """返回前端测试页面"""
+    return FileResponse("static/index.html")
 
 
 # ── 直接运行的入口 ────────────────────────────────────────────────

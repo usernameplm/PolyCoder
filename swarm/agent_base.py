@@ -1,0 +1,65 @@
+# swarm/agent_base.py
+"""
+Swarm Agent 基类。
+
+和 SubAgent 的区别：
+  - SubAgent：无状态，每次调用是独立的
+  - SwarmAgent：持久化运行，有自己的 agent_id，持续监听白板
+"""
+import asyncio
+from abc import ABC, abstractmethod
+from .blackboard import Blackboard, Task
+
+
+class SwarmAgent(ABC):
+
+    def __init__(self, blackboard: Blackboard, agent_id: str | None = None):
+        self.blackboard = blackboard
+        # 允许子类传固定 agent_id（方便看日志）；不传则自动生成一个，
+        # 保证同一类型开多个实例做负载均衡时 ID 不会撞在一起
+        self.agent_id = agent_id or f"{type(self).__name__}-{id(self) % 10000}"
+        self._running = False
+        # 把自己声明的 task_types 登记到白板，供 post() 校验任务类型是否有人处理
+        self.blackboard.register_consumer(self.task_types)
+
+    @property
+    @abstractmethod
+    def task_types(self) -> list[str]:
+        """这个 Agent 处理哪些类型的任务。"""
+        ...
+
+    @abstractmethod
+    async def handle(self, task: Task) -> str:
+        """
+        处理一个任务，返回结果字符串。
+
+        任务处理失败时抛出异常（SwarmAgent 会自动标记为 failed）。
+        """
+        ...
+
+    async def start(self):
+        """启动 Agent，持续监听白板上的任务。"""
+        self._running = True
+        print(f"[{self.agent_id}] 已启动，监听任务类型：{self.task_types}")
+
+        while self._running:
+            claimed_any = False
+
+            for task_type in self.task_types:
+                task = await self.blackboard.claim(task_type, self.agent_id)
+                if task:
+                    claimed_any = True
+                    try:
+                        result = await self.handle(task)
+                        await self.blackboard.complete(task.id, result)
+                    except Exception as e:
+                        await self.blackboard.fail(task.id, str(e))
+
+            if not claimed_any:
+                # 没有任务，等待新任务到来（最多等 5 秒，然后再轮询）
+                await self.blackboard.wait_for_task(timeout=5.0)
+
+    def stop(self):
+        """停止 Agent。"""
+        self._running = False
+        print(f"[{self.agent_id}] 已停止")

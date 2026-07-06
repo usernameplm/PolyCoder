@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PolyCoder Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; display: flex; flex-direction: column; height: 100vh; }
+        header { background: #333; color: #fff; padding: 12px 20px; display: flex; align-items: center; gap: 16px; }
+        header h1 { font-size: 18px; }
+        .status { font-size: 12px; padding: 2px 8px; border-radius: 10px; }
+        .status.online { background: #4caf50; }
+        .status.offline { background: #f44336; }
+        #chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+        .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; line-height: 1.6; word-break: break-word; }
+        .msg.user { align-self: flex-end; background: #007aff; color: #fff; white-space: pre-wrap; }
+        .msg.assistant { align-self: flex-start; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+
+        /* Markdown 渲染样式 */
+        .msg.assistant h1, .msg.assistant h2, .msg.assistant h3 { margin: 12px 0 6px; font-size: 16px; }
+        .msg.assistant h4, .msg.assistant h5 { margin: 8px 0 4px; font-size: 14px; }
+        .msg.assistant p { margin: 4px 0; }
+        .msg.assistant ul, .msg.assistant ol { padding-left: 20px; margin: 4px 0; }
+        .msg.assistant li { margin: 2px 0; }
+        .msg.assistant pre { background: #1e1e1e; color: #d4d4d4; padding: 12px 14px; border-radius: 6px; overflow-x: auto; margin: 8px 0; font-size: 13px; line-height: 1.5; }
+        .msg.assistant pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+        .msg.assistant code { background: #f0f0f0; padding: 2px 5px; border-radius: 3px; font-size: 13px; }
+        .msg.assistant table { border-collapse: collapse; margin: 8px 0; width: 100%; }
+        .msg.assistant th, .msg.assistant td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; font-size: 13px; }
+        .msg.assistant th { background: #f5f5f5; font-weight: 600; }
+        .msg.assistant strong { font-weight: 600; }
+        .msg.assistant blockquote { border-left: 3px solid #ddd; padding-left: 12px; margin: 8px 0; color: #666; }
+        .msg.assistant hr { border: none; border-top: 1px solid #eee; margin: 12px 0; }
+        .msg.assistant a { color: #007aff; }
+
+        .toolbar { display: flex; gap: 8px; padding: 10px 16px; background: #fff; border-top: 1px solid #ddd; align-items: center; }
+        #input { flex: 1; padding: 10px 14px; border: 1px solid #ccc; border-radius: 20px; font-size: 14px; outline: none; resize: none; }
+        #input:focus { border-color: #007aff; }
+        button { padding: 8px 18px; border: none; border-radius: 20px; cursor: pointer; font-size: 13px; font-weight: 500; }
+        #btn-ask { background: #007aff; color: #fff; }
+        #btn-stream { background: #34c759; color: #fff; }
+        #btn-clear { background: #e0e0e0; color: #333; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        #loading-indicator { display: none; text-align: center; color: #999; font-size: 13px; padding: 8px; }
+        #loading-indicator.active { display: block; }
+        .footer-time { font-size: 11px; color: #999; margin-top: 8px; }
+
+        /* 模式切换 tab */
+        .tabs { display: flex; gap: 6px; margin-left: auto; }
+        .tab-btn { padding: 4px 12px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.3); background: transparent; color: #ccc; font-size: 12px; }
+        .tab-btn.active { background: #007aff; color: #fff; border-color: #007aff; }
+
+        /* Swarm 面板 */
+        #swarm-panel { display: none; flex: 1; overflow-y: auto; padding: 16px; }
+        #swarm-panel.active { display: block; }
+        #chat.hidden, .toolbar.hidden, #loading-indicator.hidden { display: none; }
+        .swarm-form { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); max-width: 720px; margin: 0 auto 16px; display: flex; flex-direction: column; gap: 10px; }
+        .swarm-form label { font-size: 12px; color: #666; font-weight: 600; }
+        .swarm-form select, .swarm-form input[type=text], .swarm-form input[type=number], .swarm-form textarea {
+            width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; font-family: inherit; outline: none;
+        }
+        .swarm-form select:focus, .swarm-form input:focus, .swarm-form textarea:focus { border-color: #007aff; }
+        .swarm-form textarea { font-family: "SFMono-Regular", Consolas, Menlo, monospace; min-height: 140px; resize: vertical; }
+        .swarm-row { display: flex; gap: 10px; }
+        .swarm-row > div { flex: 1; }
+        #btn-swarm-submit { background: #ff9500; color: #fff; align-self: flex-start; }
+        .swarm-result { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); max-width: 720px; margin: 0 auto; }
+        .swarm-result .badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 12px; color: #fff; margin-left: 8px; }
+        .badge.pending, .badge.claimed { background: #ff9500; }
+        .badge.done { background: #34c759; }
+        .badge.failed { background: #f44336; }
+        .swarm-result pre { background: #1e1e1e; color: #d4d4d4; padding: 12px 14px; border-radius: 6px; overflow-x: auto; margin: 8px 0; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
+        .derived-list { margin: 8px 0; padding: 0; list-style: none; }
+        .derived-list li { margin: 4px 0; }
+        .derived-list a { color: #007aff; cursor: pointer; text-decoration: underline; font-size: 13px; }
+        .apply-section { margin-top: 12px; padding: 10px; background: #f9f9f9; border-radius: 6px; display: flex; gap: 8px; align-items: center; }
+        .apply-section input { flex: 1; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+        .apply-section button { padding: 6px 14px; background: #5856d6; color: #fff; border: none; border-radius: 4px; font-size: 13px; cursor: pointer; }
+        .apply-section button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .apply-result { margin-top: 8px; font-size: 12px; padding: 6px 10px; border-radius: 4px; }
+        .apply-result.success { background: #e8f5e9; color: #2e7d32; }
+        .apply-result.error { background: #fbe9e7; color: #c62828; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>PolyCoder</h1>
+        <span id="status" class="status offline">checking...</span>
+        <div class="tabs">
+            <button class="tab-btn active" id="tab-chat" onclick="switchMode('chat')">Chat</button>
+            <button class="tab-btn" id="tab-swarm" onclick="switchMode('swarm')">Swarm</button>
+        </div>
+    </header>
+
+    <div id="chat"></div>
+    <div id="loading-indicator">正在思考中...</div>
+
+    <div class="toolbar" id="chat-toolbar">
+        <textarea id="input" rows="1" placeholder="输入你的问题..."></textarea>
+        <button id="btn-ask" onclick="ask(false)">Ask</button>
+        <button id="btn-stream" onclick="ask(true)">Stream</button>
+        <button id="btn-clear" onclick="clearChat()">清空</button>
+    </div>
+
+    <div id="swarm-panel">
+        <div class="swarm-form">
+            <div>
+                <label>任务类型 task_type</label>
+                <select id="swarm-task-type">
+                    <option value="code_review">code_review（代码审查，Critical 问题会自动派生 debug → test_write）</option>
+                    <option value="debug">debug（调试修复，完成后自动派生 test_write）</option>
+                    <option value="test_write">test_write（生成单元测试，可直接测试或由 debug 派生）</option>
+                </select>
+            </div>
+            <div class="swarm-row">
+                <div>
+                    <label>文件名 file</label>
+                    <input type="text" id="swarm-file" placeholder="a.py" value="a.py">
+                </div>
+                <div>
+                    <label>重点关注 focus（仅 code_review 用）</label>
+                    <input type="text" id="swarm-focus" placeholder="如 security，留空为全面审查">
+                </div>
+                <div style="max-width: 140px;">
+                    <label>超时秒数 timeout</label>
+                    <input type="number" id="swarm-timeout" value="30" min="1" max="120">
+                </div>
+            </div>
+            <div>
+                <label>代码内容 code</label>
+                <textarea id="swarm-code" placeholder="粘贴要审查/调试的代码..."></textarea>
+            </div>
+            <button id="btn-swarm-submit" onclick="submitSwarmTask()">提交任务</button>
+        </div>
+        <div class="swarm-result" id="swarm-result" style="display:none;"></div>
+    </div>
+
+    <script>
+        const BASE = window.location.origin;
+        let markedReady = false;
+
+        // 等待 marked 加载完成
+        if (typeof marked !== 'undefined') {
+            marked.setOptions({ breaks: true, gfm: true });
+            markedReady = true;
+        }
+
+        // 健康检查
+        fetch(BASE + '/health')
+            .then(r => r.json())
+            .then(() => {
+                const el = document.getElementById('status');
+                el.textContent = 'online';
+                el.className = 'status online';
+            })
+            .catch(() => {
+                const el = document.getElementById('status');
+                el.textContent = 'offline';
+                el.className = 'status offline';
+            });
+
+        document.getElementById('input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                ask(true);
+            }
+        });
+
+        function renderMarkdown(text) {
+            if (typeof marked !== 'undefined' && marked.parse) {
+                return marked.parse(text);
+            }
+            // fallback: 纯文本
+            return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function addMsg(role, text) {
+            const div = document.createElement('div');
+            div.className = 'msg ' + role;
+            if (role === 'assistant') {
+                div.innerHTML = text ? renderMarkdown(text) : '';
+            } else {
+                div.textContent = text;
+            }
+            document.getElementById('chat').appendChild(div);
+            div.scrollIntoView({ behavior: 'smooth' });
+            return div;
+        }
+
+        function setButtons(disabled) {
+            document.getElementById('btn-ask').disabled = disabled;
+            document.getElementById('btn-stream').disabled = disabled;
+            document.getElementById('loading-indicator').className = disabled ? 'active' : '';
+        }
+
+        async function ask(stream) {
+            const input = document.getElementById('input');
+            const question = input.value.trim();
+            if (!question) return;
+            input.value = '';
+
+            addMsg('user', question);
+            setButtons(true);
+
+            const assistantDiv = addMsg('assistant', '');
+            const start = Date.now();
+
+            function finish(text) {
+                const timeStr = (Date.now() - start) / 1000;
+                assistantDiv.innerHTML =
+                    (text ? renderMarkdown(text) : '（空响应）') +
+                    '<div class="footer-time">' + timeStr.toFixed(1) + 's</div>';
+                assistantDiv.scrollIntoView({ behavior: 'smooth' });
+            }
+
+            try {
+                if (stream) {
+                    const url = BASE + '/ask/stream?question=' + encodeURIComponent(question);
+                    const resp = await fetch(url);
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder();
+                    let text = '';
+                    let buffer = '';
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) {
+                            if (buffer.startsWith('data: ')) {
+                                const d = buffer.slice(6);
+                                if (d !== '[DONE]') {
+                                    try {
+                                        const json = JSON.parse(d);
+                                        if (json.type === 'text_delta') text += json.text;
+                                    } catch(e) {}
+                                }
+                            }
+                            break;
+                        }
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop() || '';
+                        for (const line of lines) {
+                            if (!line.startsWith('data: ')) continue;
+                            const data = line.slice(6);
+                            if (data === '[DONE]') continue;
+                            try {
+                                const json = JSON.parse(data);
+                                if (json.type === 'text_delta') {
+                                    text += json.text;
+                                    // 流式模式下用纯文本展示，避免未闭合的 Markdown 语法闪烁
+                                    assistantDiv.innerHTML = renderMarkdown(text);
+                                    assistantDiv.scrollIntoView({ behavior: 'smooth' });
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                    finish(text);
+                } else {
+                    const resp = await fetch(BASE + '/ask', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ question }),
+                    });
+                    if (!resp.ok) {
+                        assistantDiv.innerHTML = '错误：HTTP ' + resp.status;
+                        return;
+                    }
+                    const data = await resp.json();
+                    if (data.error) {
+                        assistantDiv.innerHTML = '<span style="color:red">错误：' + data.error + '</span>';
+                    } else {
+                        finish(data.text);
+                    }
+                }
+            } catch (e) {
+                assistantDiv.innerHTML = '<span style="color:red">请求失败：' + e.message + '</span>';
+            }
+            setButtons(false);
+        }
+
+        function clearChat() {
+            document.getElementById('chat').innerHTML = '';
+        }
+
+        // ── Swarm 模式 ──────────────────────────────────────────────
+
+        function switchMode(mode) {
+            const isChat = mode === 'chat';
+            document.getElementById('tab-chat').classList.toggle('active', isChat);
+            document.getElementById('tab-swarm').classList.toggle('active', !isChat);
+            document.getElementById('chat').classList.toggle('hidden', !isChat);
+            document.getElementById('chat-toolbar').classList.toggle('hidden', !isChat);
+            if (isChat) document.getElementById('loading-indicator').classList.remove('hidden');
+            document.getElementById('swarm-panel').classList.toggle('active', !isChat);
+        }
+
+        function statusText(status) {
+            return { pending: '排队中', claimed: '处理中', done: '已完成', failed: '失败' }[status] || status;
+        }
+
+        function renderTaskResult(data, elapsed) {
+            let html = '<div><strong>task_id:</strong> ' + data.task_id +
+                ' <span class="badge ' + data.status + '">' + statusText(data.status) + '</span>' +
+                ' <span style="color:#999; font-size:12px;">(' + elapsed + 's)</span></div>';
+
+            if (data.error) {
+                html += '<div style="color:red; margin-top:8px;">错误：' + data.error + '</div>';
+            } else if (data.result) {
+                html += '<pre>' + String(data.result)
+                    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
+            } else {
+                html += '<div style="color:#999; margin-top:8px;">尚未完成（可能仍在 pending/claimed，可调大 timeout 后重试）。</div>';
+            }
+
+            if (data.derived_task_ids && data.derived_task_ids.length > 0) {
+                html += '<div style="margin-top:8px;"><strong>派生任务：</strong></div><ul class="derived-list">';
+                for (const did of data.derived_task_ids) {
+                    html += '<li><a onclick="queryTask(\'' + did + '\')">' + did + '</a></li>';
+                }
+                html += '</ul>';
+            }
+
+            if (data.status === 'done' && data.result) {
+                html += '<div class="apply-section" id="apply-section-' + data.task_id + '">' +
+                    '<span style="font-size:12px;color:#666;">写盘路径：</span>' +
+                    '<input type="text" id="apply-path-' + data.task_id + '" placeholder="out/fixed.py" value="out/' + (data.task_id) + '.py">' +
+                    '<button onclick="applyTask(\'' + data.task_id + '\')">Apply 落地</button>' +
+                    '</div><div id="apply-result-' + data.task_id + '"></div>';
+            }
+
+            return html;
+        }
+
+        async function queryTask(taskId) {
+            const resultBox = document.getElementById('swarm-result');
+            resultBox.style.display = 'block';
+            resultBox.innerHTML = '<div style="color:#999;">正在查询任务 ' + taskId + ' ...</div>';
+
+            const start = Date.now();
+            try {
+                const resp = await fetch(BASE + '/swarm/tasks/' + taskId);
+                const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+                if (!resp.ok) {
+                    resultBox.innerHTML = '<span style="color:red">错误：HTTP ' + resp.status + '</span>';
+                    return;
+                }
+                const data = await resp.json();
+                resultBox.innerHTML = renderTaskResult(data, elapsed);
+            } catch (e) {
+                resultBox.innerHTML = '<span style="color:red">查询失败：' + e.message + '</span>';
+            }
+        }
+
+        async function applyTask(taskId) {
+            const pathInput = document.getElementById('apply-path-' + taskId);
+            const resultDiv = document.getElementById('apply-result-' + taskId);
+            const path = pathInput.value.trim();
+            if (!path) { alert('请填写目标路径'); return; }
+
+            resultDiv.innerHTML = '<span style="color:#999;font-size:12px;">写盘中...</span>';
+            try {
+                const resp = await fetch(BASE + '/swarm/tasks/' + taskId + '/apply', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path }),
+                });
+                const data = await resp.json();
+                if (resp.ok) {
+                    resultDiv.innerHTML = '<div class="apply-result success">写盘成功：' + data.path + '（' + data.bytes_written + ' bytes，来源：' + data.source + '）</div>';
+                } else {
+                    resultDiv.innerHTML = '<div class="apply-result error">失败：' + (data.detail || JSON.stringify(data)) + '</div>';
+                }
+            } catch (e) {
+                resultDiv.innerHTML = '<div class="apply-result error">请求失败：' + e.message + '</div>';
+            }
+        }
+
+        async function submitSwarmTask() {
+            const taskType = document.getElementById('swarm-task-type').value;
+            const code = document.getElementById('swarm-code').value;
+            const file = document.getElementById('swarm-file').value.trim() || 'a.py';
+            const focus = document.getElementById('swarm-focus').value.trim();
+            const timeout = parseFloat(document.getElementById('swarm-timeout').value) || 30;
+
+            if (!code.trim()) {
+                alert('请先粘贴要提交的代码');
+                return;
+            }
+
+            const payload = { code, file };
+            if (taskType === 'code_review' && focus) payload.focus = focus;
+
+            const btn = document.getElementById('btn-swarm-submit');
+            btn.disabled = true;
+            btn.textContent = '提交中...';
+
+            const resultBox = document.getElementById('swarm-result');
+            resultBox.style.display = 'block';
+            resultBox.innerHTML = '<div style="color:#999;">任务已提交，等待 Swarm Agent 认领与处理...</div>';
+
+            const start = Date.now();
+            try {
+                const resp = await fetch(BASE + '/swarm/ask', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_type: taskType, payload, timeout }),
+                });
+                const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+
+                if (!resp.ok) {
+                    resultBox.innerHTML = '<span style="color:red">错误：HTTP ' + resp.status + '</span>';
+                    return;
+                }
+
+                const data = await resp.json();
+                resultBox.innerHTML = renderTaskResult(data, elapsed);
+            } catch (e) {
+                resultBox.innerHTML = '<span style="color:red">请求失败：' + e.message + '</span>';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '提交任务';
+            }
+        }
+    </script>
+</body>
+</html>
