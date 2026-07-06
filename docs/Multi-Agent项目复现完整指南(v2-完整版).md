@@ -5451,7 +5451,419 @@ curl http://localhost:8002/swarm/tasks/a1b2c3d4
 
 ---
 
-## 7.8 本章检查清单
+## 7.9 派生任务可获取：`derived_task_ids`
+
+### 7.9.0 问题：派生任务的 `task_id` 只活在 `print()` 里
+
+7.4 节 `ReviewerSwarmAgent` 判定 `NEEDS_FIX:true` 后会 `await self.blackboard.post(...)`
+自动发一个 `debug` 任务，7.4b 节 `DebuggerSwarmAgent` 修复完再发一个 `test_write`
+任务——这条 `code_review → debug → test_write` 的链路本身没问题，但派生出来的
+`task_id` 只在 Agent 内部 `print(f"...已发布 debug 任务 {debug_task_id}")` 里出现过
+一次，从来没有被写回 `Task` 本身，也没有透传到 `/swarm/ask` 的响应体。调用方拿到
+最初那个 `code_review` 任务的结果后，**没有任何编程接口能知道后台还发生过什么**：
+链路是不是自动闭环处理了问题，闭环处理的结果是什么，只能翻服务器日志肉眼找。
+7.7 节的 `GET /swarm/tasks/{task_id}` 能补查状态，但前提是你已经知道要查哪个
+`task_id`——而派生任务的 `task_id` 恰恰是缺失的那一环。
+
+这一节把"派生出的子任务 ID"变成 `Task` 对象上的一个正式字段，`post()` 和
+`post_derived()`（新方法）分工明确：外部提交的入口任务走 `post()`；Agent 内部
+因为处理某个任务而自动派生新任务，走 `post_derived()`，由白板自己维护父子关系。
+
+### 7.9.1 `swarm/blackboard.py`：`Task` 新增字段 + `post_derived()`
+
+```python
+# swarm/blackboard.py
+@dataclass
+class Task:
+    """白板上的一个任务。"""
+    id: str
+    type: str
+    payload: Any
+    status: str = "pending"
+    owner: str | None = None
+    result: Any = None
+    error: str | None = None
+    derived_task_ids: list[str] = field(default_factory=list)  # 由这个任务自动派生出的子任务 ID
+
+
+class Blackboard:
+    # ... post() / claim() / complete() / fail() 保持不动 ...
+
+    async def post_derived(self, parent_task_id: str, task_type: str, payload: Any) -> str:
+        """
+        Agent 处理任务时自动派生新任务用这个方法，而不是直接调 post()。
+
+        效果跟 post() 完全一样（一样会经过 _known_types 校验、一样会唤醒等待中的
+        Agent），多做的唯一一件事是：把新生成的 child_id 记到父任务的
+        derived_task_ids 里，让"这个任务后来触发了什么"变得可查询，而不是只存在于
+        日志里。
+        """
+        child_id = await self.post(task_type, payload)
+
+        async with self._lock:
+            parent = self._tasks.get(parent_task_id)
+            if parent is not None:
+                parent.derived_task_ids.append(child_id)
+            else:
+                # 父任务不存在（比如传错了 ID）不应该导致子任务发布失败——
+                # 子任务本身是合法、独立的任务，只是丢了追溯关系，打日志即可
+                print(f"[Blackboard] post_derived: 父任务 {parent_task_id} 不存在，"
+                      f"子任务 {child_id} 仍正常发布，但不会出现在任何 derived_task_ids 里")
+
+        return child_id
+```
+
+`post()` 本身不用改一行——它仍然是"任何 Agent 或外部代码都能调用的通用发布入口"，
+`/swarm/ask`（7.5.3 节）提交的入口任务继续走它。`post_derived()` 是在它外面包了一层
+"记父子关系"的逻辑，两者不是互斥关系。
+
+父任务不存在时选择**降级为普通 `post()` + 打警告**，而不是抛异常：设想
+`DebuggerSwarmAgent` 修复完代码后 `origin_task` 字段被传错，直接让整条链路因为
+一个记录不上的追溯关系而失败，这个代价比"丢一条追溯关系，但功能本身正常跑完"
+大得多——两种失败模式里，教学上选后者。
+
+### 7.9.2 `reviewer_agent.py` / `debugger_agent.py`：改用 `post_derived`
+
+```python
+# swarm/reviewer_agent.py —— NEEDS_FIX 分支
+if "NEEDS_FIX:true" in result:
+    debug_task_id = await self.blackboard.post_derived(
+        parent_task_id=task.id,
+        task_type=TASK_TYPE_DEBUG,
+        payload={
+            "code": code,
+            "file": filename,
+            "review_result": result,
+            "origin_task": task.id,
+        }
+    )
+    print(f"[{self.agent_id}] 发现 Critical 问题，已发布 debug 任务 {debug_task_id}")
+```
+
+```python
+# swarm/debugger_agent.py —— handle() 结尾
+test_write_task_id = await self.blackboard.post_derived(
+    parent_task_id=task.id,
+    task_type=TASK_TYPE_TEST_WRITE,
+    payload={
+        "code": result,
+        "file": filename,
+        "origin_task": task.id,
+    }
+)
+print(f"[{self.agent_id}] 修复完成，已发布 test_write 任务 {test_write_task_id}")
+```
+
+两处改动只是把 `self.blackboard.post(...)` 换成 `self.blackboard.post_derived(task.id, ...)`，
+`print()` 日志照旧保留（排障时还是有用），区别是这次返回的 `task_id` 不再是"打完日志
+就丢掉的局部变量"，而是真正落到了 `task.derived_task_ids` 里。
+
+### 7.9.3 `main.py`：`SwarmAskResponse` 暴露 `derived_task_ids`
+
+```python
+# main.py
+class SwarmAskResponse(BaseModel):
+    """POST /swarm/ask 的响应体格式"""
+    task_id: str
+    status: str
+    result: Any = None
+    error: str | None = None
+    derived_task_ids: list[str] = Field(default_factory=list, description="这个任务自动派生出的子任务 ID 列表，可用 GET /swarm/tasks/{id} 逐个查询")
+
+
+@app.post("/swarm/ask", response_model=SwarmAskResponse)
+async def swarm_ask_endpoint(req: SwarmAskRequest) -> SwarmAskResponse:
+    try:
+        task_id = await _blackboard.post(req.task_type, req.payload)
+    except ValueError as e:
+        return SwarmAskResponse(task_id="", status="failed", error=str(e))
+
+    deadline = time.time() + req.timeout
+    task = _blackboard.get_task(task_id)
+    while task.status in ("pending", "claimed") and time.time() < deadline:
+        await asyncio.sleep(0.3)
+        task = _blackboard.get_task(task_id)
+
+    return SwarmAskResponse(
+        task_id=task_id, status=task.status,
+        result=task.result, error=task.error,
+        derived_task_ids=task.derived_task_ids,
+    )
+```
+
+**同时这一节把 7.7 节只是"描述"过、但当时 `main.py` 里还没有真正写出来的两个只读
+接口正式落地**（7.7 节写的代码块可以原样抄进 `main.py`，这里不重复贴）：
+
+- `GET /swarm/tasks/{task_id}` → 返回 `SwarmAskResponse`（含 `result`/`error`/
+  `derived_task_ids`），任务不存在时 `raise HTTPException(404, ...)`；
+- `GET /swarm/tasks` → 返回 `_blackboard.summary()`，形如 `{"pending": 2, "done": 5}`。
+
+有了 `derived_task_ids` 之后，这两个接口不再只是"7.5.3 节超时兜底"用的备用查询，
+而是变成调用方追一条完整链路的正式方式：
+
+```bash
+# 1. 提交入口任务，立刻拿到响应（不等派生链路跑完）
+curl -s -X POST http://127.0.0.1:8002/swarm/ask -H "Content-Type: application/json" -d '{
+  "task_type": "code_review",
+  "payload": {"code": "def login(u): return db.execute(f\"SELECT * FROM users WHERE name={u}\")", "file": "auth.py"}
+}'
+# {"task_id":"a1b2c3d4","status":"done","result":"...","error":null,"derived_task_ids":["e5f6g7h8"]}
+
+# 2. derived_task_ids 里的 debug 任务，按 ID 轮询直到 done
+curl -s http://127.0.0.1:8002/swarm/tasks/e5f6g7h8
+# {"task_id":"e5f6g7h8","status":"done","result":"...修复后的代码...","error":null,"derived_task_ids":["i9j0k1l2"]}
+
+# 3. debug 任务的 derived_task_ids 里又能挖出 test_write 任务，同理继续查
+curl -s http://127.0.0.1:8002/swarm/tasks/i9j0k1l2
+```
+
+`derived_task_ids` 是一层一层的——`code_review` 任务的 `derived_task_ids` 里只有它
+直接派生的 `debug` 任务，`debug` 任务再派生的 `test_write` 任务要去 `debug` 任务自己
+的 `derived_task_ids` 里找，这跟树形结构逐层展开是一致的，调用方要走完整条链路
+需要递归地查下去，而不是指望入口任务的响应体里一次性拿到所有子孙任务 ID。
+
+---
+
+## 7.10 显式落地：`POST /swarm/tasks/{task_id}/apply`
+
+### 7.10.0 问题：Agent 的产出是文本，从来没有真正写回文件
+
+7.4b 节 `DebuggerSwarmAgent` 的输出格式里第 2 项是"修复后的完整代码（\`\`\`python
+代码块）"，7.4c 节 `TestWriterSwarmAgent` 的输出也是一个 \`\`\`python 代码块——
+但这两个 Agent 的 `handle()` 最后都只是 `return result`，`result` 是一整段夹杂着
+说明文字的纯文本，写进 `Task.result` 就停在那了。7.9 节让调用方能查到这段文本，
+但"查到"和"落地"是两件事：调用方要么自己写正则从 `result` 里抠代码块再手动存盘，
+要么这段修复干脆就只停留在一次 HTTP 响应里，改完了等于没改。这一节补上"显式落地"
+这最后一步：新增一个接口，从任务结果里抽代码、写到调用方指定的路径。
+
+**为什么不复用 `tools/builtin/write_file.py`？** 看一眼它的 `execute()`：
+
+```python
+# tools/builtin/write_file.py（现状）
+async def execute(self, inputs: dict) -> str:
+    path = Path(inputs["path"])          # 直接拿路径，没有任何校验
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(inputs["content"], encoding="utf-8")
+    return f"已写入 {path}（{len(inputs['content'])} 字符）"
+```
+
+这个工具的设计前提是"给 Agentic Loop 里的 LLM 主动调用"（第 5 章），路径由 LLM
+自己在推理过程中决定，风险模型是"LLM 会不会自己作妖写坑自己的代码"，本来就不是
+给"HTTP 请求体里任何人传来的字符串路径"设计的——`path` 不做任何校验，直接拼绝对
+路径就写，如果原样接到 `POST /swarm/tasks/{id}/apply` 上，调用方传一个
+`"../../../etc/bad"` 就能往工作目录之外的任意位置写文件，这是一个真实的路径穿越
+漏洞，不能图省事直接复用。新写一个 `swarm/sandbox.py` 专门做这一层校验。
+
+### 7.10.1 `swarm/code_extractor.py`：从任务结果里抽代码块
+
+```python
+# swarm/code_extractor.py
+"""
+从 Agent 的自由文本产出里抽出可写盘的 Python 代码。
+
+DebuggerSwarmAgent / TestWriterSwarmAgent 的输出格式（7.4b / 7.4c 节的 system
+prompt 里约定的）都是"说明文字 + ```python 代码块"混在一起的一整段文本，
+apply 接口只关心代码块本身，说明文字要剥掉。
+"""
+import re
+
+_PYTHON_FENCE = re.compile(r"```python\s*\n(.*?)```", re.DOTALL)
+_ANY_FENCE = re.compile(r"```[a-zA-Z]*\s*\n(.*?)```", re.DOTALL)
+
+
+def extract_python_code(text: str) -> tuple[str | None, str]:
+    """
+    从文本里抽出代码块，返回 (代码, 来源标记)。
+
+    优先级：
+      1. 第一个 ```python ... ``` 围栏 —— DebuggerSwarmAgent/TestWriterSwarmAgent
+         的 system prompt 明确要求了这个格式，是最可信的情况
+      2. 兜底：任意 ``` ... ``` 围栏（LLM 有时候会漏写语言标记）
+      3. 都没有：返回 (None, "none")，调用方（main.py 的 apply 接口）据此返回 400
+
+    来源标记透传给响应体，方便调用方知道这次写盘的内容有没有经过降级兜底。
+    """
+    m = _PYTHON_FENCE.search(text)
+    if m:
+        return m.group(1).strip(), "python_block"
+
+    m = _ANY_FENCE.search(text)
+    if m:
+        return m.group(1).strip(), "fenced_block"
+
+    return None, "none"
+```
+
+只取**第一个**代码块——`DebuggerSwarmAgent` 的输出里理论上只有一段"修复后的完整
+代码"，如果 LLM 输出里出现了多个代码块（比如举例说明"改之前 vs 改之后"），
+取第一个通常就是我们要的那段；真要支持"抽取所有代码块"，教学上先不做，等真的
+遇到这种输出再加。
+
+### 7.10.2 `swarm/sandbox.py`：工作目录沙箱校验
+
+写法直接抄 `tools/builtin/read_file.py`（5.x 节）里现成的路径穿越检测，读文件和
+写文件的沙箱逻辑本质是同一件事——都是"确保解析后的绝对路径没有跑出工作目录"：
+
+```python
+# swarm/sandbox.py
+"""
+apply 接口专用的工作目录沙箱：把调用方传来的相对路径解析成绝对路径，
+拒绝任何跑出工作目录范围的写入（路径穿越，如 "../../../etc/passwd"）。
+
+跟 tools/builtin/read_file.py 的穿越检测是同一套思路，这里单独抽出来，
+是因为"写文件"比"读文件"多一层需要独立配置的东西——写盘目标可能需要跟
+Agentic Loop 的工作目录（read_file 用的那个）不是同一个，所以用专门的
+SWARM_WORKSPACE 环境变量，不跟 read_file/write_file 工具共用配置。
+"""
+import os
+from pathlib import Path
+
+
+class PathTraversalError(ValueError):
+    """请求路径解析后跑出了工作目录范围。"""
+
+
+def get_workspace() -> Path:
+    return Path(os.environ.get("SWARM_WORKSPACE", ".")).resolve()
+
+
+def resolve_safe_path(raw_path: str, workspace: Path | None = None) -> Path:
+    """
+    把相对路径解析为工作目录内的绝对路径，穿越则抛 PathTraversalError。
+
+    典型攻击输入：raw_path = "../../../etc/bad" —— (workspace / raw_path).resolve()
+    会算出一个不以 workspace 为前缀的绝对路径，被下面的 startswith 检测拦下。
+    """
+    workspace = workspace or get_workspace()
+    target = (workspace / raw_path).resolve()
+    if not str(target).startswith(str(workspace)):
+        raise PathTraversalError(f"路径 '{raw_path}' 解析后跑出了工作目录范围，拒绝写入")
+    return target
+
+
+def write_text_sandboxed(raw_path: str, content: str, workspace: Path | None = None) -> Path:
+    """
+    在沙箱校验通过后写盘，自动创建缺失的父目录。返回写入的绝对路径。
+    """
+    target = resolve_safe_path(raw_path, workspace)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return target
+```
+
+`str(target).startswith(str(workspace))` 这个检测跟 `read_file.py` 完全一样的写法，
+`resolve()` 是关键——它会把 `..` 这种相对片段真正计算掉，拿到的是操作系统层面
+"最终落到哪" 的绝对路径，再拿这个绝对路径去跟 `workspace` 比前缀，而不是直接
+对字符串里有没有出现 `".."` 做黑名单匹配（黑名单方式容易被 `....//` 之类的变形
+绕过，`resolve()` 从根上避免了这个问题）。
+
+### 7.10.3 `main.py`：`ApplyRequest`/`ApplyResponse` + 接口实现
+
+```python
+# main.py 新增 import
+from swarm.code_extractor import extract_python_code
+from swarm.sandbox import resolve_safe_path, PathTraversalError
+
+
+class ApplyRequest(BaseModel):
+    """POST /swarm/tasks/{task_id}/apply 的请求体格式"""
+    path: str = Field(..., min_length=1, description="写入的目标路径，相对工作目录（SWARM_WORKSPACE），如 'out/auth.fixed.py'")
+
+
+class ApplyResponse(BaseModel):
+    """POST /swarm/tasks/{task_id}/apply 的响应体格式"""
+    path: str
+    bytes_written: int
+    source: str   # python_block | fenced_block（见 7.10.1 节 extract_python_code）
+
+
+@app.post("/swarm/tasks/{task_id}/apply", response_model=ApplyResponse)
+async def apply_swarm_task(task_id: str, req: ApplyRequest) -> ApplyResponse:
+    """
+    把任务结果里的代码块真正写到磁盘。
+
+    不限制 task_type——debug / test_write 的结果本来就是代码块，能正常抽取；
+    code_review 的结果是审查意见（散文），大概率抽不出代码块，走到下面的
+    400（这是预期行为，不针对 task_type 单独加白名单/黑名单）。
+    """
+    task = _blackboard.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+
+    if task.status != "done":
+        raise HTTPException(status_code=409, detail=f"任务 {task_id} 当前状态是 {task.status}，未完成不能落地")
+
+    if not isinstance(task.result, str) or not task.result.strip():
+        raise HTTPException(status_code=400, detail=f"任务 {task_id} 没有可写入的文本结果")
+
+    code, source = extract_python_code(task.result)
+    if code is None:
+        raise HTTPException(status_code=400, detail="任务结果里没有找到可抽取的代码块（可能是 code_review 这类审查意见，本身不含代码）")
+
+    try:
+        target = resolve_safe_path(req.path)
+    except PathTraversalError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(code, encoding="utf-8")
+
+    return ApplyResponse(path=str(target), bytes_written=len(code.encode("utf-8")), source=source)
+```
+
+四个失败分支对应四种"调用方搞错了什么"，故意用不同的 HTTP 状态码区分，而不是
+统一包一层 `{"error": "..."}` 用 200 返回：
+
+| 状态码 | 触发条件 | 含义 |
+|--------|---------|------|
+| 404 | `task_id` 不存在 | 拼错 ID，或者早就没这个任务 |
+| 409 | 任务存在但 `status != "done"` | 还没跑完（`pending`/`claimed`）或跑失败了（`failed`），语义上跟"资源当前状态跟请求的操作冲突"（HTTP 409 Conflict 的标准用法）一致 |
+| 400（无结果） | `task.result` 不是非空字符串 | 理论上 `status == "done"` 时 `result` 应该有内容，这里是防御性兜底 |
+| 400（抽不出代码） | `extract_python_code` 返回 `(None, "none")` | 最常见触发场景就是拿 `code_review` 任务去调 apply |
+| 400（路径穿越） | `resolve_safe_path` 抛 `PathTraversalError` | 7.10.2 节的沙箱校验没通过 |
+
+**不覆盖原文件，除非调用方显式传原文件路径**——这一点没有做成"默认拒绝覆盖已有
+文件"这种额外校验，而是直接遵循"`path` 是调用方主动指定的，指定成什么就写到哪"：
+如果调用方想覆盖 `auth.py`，把 `req.path` 传成 `"auth.py"` 本身就是"显式"这件事
+的全部含义；接口不做隐藏的"重命名成 `.bak`"或"追加时间戳"之类的自作聪明，那样反而
+会让调用方摸不清最终文件到底叫什么。
+
+### 7.10.4 验证
+
+```bash
+# 1. 启动服务（Redis 是 7.6 节的可选项，不装不影响这一节）
+python main.py
+
+# 2. 提交一个带 SQL 注入的 code_review 任务
+curl -s -X POST http://127.0.0.1:8002/swarm/ask -H "Content-Type: application/json" -d '{
+  "task_type": "code_review",
+  "payload": {"code": "def login(u): return db.execute(f\"SELECT * FROM users WHERE name={u}\")", "file": "auth.py"},
+  "timeout": 60
+}'
+# 期望响应里 derived_task_ids 非空（至少一个 debug 任务，对应 7.9 节）
+
+# 3. 轮询派生的 debug 任务直到 done
+curl -s http://127.0.0.1:8002/swarm/tasks/<debug_task_id>
+
+# 4. 落地写盘
+curl -s -X POST http://127.0.0.1:8002/swarm/tasks/<debug_task_id>/apply \
+  -H "Content-Type: application/json" -d '{"path": "out/auth.fixed.py"}'
+# {"path":"/.../out/auth.fixed.py","bytes_written":...,"source":"python_block"}
+# 期望：out/auth.fixed.py 被创建，内容是抽出来的修复后代码
+
+# 5. 路径穿越回归：应被拒绝
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8002/swarm/tasks/<debug_task_id>/apply \
+  -H "Content-Type: application/json" -d '{"path": "../../../etc/bad"}'
+# 400
+
+# 6. 白板整体摘要
+curl -s http://127.0.0.1:8002/swarm/tasks
+# {"done": N, ...}
+```
+
+---
+
+## 7.11 本章检查清单
 
 ```
 □ Blackboard 的 claim() 是原子操作（并发认领同一任务不会出现竞态）
@@ -5488,14 +5900,36 @@ curl http://localhost:8002/swarm/tasks/a1b2c3d4
 
 □ /swarm/ask 提交一个会被 ReviewerSwarmAgent 判定为 Critical 的 code_review 任务：
   1. 响应里能看到 status == "done" 的审查结果
-  2. 审查结果里包含 NEEDS_FIX:true 时，后台会自动派生一个 debug 任务
-     （不体现在这次响应里，需要用 7.7 节的 GET /swarm/tasks/{task_id} 补查那个新任务）
+  2. 响应体的 derived_task_ids 非空（7.9 节），能看到自动派生的 debug 任务 ID
+     （不需要再翻日志——这是 7.9 节相对本章早期版本的改进点）
 
 □ （可选）Redis 持久化：
   1. docker exec -it redis-dev redis-cli ping 返回 PONG
   2. 运行中 docker exec -it redis-dev redis-cli get blackboard:tasks 能看到 JSON 数据
   3. Ctrl+C 杀掉 `python main.py` 后重新启动，日志出现「从 Redis 恢复了 N 个未完成任务」，
      且未完成任务重新出现在 pending 队列（而不是永久消失）
+
+□ 派生任务追踪（7.9 节）：
+  1. Task dataclass 有 derived_task_ids 字段，post_derived() 会把 child_id 追加到
+     父任务的 derived_task_ids 里（父任务不存在时降级为普通 post()，只打警告不报错）
+  2. reviewer_agent.py / debugger_agent.py 都已改成调用 post_derived(task.id, ...)
+     而不是 post(...)
+  3. /swarm/ask 的响应体、GET /swarm/tasks/{task_id} 的响应体都带 derived_task_ids，
+     能顺着这个字段递归查到 debug → test_write 整条派生链路
+
+□ apply 接口落地写盘（7.10 节）：
+  1. swarm/code_extractor.py 的 extract_python_code() 对 ```python 代码块、无语言
+     标记的裸代码块、纯审查意见（无代码块）三种输入分别返回预期的 (代码, 来源) /
+     (None, "none")
+  2. swarm/sandbox.py 的 resolve_safe_path() 对 "../../../etc/bad" 这类穿越路径
+     抛 PathTraversalError，对正常相对路径能正确解析到 SWARM_WORKSPACE 内
+  3. POST /swarm/tasks/{task_id}/apply 四种失败分支状态码分别正确：
+     任务不存在 → 404；任务未完成（pending/claimed/failed）→ 409；
+     无代码块可抽取（如拿 code_review 任务去调）→ 400；路径穿越 → 400
+  4. 对一个 status == "done" 的 debug/test_write 任务调用 apply，指定路径下
+     真的生成了文件，内容是抽取出的代码本身（不含说明文字）
+  5. 对同一个任务用同一个 path 再调一次 apply，文件被正常覆盖（没有隐藏的
+     重命名/加时间戳行为——"不覆盖除非显式传原路径"完全由调用方通过 path 控制）
 ```
 
 ---
