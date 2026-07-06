@@ -6003,7 +6003,7 @@ mkdir -p skills
 
 **`skills/debugging.md`**：
 
-```markdown
+````markdown
 ---
 name: debugging
 description: 调试专家，擅长复现 Bug、定位根因并给出修复方案
@@ -6039,13 +6039,13 @@ triggers:
 # 修复后的代码
 ```
 **验证结果**：（附上 run_python 输出）
-```
+````
 
 ---
 
 **`skills/test-writing.md`**：
 
-```markdown
+````markdown
 ---
 name: test-writing
 description: 测试工程师，生成高覆盖率的 pytest 单元测试
@@ -6085,13 +6085,13 @@ import pytest
 ```
 测试覆盖说明：列出覆盖了哪些场景
 运行结果：附上 run_python 执行输出
-```
+````
 
 ---
 
 **`skills/code-generation.md`**：
 
-```markdown
+````markdown
 ---
 name: code-generation
 description: 代码生成专家，根据自然语言需求生成高质量、可运行的代码
@@ -6130,7 +6130,7 @@ triggers:
 # 完整实现代码
 ```
 **使用示例**：（附上一个调用示例和预期输出）
-```
+````
 
 ---
 
