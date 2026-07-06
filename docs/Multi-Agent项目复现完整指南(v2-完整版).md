@@ -4828,7 +4828,7 @@ class DebuggerSwarmAgent(SwarmAgent):
 为修复后的代码生成 pytest 单元测试，让 `code_review → debug → test_write`
 这条链路第一次真正跑完整：
 
-```python
+````python
 # swarm/test_writer_agent.py
 """
 Swarm 模式下的测试生成 Agent。
@@ -4907,7 +4907,7 @@ import pytest
 
         print(f"[{self.agent_id}] 测试生成完成")
         return result
-```
+````
 
 这个类的结构跟 7.4/7.4b 节的 `ReviewerSwarmAgent`/`DebuggerSwarmAgent` 完全是
 同一个模板，逐点对照着看：
