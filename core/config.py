@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
 
+    # Redis
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+
     # 通用
     llm_model: str = "claude-sonnet-4-6"
     app_port: int = 8002

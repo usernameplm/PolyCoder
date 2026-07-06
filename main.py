@@ -14,7 +14,7 @@ import json
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
@@ -78,9 +78,19 @@ _swarm_save_task: asyncio.Task | None = None
 
 async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 5.0):
     """后台循环：每隔 interval 秒把白板状态备份到 Redis，直到被取消。"""
+    fail_count = 0
     while True:
         await asyncio.sleep(interval)
-        await blackboard.save_to_redis(redis_client)
+        try:
+            await redis_client.ping()
+            fail_count = 0
+            await blackboard.save_to_redis(redis_client)
+        except Exception:
+            fail_count += 1
+            if fail_count == 1:
+                print("[periodic_save] Redis 不可用，降级为纯内存模式（后续不再重复打印）")
+            if fail_count >= 3:
+                await asyncio.sleep(60)  # Redis 持续不可用时放慢重试频率
 
 
 @asynccontextmanager
@@ -242,6 +252,24 @@ async def swarm_ask_endpoint(req: SwarmAskRequest) -> SwarmAskResponse:
         task_id=task_id, status=task.status,
         result=task.result, error=task.error,
     )
+
+
+@app.get("/swarm/tasks/{task_id}", response_model=SwarmAskResponse)
+async def get_swarm_task(task_id: str) -> SwarmAskResponse:
+    """按 task_id 补查任务最新状态，配合 /swarm/ask 超时后的场景使用。"""
+    task = _blackboard.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+    return SwarmAskResponse(
+        task_id=task.id, status=task.status,
+        result=task.result, error=task.error,
+    )
+
+
+@app.get("/swarm/tasks")
+async def list_swarm_tasks() -> dict:
+    """白板整体状态摘要，如 {"pending": 2, "done": 5}，运维/监控用，不是业务调用入口。"""
+    return _blackboard.summary()
 
 
 @app.get("/")
