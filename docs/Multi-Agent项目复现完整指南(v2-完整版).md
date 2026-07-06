@@ -6574,6 +6574,383 @@ triggers:
 
 ---
 
+## 9.6b 团队规范类 Skill 文件（通用入口 Agent 专用）
+
+9.6 节的 4 个 Skill 都是"Agent 能力类"——定义 Agent 如何执行某种任务。但 Skill
+系统更大的价值在于**团队规范类 Skill**：把团队内部的工程标准、约定、流程写成 Skill
+文件，让通用入口 Agent（`/ask` 背后的 Coordinator 或 CLI 对话模式）在回答时自动
+遵守你们的规范，而不是用 LLM 的通用知识随便答。
+
+**为什么不直接写死在子 Agent 的 system prompt 里？**
+
+子 Agent（reviewer、debugger、test_writer）的职责是固定的——它们本身就是"活的
+Skill"。但通用入口 Agent 面对的是**任意问题**：用户可能问"帮我建个表"、也可能问
+"这个异步代码怎么改"、也可能问"帮我提交一下代码"。把所有领域的规范都塞进通用
+Agent 的 system prompt 不现实，用 Skill 按需加载才是正解。
+
+---
+
+**`skills/git-workflow.md`**：
+
+````markdown
+---
+name: git-workflow
+description: Git 工作流规范，包括分支命名、提交信息格式和 PR 流程
+triggers:
+  - git
+  - 提交
+  - commit
+  - 分支
+  - branch
+  - merge
+  - PR
+  - pull request
+---
+
+## Git 分支命名规范
+
+- 功能分支：`feat/<模块>-<简述>`，如 `feat/swarm-redis-persist`
+- 修复分支：`fix/<issue号>-<简述>`，如 `fix/127-claim-race`
+- 重构分支：`refactor/<简述>`
+
+## Commit Message 格式（Conventional Commits）
+
+```
+<type>(<scope>): <subject>
+
+<body>（可选，说明 why）
+```
+
+type 取值：feat | fix | refactor | test | docs | chore
+scope 取值：swarm | coordinator | provider | tools | api
+
+示例：
+- `feat(swarm): add post_derived for task lineage tracking`
+- `fix(blackboard): use Condition instead of Event to prevent notification loss`
+
+## PR 规范
+
+- 标题不超过 70 字符，格式同 commit message
+- 描述里必须包含：改了什么、为什么改、怎么测的
+- 一个 PR 只做一件事，不混杂无关改动
+````
+
+---
+
+**`skills/error-handling.md`**：
+
+````markdown
+---
+name: error-handling
+description: 团队异常处理规范，定义何时捕获、何时抛出、日志格式
+triggers:
+  - 异常
+  - 错误处理
+  - try
+  - except
+  - raise
+  - 异常处理
+  - error handling
+---
+
+## 核心原则
+
+1. **不吞异常**：`except: pass` 是禁止的，最少要打日志
+2. **区分可重试和不可重试**：
+   - 可重试：网络超时、连接被拒、速率限制 → 用 tenacity 重试
+   - 不可重试：参数错误、权限不足、资源不存在 → 直接抛出
+3. **边界层捕获，内部层抛出**：
+   - HTTP 接口层（main.py）：捕获并转为合适的 HTTP 状态码
+   - 业务逻辑层（agent/、swarm/）：抛出明确的异常类，不自行捕获
+
+## 日志格式
+
+```python
+# 正确：包含上下文信息
+print(f"[{模块名}] 操作失败：{具体原因}，task_id={id}")
+
+# 错误：无用的泛化日志
+print("出错了")
+```
+
+## 自定义异常命名
+
+- 继承 `ValueError`：输入参数不合法
+- 继承 `RuntimeError`：运行时状态异常
+- 类名必须以 `Error` 结尾，如 `PathTraversalError`、`TaskTypeUnknownError`
+
+## 降级处理
+
+外部依赖（Redis、LLM API）不可用时：
+- 打印一次警告日志（不重复刷屏）
+- 降级到备选方案（内存模式 / 默认响应）
+- 不让整个服务崩溃
+````
+
+---
+
+**`skills/async-patterns.md`**：
+
+````markdown
+---
+name: async-patterns
+description: 异步编程规范，涵盖 asyncio 常用模式和踩坑指南
+triggers:
+  - 异步
+  - async
+  - await
+  - asyncio
+  - 并发
+  - 协程
+  - 事件循环
+---
+
+## 何时用异步
+
+- I/O 密集操作（网络请求、文件读写、数据库查询）→ **用 async**
+- CPU 密集操作（大量计算）→ **用线程池 / 进程池**，不要阻塞事件循环
+
+## 常用模式
+
+### 并行执行多个独立任务
+```python
+results = await asyncio.gather(task_a(), task_b(), task_c())
+```
+
+### 超时控制
+```python
+try:
+    result = await asyncio.wait_for(slow_operation(), timeout=10.0)
+except asyncio.TimeoutError:
+    # 处理超时
+```
+
+### 后台常驻任务
+```python
+task = asyncio.create_task(background_loop())
+# 服务关闭时：
+task.cancel()
+await asyncio.gather(task, return_exceptions=True)
+```
+
+## 常见陷阱
+
+1. **忘记 await**：协程不 await 就不会执行，也不报错，只有一个 RuntimeWarning
+2. **在 async 函数里用 time.sleep()**：会阻塞整个事件循环，必须用 `await asyncio.sleep()`
+3. **Lock 跨 await 使用**：`asyncio.Lock` 不能跨 await 边界保证原子性的多步操作，每次 await 都可能让出控制权
+4. **Event.set() + Event.clear() 竞态**：用 Condition 替代（本项目 Blackboard 踩过的坑）
+````
+
+---
+
+**`skills/database.md`**：
+
+````markdown
+---
+name: database
+description: 数据库设计与查询规范，包括建表、索引和迁移
+triggers:
+  - 数据库
+  - SQL
+  - 建表
+  - 索引
+  - 迁移
+  - migration
+  - 查询
+  - ORM
+---
+
+## 建表规范
+
+- 主键：使用 `id BIGINT AUTO_INCREMENT`，不用 UUID 做主键（索引性能差）
+- 时间字段：必须有 `created_at`、`updated_at`，使用 `TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+- 命名：表名蛇形复数（`user_accounts`），字段名蛇形单数（`user_name`）
+- 字符集：统一 `utf8mb4`，排序规则 `utf8mb4_unicode_ci`
+
+## 查询规范
+
+- **绝对禁止字符串拼接 SQL**——必须使用参数化查询
+- 禁止 `SELECT *`，明确列出需要的字段
+- 分页必须用 `LIMIT + OFFSET` 或游标分页，不能全表返回
+- 批量操作用 `executemany`，不要循环单条插入
+
+## 索引策略
+
+- WHERE 条件里的字段优先加索引
+- 联合索引遵循最左前缀原则
+- 不在低基数字段（如 `status` 只有 3 种值）上单独建索引
+
+## 迁移规范
+
+- 每次迁移一个文件，文件名格式：`001_create_users.sql`
+- 新增列必须有默认值（避免锁全表）
+- 不在迁移脚本里删列或改列类型（单独做，先确认无引用）
+````
+
+---
+
+**`skills/api-design.md`**：
+
+````markdown
+---
+name: api-design
+description: RESTful API 设计规范，包括路由命名、状态码和响应格式
+triggers:
+  - 接口
+  - API
+  - REST
+  - 路由
+  - endpoint
+  - 状态码
+  - HTTP
+---
+
+## 路由命名
+
+- 资源用名词复数：`/tasks`、`/users`
+- 层级关系用嵌套：`/tasks/{id}/apply`
+- 动作用 HTTP 方法表达，不要出现动词路由（`/getTask` ✗，`GET /tasks/{id}` ✓）
+
+## HTTP 方法语义
+
+| 方法 | 语义 | 幂等 |
+|------|------|------|
+| GET | 读取资源，不产生副作用 | 是 |
+| POST | 创建资源 / 触发操作 | 否 |
+| PUT | 全量替换资源 | 是 |
+| PATCH | 局部更新资源 | 否 |
+| DELETE | 删除资源 | 是 |
+
+## 状态码使用
+
+- 200：成功
+- 201：创建成功（POST 创建新资源时用）
+- 400：请求格式错误 / 参数不合法
+- 404：资源不存在
+- 409：状态冲突（如任务未完成时尝试 apply）
+- 422：请求格式正确但语义错误（Pydantic 校验失败）
+- 500：服务器内部错误（代码 Bug，不应在正常流程出现）
+
+## 响应格式
+
+成功：直接返回资源 JSON
+```json
+{"task_id": "abc", "status": "done", "result": "..."}
+```
+
+失败：使用 FastAPI 的 HTTPException，统一 detail 字段
+```json
+{"detail": "任务 abc 不存在"}
+```
+
+## 分页
+
+- 使用 `?page=1&size=20`，默认 page=1, size=20
+- 响应里带 `total` 总数，方便前端计算总页数
+````
+
+---
+
+**`skills/env-config.md`**：
+
+````markdown
+---
+name: env-config
+description: 环境变量与配置管理规范，新增配置的标准流程
+triggers:
+  - 环境变量
+  - 配置
+  - .env
+  - settings
+  - config
+  - 新增配置
+---
+
+## 新增配置项的标准流程
+
+每新增一个配置项，必须同时改 3 个地方（缺一不可）：
+
+1. **`.env`**：加上实际的值（带注释说明用途）
+2. **`core/config.py` 的 `Settings` 类**：加上对应字段（含类型和默认值）
+3. **文档**：在附录 B 的配置项说明里加一行
+
+## 命名规范
+
+- 全大写，下划线分隔：`REDIS_HOST`、`LLM_PROVIDER`
+- 前缀按模块分组：`REDIS_`、`OPENAI_`、`ANTHROPIC_`
+- 布尔值用 `true`/`false`（字符串），Settings 里声明为 `bool` 类型自动转换
+
+## 默认值原则
+
+- 本地开发能跑起来的默认值（如 `REDIS_HOST=localhost`）
+- 密钥类字段默认空字符串，启动时不报错但调用时才报错
+- 端口类字段有合理默认值（如 `APP_PORT=8002`）
+
+## 敏感配置
+
+- `.env` 文件永远不提交到 Git（已在 .gitignore 里）
+- 生产环境通过环境变量注入，不依赖文件
+- 日志里打印配置信息时，密钥只显示前 4 位 + `***`
+````
+
+---
+
+**`skills/prompt-engineering.md`**：
+
+````markdown
+---
+name: prompt-engineering
+description: Agent 提示词编写规范，确保 system prompt 结构化、输出可控
+triggers:
+  - 提示词
+  - prompt
+  - system prompt
+  - 系统提示
+  - Agent 指令
+---
+
+## System Prompt 结构模板
+
+```
+## 你的角色
+（一句话定位：你是什么、专长什么）
+
+## 工作流程
+（编号步骤，告诉 LLM 先做什么后做什么）
+
+## 输出格式
+（严格约定输出结构，方便下游解析）
+
+## 约束条件
+（明确的禁止项和边界）
+```
+
+## 关键原则
+
+1. **角色先行**：第一段就明确身份，LLM 会在整个对话中保持角色一致性
+2. **流程编号**：用数字步骤而非散文描述，LLM 更容易按顺序执行
+3. **输出格式必须显式约定**：需要结构化输出时，给出精确模板（含占位符）
+4. **用"必须"/"禁止"而非"尽量"/"建议"**：模糊措辞导致 LLM 自行判断
+
+## 常见反模式
+
+| 反模式 | 问题 | 改进 |
+|--------|------|------|
+| "请尽量详细" | 输出不可控，可能很长 | "用 3-5 句话总结" |
+| "如果可以的话" | LLM 可能选择不做 | "必须执行以下步骤" |
+| 没有输出格式约定 | 每次输出结构不同 | 明确给出 JSON/Markdown 模板 |
+| 把所有要求写在一段话里 | LLM 容易漏掉 | 拆成编号列表 |
+
+## 需要解析输出时的技巧
+
+在输出格式里加入明确的标记，方便代码用正则/字符串匹配提取：
+- `NEEDS_FIX:true` / `NEEDS_FIX:false`（本项目 reviewer_agent 的做法）
+- 用 ```python 围栏包裹代码（方便 code_extractor.py 抽取）
+- 关键字段放在独立行开头（如 `Bug 根因：xxx`）
+````
+
+---
+
 ## 9.7 本章检查清单
 
 ```
