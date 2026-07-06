@@ -8,6 +8,8 @@
   - 白板保证：同一个任务不会被两个 Agent 重复认领（加锁保证原子性）
 """
 import asyncio
+import dataclasses
+import json
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -129,3 +131,38 @@ class Blackboard:
         from collections import Counter
         counts = Counter(t.status for t in self._tasks.values())
         return dict(counts)
+
+    async def save_to_redis(self, redis_client):
+        """
+        把当前白板状态保存到 Redis，支持重启后恢复。
+
+        Redis 只能存字符串/字节，不能直接存 Python 对象，所以要先把
+        Task（dataclass）转成 dict（dataclasses.asdict），再转成 JSON 字符串（json.dumps）。
+        """
+        try:
+            async with self._lock:
+                tasks_data = {tid: dataclasses.asdict(t) for tid, t in self._tasks.items()}
+            await redis_client.set("blackboard:tasks", json.dumps(tasks_data))
+        except Exception as e:
+            print(f"[Blackboard] 保存到 Redis 失败（降级为纯内存模式）：{e}")
+
+    async def load_from_redis(self, redis_client):
+        """从 Redis 恢复白板状态（进程启动时调用一次）。"""
+        try:
+            data = await redis_client.get("blackboard:tasks")
+        except Exception as e:
+            print(f"[Blackboard] 连接 Redis 失败，跳过恢复，从空白板启动：{e}")
+            return
+
+        if not data:
+            print("[Blackboard] Redis 里没有历史任务数据，从空白板启动")
+            return
+
+        tasks_data = json.loads(data)
+        async with self._lock:
+            for tid, t_dict in tasks_data.items():
+                if t_dict["status"] in ("pending", "claimed"):
+                    t_dict["status"] = "pending"
+                    t_dict["owner"] = None
+                    self._tasks[tid] = Task(**t_dict)
+        print(f"[Blackboard] 从 Redis 恢复了 {len(self._tasks)} 个未完成任务")

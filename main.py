@@ -25,6 +25,7 @@ from swarm.reviewer_agent import ReviewerSwarmAgent
 from swarm.debugger_agent import DebuggerSwarmAgent
 from swarm.test_writer_agent import TestWriterSwarmAgent
 from swarm.task_types import TaskType
+from swarm.redis_client import create_redis_client
 
 from agent import ask_stream
 from coordinator.agent import CoordinatorAgent
@@ -71,19 +72,29 @@ class SwarmAskResponse(BaseModel):
 # 全局白板 + Swarm Agent 后台任务（跟 _coordinator 一样，启动时初始化一次）
 _blackboard = Blackboard()
 _swarm_agent_tasks: list[asyncio.Task] = []
+_redis_client = create_redis_client()
+_swarm_save_task: asyncio.Task | None = None
+
+
+async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 5.0):
+    """后台循环：每隔 interval 秒把白板状态备份到 Redis，直到被取消。"""
+    while True:
+        await asyncio.sleep(interval)
+        await blackboard.save_to_redis(redis_client)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    yield 前：服务启动时执行（初始化资源）
-    yield 后：服务关闭时执行（释放资源）
-    """
+    global _swarm_save_task
+
     print("服务启动中...")
     print(f"API 文档地址：http://localhost:8002/docs")
     print(f"流式测试：curl -N 'http://localhost:8002/ask/stream?question=你好'")
 
-    # 常驻 Swarm Agent：跟 FastAPI 服务同生命周期，不是每次请求创建/销毁
+    # 1. 启动时先尝试从 Redis 恢复上次未完成的任务
+    await _blackboard.load_from_redis(_redis_client)
+
+    # 2. 常驻 Swarm Agent
     agents = [
         ReviewerSwarmAgent(_blackboard),
         DebuggerSwarmAgent(_blackboard),
@@ -91,11 +102,19 @@ async def lifespan(app: FastAPI):
     ]
     _swarm_agent_tasks.extend(asyncio.create_task(a.start()) for a in agents)
 
+    # 3. 后台定期备份，不阻塞主流程
+    _swarm_save_task = asyncio.create_task(periodic_save(_blackboard, _redis_client))
+
     yield
 
+    # 4. 收尾：停 Agent、停后台备份任务、退出前再存一次、关闭连接
     for task in _swarm_agent_tasks:
         task.cancel()
     await asyncio.gather(*_swarm_agent_tasks, return_exceptions=True)
+
+    _swarm_save_task.cancel()
+    await _blackboard.save_to_redis(_redis_client)
+    await _redis_client.close()
     print("服务已关闭。")
 
 
