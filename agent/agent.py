@@ -55,8 +55,22 @@ _executor = ToolExecutor(_registry)
 _store = SessionStore(base_dir="sessions/", redis_client=create_redis_client())
 
 
-async def ask(question: str) -> AskResult:
+async def ask(question: str, session_id: str | None = None) -> AskResult:
+    """
+    调用 Agent 回答问题。
+
+    session_id 为 None（默认）时无记忆，每次调用互不影响；
+    传入 session_id 时会从 SessionStore 加载历史（最近 10 轮）、
+    拼到本次问题前面一起跑，并把这轮问答追加写回 SessionStore（第 10 章）。
+    """
     provider = get_provider()
+
+    initial_messages = None
+    if session_id is not None:
+        history = await _store.load_messages(session_id, max_turns=10)
+        new_user_message = Message(role="user", content=[TextBlock(text=question)])
+        initial_messages = history + [new_user_message]
+        await _store.append_message(session_id, "user", question)
 
     result = await run_agent_loop(
         prompt=question,
@@ -65,45 +79,11 @@ async def ask(question: str) -> AskResult:
         tools=_registry.get_all_definitions(),
         executor=_executor,
         max_turns=10,
+        initial_messages=initial_messages,
     )
 
-    return AskResult(
-        text=result.text,
-        input_tokens=result.total_usage.input_tokens,
-        output_tokens=result.total_usage.output_tokens,
-        turn_count=result.turn_count,
-    )
-
-
-async def ask_with_memory(question: str, session_id: str = "default") -> AskResult:
-    """
-    带多轮记忆的 Agent 调用（第 10 章）。
-
-    流程：
-    1. 从 SessionStore 加载历史对话（最近 10 轮）
-    2. 把新问题接到历史末尾，构成完整消息列表
-    3. 把完整消息列表传给 Agentic Loop（不再单独传 prompt 让它从零构造）
-    4. 把这轮的问答追加写回 SessionStore
-    """
-    provider = get_provider()
-
-    history = await _store.load_messages(session_id, max_turns=10)
-    new_user_message = Message(role="user", content=[TextBlock(text=question)])
-    all_messages = history + [new_user_message]
-
-    await _store.append_message(session_id, "user", question)
-
-    result = await run_agent_loop(
-        prompt=question,
-        provider=provider,
-        system=SYSTEM_PROMPT,
-        tools=_registry.get_all_definitions(),
-        executor=_executor,
-        max_turns=10,
-        initial_messages=all_messages,
-    )
-
-    await _store.append_message(session_id, "assistant", result.text)
+    if session_id is not None:
+        await _store.append_message(session_id, "assistant", result.text)
 
     return AskResult(
         text=result.text,

@@ -7325,10 +7325,16 @@ async def run_agent_loop(
     ...
 ```
 
-然后在 `agent/agent.py` 里加 `ask_with_memory`：
+> **为什么不单独写一个 `ask_with_memory()`？** 它跟 `ask()` 除了"要不要读写历史"之外，
+> 拿 provider、传 tools/executor、跑 loop、组装 `AskResult` 全部一样——两个函数并存只会
+> 变成重复代码，以后改一处很容易忘了改另一处。更好的做法是给 `ask()` 加一个可选的
+> `session_id`：不传（默认 `None`）就是原来的无记忆行为，完全兼容现有调用方
+> （`cli.py`、测试）；传了就自动读历史、拼历史、存历史。
+
+给 `agent/agent.py` 里已有的 `ask()` 加上 `session_id` 参数：
 
 ```python
-# agent/agent.py（在已有 ask() / ask_stream() 之后追加）
+# agent/agent.py（在文件顶部追加 import，并替换 ask()）
 
 from providers.types import Message, TextBlock
 from persistence.session_store import SessionStore
@@ -7340,23 +7346,22 @@ from swarm.redis_client import create_redis_client
 _store = SessionStore(base_dir="sessions/", redis_client=create_redis_client())
 
 
-async def ask_with_memory(question: str, session_id: str = "default") -> AskResult:
+async def ask(question: str, session_id: str | None = None) -> AskResult:
     """
-    带多轮记忆的 Agent 调用。
+    调用 Agent 回答问题。
 
-    流程：
-    1. 从 SessionStore 加载历史对话（最近 10 轮）
-    2. 把新问题接到历史末尾，构成完整消息列表
-    3. 把完整消息列表传给 Agentic Loop（用 initial_messages，不再只传 prompt）
-    4. 把这轮的问答追加写回 SessionStore
+    session_id 为 None（默认）时无记忆，每次调用互不影响；
+    传入 session_id 时会从 SessionStore 加载历史（最近 10 轮）、
+    拼到本次问题前面一起跑，并把这轮问答追加写回 SessionStore。
     """
     provider = get_provider()
 
-    history = await _store.load_messages(session_id, max_turns=10)
-    new_user_message = Message(role="user", content=[TextBlock(text=question)])
-    all_messages = history + [new_user_message]
-
-    await _store.append_message(session_id, "user", question)
+    initial_messages = None
+    if session_id is not None:
+        history = await _store.load_messages(session_id, max_turns=10)
+        new_user_message = Message(role="user", content=[TextBlock(text=question)])
+        initial_messages = history + [new_user_message]
+        await _store.append_message(session_id, "user", question)
 
     result = await run_agent_loop(
         prompt=question,
@@ -7365,10 +7370,11 @@ async def ask_with_memory(question: str, session_id: str = "default") -> AskResu
         tools=_registry.get_all_definitions(),
         executor=_executor,
         max_turns=10,
-        initial_messages=all_messages,
+        initial_messages=initial_messages,
     )
 
-    await _store.append_message(session_id, "assistant", result.text)
+    if session_id is not None:
+        await _store.append_message(session_id, "assistant", result.text)
 
     return AskResult(
         text=result.text,
@@ -7378,11 +7384,11 @@ async def ask_with_memory(question: str, session_id: str = "default") -> AskResu
     )
 ```
 
-记得把 `ask_with_memory` 加进 `agent/__init__.py` 的导出：
+`agent/__init__.py` 的导出不用变，`ask` 本来就在导出列表里：
 
 ```python
 # agent/__init__.py
-from .agent import ask, ask_stream, ask_with_memory, AskResult
+from .agent import ask, ask_stream, AskResult
 ```
 
 ---
@@ -7398,8 +7404,8 @@ class AskRequest(BaseModel):
 
 @app.post("/ask")
 async def ask_endpoint(req: AskRequest):
-    result = await ask_with_memory(req.question, session_id=req.session_id)
-    return {"text": result, "session_id": req.session_id}
+    result = await ask(req.question, session_id=req.session_id)
+    return {"text": result.text, "session_id": req.session_id}
 ```
 
 客户端调用时保持相同的 `session_id`，Agent 就会记住上下文：
@@ -7872,7 +7878,7 @@ class FeishuClient:
 import json
 import time
 from .client import FeishuClient
-from agent import ask_with_memory   # 使用带记忆的 ask
+from agent import ask   # 传 session_id 就是带记忆的调用
 
 
 class MessageHandler:
@@ -7962,8 +7968,8 @@ class MessageHandler:
 
         # 调用 Agent
         try:
-            result = await ask_with_memory(text, session_id=session_key)
-            await self.client.send_text(receive_id, result, id_type=receive_id_type)
+            result = await ask(text, session_id=session_key)
+            await self.client.send_text(receive_id, result.text, id_type=receive_id_type)
         except Exception as e:
             await self.client.send_text(receive_id, f"处理时遇到错误，请稍后重试。", id_type=receive_id_type)
             print(f"[Handler] 错误：{e}")
