@@ -6,9 +6,15 @@ TF-IDF 是一种简单的文本相关性算法：
   - TF（词频）：词在查询中出现的频率
   - IDF（逆文档频率）：词在所有 Skill 中的"稀有程度"（越稀有越有区分度）
 
-不需要安装额外依赖，用纯 Python 实现。
+分词用 jieba：中文没有空格分隔单词，简单按正则切分会把一整段连续汉字
+当成一个词（比如"帮我写一个"整体算一个 token），导致中文 query 命中率很差。
+jieba 是成熟的中文分词库，能正确识别词边界，同时也兼容英文/数字分词。
 """
 import math
+import re
+
+import jieba
+
 from .loader import Skill, load_skills
 
 
@@ -35,10 +41,9 @@ class SkillSearcher:
         return {word: math.log(n / freq) for word, freq in doc_freq.items()}
 
     def _tokenize(self, text: str) -> list[str]:
-        """简单分词：按空格和标点切分，转小写。"""
-        import re
-        tokens = re.findall(r'[\w一-鿿]+', text.lower())
-        return tokens
+        """用 jieba 分词（中文按词切分，英文/数字按单词切分），转小写并过滤标点和空白。"""
+        raw_tokens = jieba.cut(text.lower())
+        return [t for t in raw_tokens if re.match(r'^[\w一-鿿]+$', t)]
 
     def search(self, query: str, top_k: int = 3) -> list[Skill]:
         """

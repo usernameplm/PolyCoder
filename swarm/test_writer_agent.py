@@ -40,7 +40,7 @@ class TestWriterSwarmAgent(SwarmAgent):
 
         provider = get_provider()
 
-        system = """
+        base_system = """
 你是一名测试工程师，专注于编写高质量的 pytest 单元测试。
 
 测试覆盖原则：
@@ -63,6 +63,7 @@ import pytest
             f"{code}\n\n"
             "请为这段代码编写 pytest 单元测试。"
         )
+        system = self._enhance_system(base_system, prompt[:300])
 
         response = await provider.chat(
             messages=[Message(role="user", content=[TextBlock(text=prompt)])],

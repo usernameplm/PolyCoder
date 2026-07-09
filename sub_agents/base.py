@@ -10,6 +10,7 @@ from agent.loop import run_agent_loop
 from agent.executor import ToolExecutor
 from providers.router import get_provider
 from tools.registry import ToolRegistry
+from skills.enhancer import enhance_system_prompt
 
 
 class SubAgent(ABC):
@@ -55,6 +56,13 @@ class SubAgent(ABC):
             context_str = "\n".join(f"【{k}的结果】\n{v}" for k, v in context.items())
             full_task = f"{task}\n\n参考信息（来自前置任务）：\n{context_str}"
 
+        # 用任务描述搜索相关 Skill，动态增强 system prompt
+        system = enhance_system_prompt(
+            base_system=self.system_prompt,
+            context=full_task[:300],
+            agent_name=self.name,
+        )
+
         provider = get_provider()
 
         # 使用 Agentic Loop 执行任务
@@ -67,7 +75,7 @@ class SubAgent(ABC):
         result = await run_agent_loop(
             prompt=full_task,
             provider=provider,
-            system=self.system_prompt,
+            system=system,
             tools=registry.get_all_definitions() if self.tools else None,
             executor=executor,
             max_turns=10,

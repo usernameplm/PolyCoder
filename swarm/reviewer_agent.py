@@ -45,13 +45,14 @@ class ReviewerSwarmAgent(SwarmAgent):
 
         provider = get_provider()
 
-        system = """
+        base_system = """
 你是一名资深代码审查工程师。
 审查维度：SQL 注入、命令注入、硬编码密码、逻辑错误、边界条件、性能问题。
 每个问题输出：[Critical/Warning/Suggestion] 行号 - 问题描述 - 建议修复。
 发现 Critical 级别问题时，最后一行输出 NEEDS_FIX:true，否则输出 NEEDS_FIX:false。
 """
         prompt = f"文件：{filename}\n重点关注：{focus}\n\n```python\n{code}\n```"
+        system = self._enhance_system(base_system, prompt[:300])
 
         response = await provider.chat(
             messages=[Message(role="user", content=[TextBlock(text=prompt)])],

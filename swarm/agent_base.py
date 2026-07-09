@@ -9,6 +9,7 @@ Swarm Agent 基类。
 import asyncio
 from abc import ABC, abstractmethod
 from .blackboard import Blackboard, Task
+from skills.enhancer import enhance_system_prompt
 
 
 class SwarmAgent(ABC):
@@ -36,6 +37,10 @@ class SwarmAgent(ABC):
         任务处理失败时抛出异常（SwarmAgent 会自动标记为 failed）。
         """
         ...
+
+    def _enhance_system(self, base_system: str, context: str) -> str:
+        """Skill 增强的便捷入口（调用公共模块）。"""
+        return enhance_system_prompt(base_system, context, agent_name=self.agent_id)
 
     async def start(self):
         """启动 Agent，持续监听白板上的任务。"""

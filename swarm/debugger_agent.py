@@ -28,7 +28,7 @@ class DebuggerSwarmAgent(SwarmAgent):
 
         provider = get_provider()
 
-        system = """
+        base_system = """
 你是一名调试工程师，根据代码审查结果修复 Bug。
 输出格式：
 1. Bug 根因（一句话）
@@ -41,6 +41,7 @@ class DebuggerSwarmAgent(SwarmAgent):
             f"原始代码：\n```python\n{code}\n```\n\n"
             "请根据审查结果修复所有 Critical 级别的问题。"
         )
+        system = self._enhance_system(base_system, prompt[:300])
 
         response = await provider.chat(
             messages=[Message(role="user", content=[TextBlock(text=prompt)])],
