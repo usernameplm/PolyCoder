@@ -1,1 +1,1 @@
-from .agent import ask, ask_stream, AskResult
+from .agent import ask, ask_stream, clear_session, AskResult

@@ -128,6 +128,14 @@ class SessionStore:
                 except Exception as e:
                     print(f"[SessionStore] Redis 缓存回填失败（不影响本次返回结果）：{e}")
 
+        # 3. 修补"孤儿 user 消息"：如果上一次调用在写完 user、还没写 assistant
+        #    时中途崩溃（比如 LLM 调用抛异常），文件/缓存会以一条没人回答的
+        #    user 记录结尾。留着它的话，本次会在它后面再拼一条新 user 消息，
+        #    形成连续两条 role="user"，违反 Anthropic API 的角色交替要求，
+        #    下一次请求会直接报错。这条记录反正没被回答过，丢弃它不影响历史完整性。
+        if raw_messages and raw_messages[-1].get("role") == "user":
+            raw_messages = raw_messages[:-1]
+
         # 只取最近 max_turns 轮（每轮 = user + assistant）
         max_records = max_turns * 2
         recent = raw_messages[-max_records:] if len(raw_messages) > max_records else raw_messages

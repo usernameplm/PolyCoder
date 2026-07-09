@@ -93,8 +93,18 @@ async def ask(question: str, session_id: str | None = None) -> AskResult:
     )
 
 
-async def ask_stream(question: str) -> AsyncGenerator[str, None]:
-    """流式调用，通过 on_text_delta 回调实时传出文本。"""
+async def clear_session(session_id: str):
+    """清除一个会话的历史（文件 + Redis 缓存）。"""
+    await _store.clear(session_id)
+
+
+async def ask_stream(question: str, session_id: str | None = None) -> AsyncGenerator[str, None]:
+    """
+    流式调用，通过 on_text_delta 回调实时传出文本。
+
+    session_id 用法跟 ask() 一致：不传就是无记忆的一次性调用；
+    传入则加载/追加历史，效果与 ask() 相同，只是文本以流式方式返回。
+    """
     queue: Queue[str | None] = Queue()
 
     def on_delta(text: str):
@@ -102,6 +112,20 @@ async def ask_stream(question: str) -> AsyncGenerator[str, None]:
 
     async def run_loop():
         provider = get_provider()
+
+        initial_messages = None
+        if session_id is not None:
+            history = await _store.load_messages(session_id, max_turns=10)
+            new_user_message = Message(role="user", content=[TextBlock(text=question)])
+            initial_messages = history + [new_user_message]
+            await _store.append_message(session_id, "user", question)
+
+        text_chunks: list[str] = []
+
+        def on_delta_and_collect(text: str):
+            text_chunks.append(text)
+            on_delta(text)
+
         await run_agent_loop(
             prompt=question,
             provider=provider,
@@ -109,8 +133,13 @@ async def ask_stream(question: str) -> AsyncGenerator[str, None]:
             tools=_registry.get_all_definitions(),
             executor=_executor,
             max_turns=10,
-            on_text_delta=on_delta,
+            on_text_delta=on_delta_and_collect,
+            initial_messages=initial_messages,
         )
+
+        if session_id is not None:
+            await _store.append_message(session_id, "assistant", "".join(text_chunks))
+
         queue.put_nowait(None)
 
     loop_task = asyncio.create_task(run_loop())

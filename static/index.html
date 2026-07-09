@@ -228,7 +228,8 @@
 
             try {
                 if (stream) {
-                    const url = BASE + '/ask/stream?question=' + encodeURIComponent(question);
+                    const url = BASE + '/ask/stream?question=' + encodeURIComponent(question) +
+                        '&session_id=' + encodeURIComponent(SESSION_ID);
                     const resp = await fetch(url);
                     const reader = resp.body.getReader();
                     const decoder = new TextDecoder();
@@ -291,8 +292,17 @@
             setButtons(false);
         }
 
-        function clearChat() {
+        async function clearChat() {
             document.getElementById('chat').innerHTML = '';
+            try {
+                await fetch(BASE + '/session/clear', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: SESSION_ID }),
+                });
+            } catch (e) {
+                console.warn('清除服务端会话失败：', e.message);
+            }
         }
 
         // ── Swarm 模式 ──────────────────────────────────────────────

@@ -29,7 +29,7 @@ from swarm.redis_client import create_redis_client
 from swarm.code_extractor import extract_python_code
 from swarm.sandbox import resolve_safe_path, PathTraversalError
 
-from agent import ask, ask_stream
+from agent import ask, ask_stream, clear_session
 
 from typing import Any
 
@@ -56,6 +56,11 @@ class AskResponse(BaseModel):
     session_id: str = Field(default="", description="本次请求使用的会话 ID，回传给前端便于下一轮携带")
     usage: dict = Field(default_factory=dict, description="Token 用量")
     error: str | None = Field(default=None, description="错误信息")
+
+
+class ClearSessionRequest(BaseModel):
+    """POST /session/clear 的请求体格式"""
+    session_id: str = Field(..., min_length=1, description="要清除的会话 ID")
 
 
 class SwarmAskRequest(BaseModel):
@@ -207,11 +212,11 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
 
 
 @app.get("/ask/stream")
-async def ask_stream_endpoint(question: str):
+async def ask_stream_endpoint(question: str, session_id: str | None = None):
     """
     SSE 流式响应接口：逐 token 实时推送，适合前端打字机效果。
 
-    URL 参数：?question=你的问题
+    URL 参数：?question=你的问题&session_id=可选，同一会话传相同值
     响应：text/event-stream 格式，逐块推送 JSON 数据
 
     测试方法：
@@ -224,7 +229,7 @@ async def ask_stream_endpoint(question: str):
         每次 yield 一条 SSE 格式的消息（'data: {...}\\n\\n'）。
         """
         try:
-            async for chunk in ask_stream(question):
+            async for chunk in ask_stream(question, session_id=session_id):
                 # 把文本片段包装成 SSE 格式
                 data = json.dumps(
                     {"type": "text_delta", "text": chunk},
@@ -248,6 +253,18 @@ async def ask_stream_endpoint(question: str):
             "X-Accel-Buffering": "no",            # 禁用 Nginx 缓冲（如果用了 Nginx 反代）
         },
     )
+
+
+@app.post("/session/clear")
+async def clear_session_endpoint(req: ClearSessionRequest) -> dict:
+    """
+    清除一个会话的历史（JSONL 文件 + Redis 缓存）。
+
+    请求体：{"session_id": "..."}
+    """
+    await clear_session(req.session_id)
+    return {"session_id": req.session_id, "cleared": True}
+
 
 @app.post("/swarm/ask", response_model=SwarmAskResponse)
 async def swarm_ask_endpoint(req: SwarmAskRequest) -> SwarmAskResponse:

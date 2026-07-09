@@ -7045,7 +7045,7 @@ def resolve_safe_path(workspace: Path, relative: str) -> Path:
 # 第 10 章：阶段 10 —— 会话持久化
 
 > **本章目标**：让 Agent 记住历史对话，重启后能从上次中断的地方继续。
-> 用 JSONL 文件作为主存储，Redis 作为索引，支持断点续传。
+> 用 JSONL 文件作为主存储，Redis 缓存最近消息内容加速加载，支持断点续传。
 
 ---
 
@@ -7234,6 +7234,14 @@ class SessionStore:
                 except Exception as e:
                     print(f"[SessionStore] Redis 缓存回填失败（不影响本次返回结果）：{e}")
 
+        # 3. 修补"孤儿 user 消息"：如果上一次调用在写完 user、还没写 assistant
+        #    时中途崩溃（比如 LLM 调用抛异常），文件/缓存会以一条没人回答的
+        #    user 记录结尾。留着它的话，本次会在它后面再拼一条新 user 消息，
+        #    形成连续两条 role="user"，违反 Anthropic API 的角色交替要求，
+        #    下一次请求会直接报错。这条记录反正没被回答过，丢弃它不影响历史完整性。
+        if raw_messages and raw_messages[-1].get("role") == "user":
+            raw_messages = raw_messages[:-1]
+
         # 只取最近 max_turns 轮（每轮 = user + assistant）
         max_records = max_turns * 2
         recent = raw_messages[-max_records:] if len(raw_messages) > max_records else raw_messages
@@ -7290,6 +7298,15 @@ class SessionStore:
 
         print(f"[SessionStore] 已清除会话：{session_id}")
 ```
+
+> **为什么 `load_messages` 要专门丢弃末尾的孤儿 user 消息？** `append_message("user", ...)`
+> 和 `append_message("assistant", ...)` 是两次独立的写入（中间隔着一次完整的 Agentic
+> Loop 调用）。如果 Loop 在这中间抛异常（比如 LLM 调用超时/报错），JSONL 文件就会停在
+> 一条没人回答的 user 记录上。如果不处理，下次 `ask()` 会在它后面再拼一条新的 user
+> 消息，历史里出现连续两条 `role="user"`，直接违反 Anthropic API"必须 user/assistant
+> 交替"的硬性要求，那次请求会报错而不是"记忆稍微少了一点"。丢弃这条未完成的记录，
+> 是让历史"要么完整一轮、要么不存在"，代价是这条消息的内容确实会丢——但反正它也没被
+> 回答过，保留半条记录没有意义。
 
 ---
 
@@ -7384,11 +7401,79 @@ async def ask(question: str, session_id: str | None = None) -> AskResult:
     )
 ```
 
-`agent/__init__.py` 的导出不用变，`ask` 本来就在导出列表里：
+`ask_stream()`（流式接口）原来完全没有记忆能力，跟 `ask()` 相比是个明显的功能缺口——
+同样加一个可选的 `session_id`，逻辑跟 `ask()` 一致（加载历史 → 拼新问题 → 跑 Loop →
+存回历史），区别只是回复文字要靠回调边生成边收集，跑完才知道完整内容、才能写回
+`SessionStore`：
+
+```python
+# agent/agent.py
+
+async def clear_session(session_id: str):
+    """清除一个会话的历史（文件 + Redis 缓存），供 FastAPI /session/clear 调用。"""
+    await _store.clear(session_id)
+
+
+async def ask_stream(question: str, session_id: str | None = None) -> AsyncGenerator[str, None]:
+    """
+    流式调用，通过 on_text_delta 回调实时传出文本。
+
+    session_id 用法跟 ask() 一致：不传就是无记忆的一次性调用；
+    传入则加载/追加历史，效果与 ask() 相同，只是文本以流式方式返回。
+    """
+    queue: Queue[str | None] = Queue()
+
+    def on_delta(text: str):
+        queue.put_nowait(text)
+
+    async def run_loop():
+        provider = get_provider()
+
+        initial_messages = None
+        if session_id is not None:
+            history = await _store.load_messages(session_id, max_turns=10)
+            new_user_message = Message(role="user", content=[TextBlock(text=question)])
+            initial_messages = history + [new_user_message]
+            await _store.append_message(session_id, "user", question)
+
+        text_chunks: list[str] = []
+
+        def on_delta_and_collect(text: str):
+            text_chunks.append(text)
+            on_delta(text)
+
+        await run_agent_loop(
+            prompt=question,
+            provider=provider,
+            system=SYSTEM_PROMPT,
+            tools=_registry.get_all_definitions(),
+            executor=_executor,
+            max_turns=10,
+            on_text_delta=on_delta_and_collect,
+            initial_messages=initial_messages,
+        )
+
+        if session_id is not None:
+            await _store.append_message(session_id, "assistant", "".join(text_chunks))
+
+        queue.put_nowait(None)
+
+    loop_task = asyncio.create_task(run_loop())
+
+    while True:
+        chunk = await queue.get()
+        if chunk is None:
+            break
+        yield chunk
+
+    await loop_task
+```
+
+`agent/__init__.py` 补上新增的 `clear_session` 导出：
 
 ```python
 # agent/__init__.py
-from .agent import ask, ask_stream, AskResult
+from .agent import ask, ask_stream, clear_session, AskResult
 ```
 
 ---
@@ -7451,6 +7536,87 @@ curl -X POST http://localhost:8002/ask \
   -d '{"question": "帮我想想这个项目应该用什么数据库？", "session_id": "user_001"}'
 ```
 
+`/ask/stream`（SSE 流式接口）同样加上 `session_id`（URL 查询参数，可选）：
+
+```python
+# main.py
+
+@app.get("/ask/stream")
+async def ask_stream_endpoint(question: str, session_id: str | None = None):
+    async def event_generator():
+        try:
+            async for chunk in ask_stream(question, session_id=session_id):
+                data = json.dumps({"type": "text_delta", "text": chunk}, ensure_ascii=False)
+                yield f"data: {data}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            error_data = json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False)
+            yield f"data: {error_data}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers={...})
+```
+
+再补一个清除会话的接口——10.3 的 `SessionStore.clear()` 之前只是个方法，没有任何路由
+接到它，前端的"清空"按钮点了也只是清空页面上的气泡，服务端历史其实还在：
+
+```python
+# main.py
+
+class ClearSessionRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, description="要清除的会话 ID")
+
+
+@app.post("/session/clear")
+async def clear_session_endpoint(req: ClearSessionRequest) -> dict:
+    await clear_session(req.session_id)
+    return {"session_id": req.session_id, "cleared": True}
+```
+
+**前端怎么拿到 session_id？** 没有登录系统，`session_id` 就不能像飞书那样直接用平台
+自带的 `sender_id`/`chat_id`，得让浏览器自己造一个、并持久化下来——同一浏览器下次
+打开页面还是这个 ID，能接着聊；换个浏览器/清了缓存就是新会话。用 `localStorage` 存
+一个 `crypto.randomUUID()` 即可：
+
+```js
+// static/index.html
+
+function getSessionId() {
+    let id = localStorage.getItem('session_id');
+    if (!id) {
+        id = crypto.randomUUID();
+        localStorage.setItem('session_id', id);
+    }
+    return id;
+}
+const SESSION_ID = getSessionId();
+
+// POST /ask 时带上
+fetch(BASE + '/ask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question, session_id: SESSION_ID }),
+});
+
+// GET /ask/stream 时带上
+const url = BASE + '/ask/stream?question=' + encodeURIComponent(question) +
+    '&session_id=' + encodeURIComponent(SESSION_ID);
+
+// "清空"按钮：先清服务端历史，再清页面
+async function clearChat() {
+    document.getElementById('chat').innerHTML = '';
+    await fetch(BASE + '/session/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: SESSION_ID }),
+    });
+}
+```
+
+> `AskRequest.session_id` 上的默认值 `"web:default"` 只是兜底（比如直接用 curl 测试、
+> 没传这个字段的场景），走真正前端页面时请求体里一定会带上浏览器自己持久化的
+> `SESSION_ID`，不会落到这个默认值上，也就不会出现"所有访客共用一个会话、历史互相
+> 串"的问题。
+
 ---
 
 ## 10.6 本章检查清单
@@ -7464,9 +7630,19 @@ curl -X POST http://localhost:8002/ask \
 □ load_messages() 能正确重建 Message 对象列表
   验证：先对话 3 次，然后 python -c "import asyncio; from persistence.session_store import SessionStore; ..."
 
-□ 清除会话后再对话，Agent 不再记得之前的内容
+□ 调用 POST /session/clear 清除会话后再对话，Agent 不再记得之前的内容
+  （不是只清前端页面——之前 SessionStore.clear() 没有接任何路由，这一条测不了）
 
 □ 重启服务后，再次发同一 session_id 的请求，Agent 还记得之前的对话
+
+□ /ask/stream 传入 session_id 时也有记忆效果，跟 /ask 表现一致
+
+□ 前端刷新页面后 localStorage 里的 session_id 不变，Agent 还记得刷新前的对话；
+  换一个浏览器 / 清掉 localStorage 后是全新会话，不会看到别人的历史
+
+□ 人为让一次 ask() 调用在写完 user、还没写 assistant 时抛异常（比如临时改 provider
+  抛错），验证下一次同 session_id 的请求不会因为"连续两条 user 消息"报错
+  （load_messages() 应该已经丢弃了那条孤儿 user 记录）
 
 □ （可选，装了 Redis 才测）Redis List 缓存写入成功
   验证：redis-cli lrange session_msgs:default 0 -1，应该能看到完整的消息 JSON（不只是预览）
