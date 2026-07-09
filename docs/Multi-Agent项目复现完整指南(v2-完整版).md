@@ -28,7 +28,7 @@ Provider 层（3-4）：★ 新增，取代 claude-agent-sdk
 工程层（8-10）：
   阶段 8  → 上下文管理（Token 预算 + 压缩 + 缓存）
   阶段 9  → Skills 系统（SKILL.md 按需加载 + TF-IDF 工具搜索）
-  阶段 10 → 会话持久化（JSONL + Redis 索引 + 断点续传）
+  阶段 10 → 会话持久化（JSONL + Redis 缓存 + 断点续传）
 
 集成层（11-14）：
   阶段 11 → 可观测性（结构化日志 + Prometheus + 链路追踪）
@@ -7051,20 +7051,34 @@ def resolve_safe_path(workspace: Path, relative: str) -> Path:
 
 ## 10.1 持久化架构
 
+JSONL 文件是唯一的"事实来源"（source of truth），永远全量、永久保存。Redis 只缓存**最近一段窗口内的消息内容本身**（用 List 类型），是可丢弃、可重建的加速层——丢了大不了退回读文件，不影响正确性。
+
+写入路径：
+
 ```
 用户发送消息
     ↓
 Agent 处理（Agentic Loop）
     ↓
-把这次对话追加写入 JSONL 文件（顺序写，高效）
-    ↓ 同时
-更新 Redis 索引（session_id → 文件中的最新位置）
-    ↓
-下次用户发送消息时：
-    从 Redis 找到 session_id 对应的 JSONL 文件
-    读取历史消息，注入 Agentic Loop 的初始 messages
-    Agent 带着完整上下文继续对话
+把这次对话追加写入 JSONL 文件（顺序写，高效，永久保存）
+    ↓ 同时（尽力而为，失败不影响主流程）
+把这条 message 记录 RPUSH 进 Redis List（session_msgs:{session_id}）
+并 LTRIM 只保留最近 N 轮，设置过期时间
 ```
+
+读取路径（下次用户发消息，需要加载历史时）：
+
+```
+优先查 Redis List（session_msgs:{session_id}）
+    ├─ 命中（List 非空 且 请求轮数在缓存窗口内）
+    │     → 直接从 Redis 内存里取，无需碰磁盘，速度快
+    │
+    └─ 未命中（Redis 未启用 / key 已过期 / 请求轮数超出缓存窗口）
+          → 退回读取 JSONL 文件（慢但一定拿得到完整历史）
+          → 顺手把读到的最近 N 轮回填进 Redis List（下次命中）
+```
+
+> 注意：之前版本里 Redis 只存了 `session_id → 文件路径 + 最后一条预览`（Hash），这其实**加速不了任何东西**——因为文件路径本来就能由 `session_id` 直接算出来（见 10.3 的 `_session_path`），查 Redis 反而多了一次网络往返。真正想让 Redis 起到加速作用，缓存的必须是**消息内容本身**，这样加载历史时才能跳过磁盘 I/O 和 JSONL 逐行解析。
 
 ---
 
@@ -7095,9 +7109,14 @@ JSONL（JSON Lines）格式：每行是一个独立的 JSON 对象，追加写�
 会话持久化存储。
 
 设计原则：
-1. 主存储：JSONL 文件（追加写，不修改，简单可靠）
-2. 索引：Redis（快速查找 session_id → 最新状态）
-3. 降级：Redis 不可用时，直接读 JSONL 文件（慢但可用）
+1. 主存储：JSONL 文件（追加写，不修改，简单可靠，永久保存全部历史）
+2. 缓存：Redis List（缓存最近 CACHE_MAX_TURNS 轮消息内容本身，加速加载）
+3. 降级：Redis 不可用 / 未命中时，直接读 JSONL 文件（慢但一定可用），
+   并顺手把读到的内容回填进 Redis，让下一次命中缓存
+
+关键点：Redis 缓存的必须是**消息内容本身**，而不是文件路径或摘要——
+文件路径本来就能由 session_id 直接算出来（见 _session_path），
+缓存路径没有意义；只有缓存内容才能真正省掉磁盘 I/O 和 JSONL 解析开销。
 """
 import json
 import time
@@ -7105,6 +7124,12 @@ import asyncio
 from pathlib import Path
 import aiofiles
 from providers.types import Message, TextBlock
+
+# Redis List 里最多缓存多少轮对话（每轮 = user + assistant，即 2 条记录）
+# 请求的 max_turns 超过这个窗口时，缓存肯定不完整，直接退回读文件。
+CACHE_MAX_TURNS = 20
+CACHE_MAX_RECORDS = CACHE_MAX_TURNS * 2
+CACHE_TTL_SECONDS = 7 * 24 * 3600   # 7 天没有新消息，缓存自动过期
 
 
 class SessionStore:
@@ -7121,8 +7146,11 @@ class SessionStore:
         dir_path.mkdir(exist_ok=True)
         return dir_path / f"{session_id}.jsonl"
 
+    def _cache_key(self, session_id: str) -> str:
+        return f"session_msgs:{session_id}"
+
     async def append_message(self, session_id: str, role: str, content: str):
-        """追加一条对话消息到 JSONL 文件。"""
+        """追加一条对话消息到 JSONL 文件，并同步进 Redis 缓存。"""
         record = {
             "type": "message",
             "ts": int(time.time()),
@@ -7130,10 +7158,10 @@ class SessionStore:
             "role": role,
             "content": content,
         }
-        await self._append_record(session_id, record)
+        await self._append_record(session_id, record, cache=True)
 
     async def append_tool_call(self, session_id: str, tool_name: str, inputs: dict, output: str):
-        """追加工具调用记录（仅审计用）。"""
+        """追加工具调用记录（仅审计用，不缓存——恢复历史时用不上）。"""
         record = {
             "type": "tool_call",
             "ts": int(time.time()),
@@ -7142,33 +7170,35 @@ class SessionStore:
             "input": inputs,
             "output": output[:500],   # 截断，避免大数据
         }
-        await self._append_record(session_id, record)
+        await self._append_record(session_id, record, cache=False)
 
-    async def _append_record(self, session_id: str, record: dict):
-        """把一条记录追加到 JSONL 文件，同时更新 Redis 索引。"""
+    async def _append_record(self, session_id: str, record: dict, cache: bool):
+        """把一条记录追加到 JSONL 文件；如果是 message 记录，同时推进 Redis List 缓存。"""
         path = self._session_path(session_id)
         line = json.dumps(record, ensure_ascii=False)
 
-        # 追加写入 JSONL 文件
+        # 追加写入 JSONL 文件——这一步是唯一"必须成功"的部分
         async with aiofiles.open(path, "a", encoding="utf-8") as f:
             await f.write(line + "\n")
 
-        # 更新 Redis 索引（记录最后更新时间）
-        if self.redis:
+        # 同步更新 Redis List 缓存（尽力而为，失败不影响主流程）
+        if self.redis and cache:
             try:
-                redis_key = f"session:{session_id}"
-                await self.redis.hset(redis_key, mapping={
-                    "file": str(path),
-                    "updated_at": int(time.time()),
-                    "last_record": line[:200],   # 存最后一条记录的预览
-                })
-                await self.redis.expire(redis_key, 7 * 24 * 3600)   # 7 天过期
+                cache_key = self._cache_key(session_id)
+                await self.redis.rpush(cache_key, line)
+                # 只保留最近 CACHE_MAX_RECORDS 条，防止 List 无限增长
+                await self.redis.ltrim(cache_key, -CACHE_MAX_RECORDS, -1)
+                await self.redis.expire(cache_key, CACHE_TTL_SECONDS)
             except Exception as e:
-                print(f"[SessionStore] Redis 更新失败（降级到纯文件模式）：{e}")
+                print(f"[SessionStore] Redis 缓存更新失败（降级到纯文件模式）：{e}")
 
     async def load_messages(self, session_id: str, max_turns: int = 20) -> list[Message]:
         """
-        从 JSONL 文件加载对话历史，重建 messages 列表。
+        加载对话历史，重建 messages 列表。
+
+        优先从 Redis List 缓存读取（快，内存命中）；
+        缓存未启用 / 未命中 / 请求轮数超出缓存窗口时，退回读 JSONL 文件（慢但保真），
+        并把读到的最近 CACHE_MAX_TURNS 轮回填进 Redis，供下次命中。
 
         参数：
             max_turns - 最多加载几轮（防止历史太长超出 Token 限制）
@@ -7176,27 +7206,33 @@ class SessionStore:
         返回：
             Message 对象列表，可直接传给 Agentic Loop
         """
-        path = self._session_path(session_id)
-        if not path.exists():
-            return []
+        raw_messages = None
 
-        # 读取所有 message 类型的记录
-        raw_messages = []
-        try:
-            async with aiofiles.open(path, "r", encoding="utf-8") as f:
-                async for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                        if record.get("type") == "message":
-                            raw_messages.append(record)
-                    except json.JSONDecodeError:
-                        continue   # 跳过损坏的行
-        except Exception as e:
-            print(f"[SessionStore] 读取会话文件失败：{e}")
-            return []
+        # 1. 尝试命中 Redis 缓存：只有当请求的轮数不超过缓存窗口时，缓存才可能是完整的
+        if self.redis and max_turns <= CACHE_MAX_TURNS:
+            try:
+                cache_key = self._cache_key(session_id)
+                cached_lines = await self.redis.lrange(cache_key, 0, -1)
+                if cached_lines:
+                    raw_messages = [json.loads(line) for line in cached_lines]
+            except Exception as e:
+                print(f"[SessionStore] Redis 缓存读取失败（降级到读文件）：{e}")
+
+        # 2. 缓存未命中：读 JSONL 文件（唯一保真的数据源）
+        if raw_messages is None:
+            raw_messages = await self._load_from_file(session_id)
+            # 把最近 CACHE_MAX_RECORDS 条回填进 Redis，供下次命中
+            if self.redis and raw_messages:
+                try:
+                    cache_key = self._cache_key(session_id)
+                    recent_for_cache = raw_messages[-CACHE_MAX_RECORDS:]
+                    lines = [json.dumps(r, ensure_ascii=False) for r in recent_for_cache]
+                    await self.redis.delete(cache_key)
+                    if lines:
+                        await self.redis.rpush(cache_key, *lines)
+                        await self.redis.expire(cache_key, CACHE_TTL_SECONDS)
+                except Exception as e:
+                    print(f"[SessionStore] Redis 缓存回填失败（不影响本次返回结果）：{e}")
 
         # 只取最近 max_turns 轮（每轮 = user + assistant）
         max_records = max_turns * 2
@@ -7215,6 +7251,31 @@ class SessionStore:
 
         return messages
 
+    async def _load_from_file(self, session_id: str) -> list[dict]:
+        """从 JSONL 文件读取所有 message 类型的原始记录。"""
+        path = self._session_path(session_id)
+        if not path.exists():
+            return []
+
+        raw_messages = []
+        try:
+            async with aiofiles.open(path, "r", encoding="utf-8") as f:
+                async for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        if record.get("type") == "message":
+                            raw_messages.append(record)
+                    except json.JSONDecodeError:
+                        continue   # 跳过损坏的行
+        except Exception as e:
+            print(f"[SessionStore] 读取会话文件失败：{e}")
+            return []
+
+        return raw_messages
+
     async def clear(self, session_id: str):
         """清除会话历史（用户请求 /clear 时调用）。"""
         path = self._session_path(session_id)
@@ -7223,7 +7284,7 @@ class SessionStore:
 
         if self.redis:
             try:
-                await self.redis.delete(f"session:{session_id}")
+                await self.redis.delete(self._cache_key(session_id))
             except Exception:
                 pass
 
@@ -7335,7 +7396,16 @@ curl -X POST http://localhost:8002/ask \
 
 □ 重启服务后，再次发同一 session_id 的请求，Agent 还记得之前的对话
 
-□ （可选）Redis 索引写入成功（redis-cli hgetall session:default）
+□ （可选，装了 Redis 才测）Redis List 缓存写入成功
+  验证：redis-cli lrange session_msgs:default 0 -1，应该能看到完整的消息 JSON（不只是预览）
+
+□ （可选）验证缓存确实被读到、而不是每次都在读文件
+  验证：先对话几轮预热缓存，然后临时把 sessions/ 目录改名（模拟文件不可读），
+  再发一条 max_turns 在缓存窗口内的请求，Agent 应该仍然记得历史（说明走的是 Redis 缓存）
+
+□ （可选）验证缓存未命中时能正确回填
+  验证：redis-cli del session_msgs:default 清空缓存后再发一条请求，
+  Agent 依然记得历史（退回读文件），且之后 lrange session_msgs:default 0 -1 能看到缓存已重新写入
 ```
 
 ---
@@ -8826,7 +8896,7 @@ Commit 命名规范：
 | 历史压缩（摘要策略） | 超长对话自动压缩保留关键信息 |
 | Anthropic Prompt Cache | system prompt 缓存，5 分钟内复用降低 90% 费用 |
 | JSONL 会话持久化 | 对话历史落盘，支持断点续传 |
-| Redis 索引 | 会话快速检索，支持多用户并发隔离 |
+| Redis List 缓存 | 缓存最近 N 轮消息内容，加速会话加载；未命中时退回读文件 |
 | aioredis | 异步 Redis 客户端 |
 
 ### 可观测性层
