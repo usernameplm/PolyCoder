@@ -1,4 +1,4 @@
-# agent.py（完整替换）
+# agent/agent.py
 import asyncio
 from asyncio import Queue
 from dataclasses import dataclass
@@ -6,12 +6,15 @@ from typing import AsyncGenerator
 from agent.loop import run_agent_loop
 from agent.executor import ToolExecutor
 from providers.router import get_provider
+from providers.types import Message, TextBlock
 from tools.registry import ToolRegistry
 from tools.builtin.read_file import ReadFileTool
 from tools.builtin.run_python import RunPythonTool
 from tools.builtin.search_code import SearchCodeTool
 from tools.builtin.list_dir import ListDirTool
 from tools.builtin.write_file import WriteFileTool
+from persistence.session_store import SessionStore
+from swarm.redis_client import create_redis_client
 
 SYSTEM_PROMPT = """
 你是一个专业的 Coding Agent，帮助用户完成代码相关任务。
@@ -48,6 +51,9 @@ _registry.register(ListDirTool())
 _registry.register(WriteFileTool())
 _executor = ToolExecutor(_registry)
 
+# 会话存储（第 10 章）：JSONL 落盘 + Redis 缓存最近历史
+_store = SessionStore(base_dir="sessions/", redis_client=create_redis_client())
+
 
 async def ask(question: str) -> AskResult:
     provider = get_provider()
@@ -60,6 +66,44 @@ async def ask(question: str) -> AskResult:
         executor=_executor,
         max_turns=10,
     )
+
+    return AskResult(
+        text=result.text,
+        input_tokens=result.total_usage.input_tokens,
+        output_tokens=result.total_usage.output_tokens,
+        turn_count=result.turn_count,
+    )
+
+
+async def ask_with_memory(question: str, session_id: str = "default") -> AskResult:
+    """
+    带多轮记忆的 Agent 调用（第 10 章）。
+
+    流程：
+    1. 从 SessionStore 加载历史对话（最近 10 轮）
+    2. 把新问题接到历史末尾，构成完整消息列表
+    3. 把完整消息列表传给 Agentic Loop（不再单独传 prompt 让它从零构造）
+    4. 把这轮的问答追加写回 SessionStore
+    """
+    provider = get_provider()
+
+    history = await _store.load_messages(session_id, max_turns=10)
+    new_user_message = Message(role="user", content=[TextBlock(text=question)])
+    all_messages = history + [new_user_message]
+
+    await _store.append_message(session_id, "user", question)
+
+    result = await run_agent_loop(
+        prompt=question,
+        provider=provider,
+        system=SYSTEM_PROMPT,
+        tools=_registry.get_all_definitions(),
+        executor=_executor,
+        max_turns=10,
+        initial_messages=all_messages,
+    )
+
+    await _store.append_message(session_id, "assistant", result.text)
 
     return AskResult(
         text=result.text,

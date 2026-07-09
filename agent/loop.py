@@ -47,6 +47,7 @@ async def run_agent_loop(
     max_turns: int = 10,
     max_tokens: int = 4096,
     on_text_delta: Callable[[str], None] | None = None,
+    initial_messages: list[Message] | None = None,
 ) -> LoopResult:
     """
     Agentic Loop 主函数。
@@ -60,13 +61,17 @@ async def run_agent_loop(
         max_turns      最多循环几轮（防止无限循环，消耗过多 Token）
         max_tokens     每轮最大输出 Token
         on_text_delta  流式文本回调（传入则启用流式模式）
+        initial_messages  已有的历史消息（含本轮新问题），传入则跳过用 prompt
+                          单独构造首条消息——用于带会话记忆的多轮对话场景
 
     返回：
         LoopResult 包含最终文字、用量统计、轮次数、终止原因
     """
-    # 初始化状态：消息历史只有用户的第一条消息
-    initial_messages = [Message(role="user", content=[TextBlock(text=prompt)])]
-    state = LoopState(messages=tuple(initial_messages))
+    # 初始化状态：优先用调用方传入的完整历史；没有则退回单条用户消息
+    starting_messages = initial_messages if initial_messages is not None else [
+        Message(role="user", content=[TextBlock(text=prompt)])
+    ]
+    state = LoopState(messages=tuple(starting_messages))
 
     # ── 主循环 ─────────────────────────────────────────────────────────────────
     while True:

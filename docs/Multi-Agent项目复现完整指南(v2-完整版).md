@@ -2594,14 +2594,14 @@ async def run_agent_loop(
 
 ---
 
-## 4.6 新建 `agent/api.py`（对外接口）
+## 4.6 新建 `agent/agent.py`（对外接口）
 
 > **注意**：第 1-3 章的 `agent.py` 到这里可以删除。
 > 第 4 章起改用 `agent/` 包，`agent.py` 会被 `agent/` 目录遮蔽。
-> `agent/__init__.py` 只做导出，实现放在 `agent/api.py`。
+> `agent/__init__.py` 只做导出，实现放在 `agent/agent.py`。
 
 ```python
-# agent/api.py
+# agent/agent.py
 # 对外暴露的简洁接口：ask() 和 ask_stream()
 # cli.py、main.py、测试代码都从这里导入，不直接接触 loop.py
 
@@ -7295,60 +7295,95 @@ class SessionStore:
 
 ## 10.4 在 Agent 中使用会话持久化
 
+> 本章的 `SessionStore` 要接到项目实际的 `agent/agent.py` 里（第 4 章之后 `agent.py` 已经拆成了
+> `agent/` 包，对外接口实现在 `agent/agent.py`，`agent/__init__.py` 只做导出），
+> 而不是新建一个独立的 `agent.py`。这里复用 `ask()` 已有的 `_registry`（工具注册）、
+> `_executor`（工具执行器）、`SYSTEM_PROMPT`，只是多了"加载历史 / 存历史"两步。
+
+先给 `run_agent_loop` 补上 `initial_messages` 参数（对应第 4 章遗留的 TODO：调用方需要能传入
+包含历史的完整消息列表，而不是永远从 `prompt` 现造一条消息）：
+
 ```python
-# agent.py — 带会话记忆的 ask() 函数
+# agent/loop.py（run_agent_loop 签名变化）
 
+async def run_agent_loop(
+    prompt: str,
+    provider: BaseProvider,
+    system: str = "",
+    tools: list[ToolDefinition] | None = None,
+    executor: ToolExecutor | None = None,
+    max_turns: int = 10,
+    max_tokens: int = 4096,
+    on_text_delta: Callable[[str], None] | None = None,
+    initial_messages: list[Message] | None = None,   # 新增
+) -> LoopResult:
+    # 优先用调用方传入的完整历史（含本轮新问题）；没传则退回单条用户消息
+    starting_messages = initial_messages if initial_messages is not None else [
+        Message(role="user", content=[TextBlock(text=prompt)])
+    ]
+    state = LoopState(messages=tuple(starting_messages))
+    ...
+```
+
+然后在 `agent/agent.py` 里加 `ask_with_memory`：
+
+```python
+# agent/agent.py（在已有 ask() / ask_stream() 之后追加）
+
+from providers.types import Message, TextBlock
 from persistence.session_store import SessionStore
+from swarm.redis_client import create_redis_client
 
-# 全局 store（实际中应该在应用启动时初始化 redis_client）
-_store = SessionStore(base_dir="sessions/")
+# 会话存储：JSONL 落盘 + Redis 缓存最近历史。
+# redis_client 复用 swarm/redis_client.py 里的同一套连接配置（Blackboard 也是这么接的），
+# 不要各自硬编码 host/port。
+_store = SessionStore(base_dir="sessions/", redis_client=create_redis_client())
 
 
-async def ask_with_memory(question: str, session_id: str = "default") -> str:
+async def ask_with_memory(question: str, session_id: str = "default") -> AskResult:
     """
     带多轮记忆的 Agent 调用。
 
     流程：
-    1. 从存储加载历史对话
-    2. 把新问题加到历史末尾
-    3. 用完整历史运行 Agentic Loop
-    4. 把新的问答追加存储
+    1. 从 SessionStore 加载历史对话（最近 10 轮）
+    2. 把新问题接到历史末尾，构成完整消息列表
+    3. 把完整消息列表传给 Agentic Loop（用 initial_messages，不再只传 prompt）
+    4. 把这轮的问答追加写回 SessionStore
     """
     provider = get_provider()
 
-    # 加载历史（最近 10 轮）
     history = await _store.load_messages(session_id, max_turns=10)
-
-    # 构建完整消息列表：历史 + 新问题
     new_user_message = Message(role="user", content=[TextBlock(text=question)])
     all_messages = history + [new_user_message]
 
-    # 保存用户消息
     await _store.append_message(session_id, "user", question)
 
-    # 运行 Agentic Loop（传入历史消息）
-    from agent.loop import run_agent_loop, LoopResult
-
-    # 注意：run_agent_loop 的 prompt 参数是新增的用户输入，
-    # 但 messages 里已经有历史了，要改造一下 loop 接受初始 messages
     result = await run_agent_loop(
         prompt=question,
         provider=provider,
         system=SYSTEM_PROMPT,
-        # TODO: 把 initial_messages 改为 history + user_message（第 4 章的 loop 需要微调）
+        tools=_registry.get_all_definitions(),
+        executor=_executor,
         max_turns=10,
+        initial_messages=all_messages,
     )
 
-    # 保存 Agent 回答
     await _store.append_message(session_id, "assistant", result.text)
 
-    return result.text
+    return AskResult(
+        text=result.text,
+        input_tokens=result.total_usage.input_tokens,
+        output_tokens=result.total_usage.output_tokens,
+        turn_count=result.turn_count,
+    )
 ```
 
-> 💡 **改造 run_agent_loop 以支持历史消息**：
-> 第 4 章实现的 loop 里，初始 messages 只有一条用户消息。要支持会话历史，
-> 需要给 run_agent_loop 加一个 `initial_messages` 参数，
-> 让调用方传入包含历史的完整消息列表。
+记得把 `ask_with_memory` 加进 `agent/__init__.py` 的导出：
+
+```python
+# agent/__init__.py
+from .agent import ask, ask_stream, ask_with_memory, AskResult
+```
 
 ---
 
@@ -11216,12 +11251,12 @@ A：登录账户后进入「账户设置」→「升级套餐」，支持支付�
 
 ---
 
-## 15.11 更新 `agent/api.py` 接入工具
+## 15.11 更新 `agent/agent.py` 接入工具
 
-用以下内容替换 `agent/api.py`，让 `ask()` 带上知识库工具：
+用以下内容替换 `agent/agent.py`，让 `ask()` 带上知识库工具：
 
 ```python
-# agent/api.py（完整替换）
+# agent/agent.py（完整替换）
 
 import asyncio
 from asyncio import Queue
@@ -11442,7 +11477,7 @@ tests/
 
 修改文件：
 agent/loop.py    ← 在 LLM 调用和工具执行处埋点，收集 metrics
-agent/api.py     ← AskResult 新增 metrics 字段
+agent/agent.py     ← AskResult 新增 metrics 字段
 pyproject.toml   ← pytest 异步配置
 ```
 
@@ -11852,12 +11887,12 @@ async def run_agent_loop(
 
 ---
 
-## 16.6 更新 `agent/api.py` 暴露指标
+## 16.6 更新 `agent/agent.py` 暴露指标
 
-在上一章修改后的 `agent/api.py` 基础上，给 `AskResult` 加入 metrics 字段：
+在上一章修改后的 `agent/agent.py` 基础上，给 `AskResult` 加入 metrics 字段：
 
 ```python
-# agent/api.py — 修改 AskResult dataclass
+# agent/agent.py — 修改 AskResult dataclass
 
 from core.metrics import SessionMetrics   # ← 新增导入
 
@@ -12361,8 +12396,8 @@ async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
     monkeypatch 临时把知识库目录换成测试目录，
     不影响真实的 knowledge_base/ 文件夹。
     """
-    # 临时替换 agent/api.py 里的工具注册逻辑，使用测试知识库
-    import agent.api as api_module
+    # 临时替换 agent/agent.py 里的工具注册逻辑，使用测试知识库
+    import agent.agent as agent_module
     import tools.registry as reg_module
     from tools.registry import ToolRegistry
     from tools.knowledge_base import KnowledgeBaseTool
@@ -12374,7 +12409,7 @@ async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
         executor = ToolExecutor(registry)
         return executor, registry.all_definitions()
 
-    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build_executor_and_tools)
+    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build_executor_and_tools)
 
     result = await ask("我们公司的退货政策是什么？退货有什么条件？")
 
@@ -12387,7 +12422,7 @@ async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
 
 async def test_product_spec_question_triggers_kb_tool(test_kb_dir, monkeypatch):
     """问产品规格时，Agent 应该调用 search_knowledge_base 工具。"""
-    import agent.api as api_module
+    import agent.agent as agent_module
     from tools.registry import ToolRegistry
     from tools.knowledge_base import KnowledgeBaseTool
     from agent.executor import ToolExecutor
@@ -12398,7 +12433,7 @@ async def test_product_spec_question_triggers_kb_tool(test_kb_dir, monkeypatch):
         executor = ToolExecutor(registry)
         return executor, registry.all_definitions()
 
-    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build_executor_and_tools)
+    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build_executor_and_tools)
 
     result = await ask("ProCoder X1 的内存是多少？")
 
@@ -12510,7 +12545,7 @@ async def test_kb_query_triggers_tool_call(test_kb_dir, monkeypatch):
     这是最重要的集成测试：验证 RAG 完整链路：
     提问 → Agent 决定查知识库 → 检索到相关文档 → 基于文档回答
     """
-    import agent.api as api_module
+    import agent.agent as agent_module
     from tools.registry import ToolRegistry
     from tools.knowledge_base import KnowledgeBaseTool
     from agent.executor import ToolExecutor
@@ -12520,7 +12555,7 @@ async def test_kb_query_triggers_tool_call(test_kb_dir, monkeypatch):
         registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
         return ToolExecutor(registry), registry.all_definitions()
 
-    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build)
+    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
 
     result = await ask("请介绍一下退货政策，退货有什么条件？")
 
@@ -12537,7 +12572,7 @@ async def test_kb_answer_contains_relevant_info(test_kb_dir, monkeypatch):
     """
     基于知识库的回答应该包含文档里的具体信息，而不是泛泛而谈。
     """
-    import agent.api as api_module
+    import agent.agent as agent_module
     from tools.registry import ToolRegistry
     from tools.knowledge_base import KnowledgeBaseTool
     from agent.executor import ToolExecutor
@@ -12547,7 +12582,7 @@ async def test_kb_answer_contains_relevant_info(test_kb_dir, monkeypatch):
         registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
         return ToolExecutor(registry), registry.all_definitions()
 
-    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build)
+    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
 
     result = await ask("ProCoder X1 的 CPU 规格是什么？")
 
@@ -12566,7 +12601,7 @@ async def test_multi_turn_when_tool_used(test_kb_dir, monkeypatch):
     当 Agent 使用工具时，turn_count 应该 >= 2
     （第 1 轮：决定调工具；第 2 轮：基于工具结果回答）。
     """
-    import agent.api as api_module
+    import agent.agent as agent_module
     from tools.registry import ToolRegistry
     from tools.knowledge_base import KnowledgeBaseTool
     from agent.executor import ToolExecutor
@@ -12576,7 +12611,7 @@ async def test_multi_turn_when_tool_used(test_kb_dir, monkeypatch):
         registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
         return ToolExecutor(registry), registry.all_definitions()
 
-    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build)
+    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
 
     result = await ask("保修期多久？")
 
@@ -12704,7 +12739,7 @@ if result.metrics:
 □ 准备了 tests/fixtures/knowledge_base/ 里的两个测试文档
 □ 运行 pytest tests/test_rag.py -v，全部通过
 □ 修改了 agent/loop.py，加入 metrics 埋点
-□ 修改了 agent/api.py，AskResult 有 metrics 字段
+□ 修改了 agent/agent.py，AskResult 有 metrics 字段
 □ 运行 pytest tests/test_agent_e2e.py::test_ask_returns_ask_result -v，通过
 □ 运行全部集成测试 pytest tests/ -v，无错误（或仅有预期的 skip）
 □ 修改 cli.py 加入 metrics.print_report()，对话后能看到统计报告
