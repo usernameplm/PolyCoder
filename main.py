@@ -29,8 +29,7 @@ from swarm.redis_client import create_redis_client
 from swarm.code_extractor import extract_python_code
 from swarm.sandbox import resolve_safe_path, PathTraversalError
 
-from agent import ask_stream
-from coordinator.agent import CoordinatorAgent
+from agent import ask, ask_stream
 
 from typing import Any
 
@@ -45,11 +44,16 @@ class AskRequest(BaseModel):
         description="用户的问题",
         examples=["Python 是什么？"]
     )
+    session_id: str = Field(
+        default="web:default",
+        description="会话 ID，同一 session_id 的多次请求会共享对话历史（第 10 章）",
+    )
 
 
 class AskResponse(BaseModel):
     """POST /ask 的响应体格式"""
     text: str = Field(default="", description="Agent 的回答")
+    session_id: str = Field(default="", description="本次请求使用的会话 ID，回传给前端便于下一轮携带")
     usage: dict = Field(default_factory=dict, description="Token 用量")
     error: str | None = Field(default=None, description="错误信息")
 
@@ -172,30 +176,34 @@ async def health_check():
     return {"status": "ok", "timestamp": int(time.time())}
 
 
-# 全局 Coordinator 实例（启动时初始化一次）
-_coordinator = CoordinatorAgent()
-
-
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(req: AskRequest) -> AskResponse:
     """
-    完整响应接口：通过 Coordinator 规划任务 → 分发执行 → 聚合结果。
+    完整响应接口：调用 Agent 回答问题，支持按 session_id 记忆多轮对话（第 10 章）。
 
-    请求体：{"question": "你的问题"}
-    响应体：{"text": "回答", "usage": {...}, "error": null}
+    请求体：{"question": "你的问题", "session_id": "可选，同一会话传相同值"}
+    响应体：{"text": "回答", "session_id": "...", "usage": {...}, "error": null}
     """
     start = time.time()
-    print(f"[/ask] 收到请求: {req.question[:60]}")
+    print(f"[/ask] 收到请求: {req.question[:60]}（session_id={req.session_id}）")
 
     try:
-        result = await _coordinator.run(req.question)
+        result = await ask(req.question, session_id=req.session_id)
         elapsed_ms = round((time.time() - start) * 1000)
         print(f"[/ask] 完成，耗时 {elapsed_ms}ms")
-        return AskResponse(text=result)
+        return AskResponse(
+            text=result.text,
+            session_id=req.session_id,
+            usage={
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+                "turn_count": result.turn_count,
+            },
+        )
     except Exception as e:
         elapsed_ms = round((time.time() - start) * 1000)
         print(f"[/ask] 出错，耗时 {elapsed_ms}ms：{e}")
-        return AskResponse(error=str(e))
+        return AskResponse(session_id=req.session_id, error=str(e))
 
 
 @app.get("/ask/stream")

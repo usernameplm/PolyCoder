@@ -141,6 +141,17 @@
         const BASE = window.location.origin;
         let markedReady = false;
 
+        // 会话 ID：同一浏览器多次打开页面复用同一个，Agent 才能记住上下文（第 10 章）
+        function getSessionId() {
+            let id = localStorage.getItem('session_id');
+            if (!id) {
+                id = crypto.randomUUID();
+                localStorage.setItem('session_id', id);
+            }
+            return id;
+        }
+        const SESSION_ID = getSessionId();
+
         // 等待 marked 加载完成
         if (typeof marked !== 'undefined') {
             marked.setOptions({ breaks: true, gfm: true });
@@ -261,7 +272,7 @@
                     const resp = await fetch(BASE + '/ask', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ question }),
+                        body: JSON.stringify({ question, session_id: SESSION_ID }),
                     });
                     if (!resp.ok) {
                         assistantDiv.innerHTML = '错误：HTTP ' + resp.status;

@@ -7395,17 +7395,48 @@ from .agent import ask, ask_stream, AskResult
 
 ## 10.5 在 FastAPI 接口中传入 session_id
 
+`main.py` 里的 `/ask` 目前还是走第 4 章留下的 `CoordinatorAgent`（规划 → 分发 → 聚合），
+跟这一章的 `ask()`/`SessionStore` 是两条不相关的链路，加 `session_id` 也不会有记忆效果。
+这里把 `/ask` 切回直接调用 `ask()`，`_coordinator` 也一并删掉（没有其它地方在用）：
+
 ```python
-# main.py 的 /ask 接口增加 session_id 支持
+# main.py
+
+from agent import ask, ask_stream   # 不再需要 CoordinatorAgent
+
 
 class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1)
-    session_id: str = Field(default="web:default", description="会话 ID，用于多轮对话记忆")
+    """POST /ask 的请求体格式"""
+    question: str = Field(..., min_length=1, description="用户的问题")
+    session_id: str = Field(
+        default="web:default",
+        description="会话 ID，同一 session_id 的多次请求会共享对话历史",
+    )
 
-@app.post("/ask")
-async def ask_endpoint(req: AskRequest):
-    result = await ask(req.question, session_id=req.session_id)
-    return {"text": result.text, "session_id": req.session_id}
+
+class AskResponse(BaseModel):
+    """POST /ask 的响应体格式"""
+    text: str = Field(default="", description="Agent 的回答")
+    session_id: str = Field(default="", description="本次请求使用的会话 ID，回传给前端便于下一轮携带")
+    usage: dict = Field(default_factory=dict, description="Token 用量")
+    error: str | None = Field(default=None, description="错误信息")
+
+
+@app.post("/ask", response_model=AskResponse)
+async def ask_endpoint(req: AskRequest) -> AskResponse:
+    try:
+        result = await ask(req.question, session_id=req.session_id)
+        return AskResponse(
+            text=result.text,
+            session_id=req.session_id,
+            usage={
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+                "turn_count": result.turn_count,
+            },
+        )
+    except Exception as e:
+        return AskResponse(session_id=req.session_id, error=str(e))
 ```
 
 客户端调用时保持相同的 `session_id`，Agent 就会记住上下文：
