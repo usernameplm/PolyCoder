@@ -2681,6 +2681,14 @@ from .api import ask, ask_stream, AskResult
 
 这样 `from agent import ask` 依然正常工作，`__init__.py` 保持干净。
 
+> **后续更新**：`agent/agent.py` 这套"单 Agent 直接对话"接口在第 10 章引入
+> Coordinator 架构后被逐步架空——`ask_stream()`/`clear_session()` 先搬到
+> `coordinator/agent.py`（10.4b），最终 `ask()` 本身也统一改成调用
+> `CoordinatorAgent.run()`（10.5），`agent/agent.py` 整个文件被删除。
+> `agent/loop.py`、`agent/executor.py` 这些底层组件保留，继续被
+> `sub_agents/base.py` 复用；只是不再有 `agent/agent.py` 这层"对外接口"，
+> CLI 和 Web 接口统一走 `coordinator/agent.py`。
+
 ---
 
 ## 4.7 Agentic Loop 的工作流程图
@@ -7637,11 +7645,17 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
         return AskResponse(session_id=req.session_id, error=str(e))
 ```
 
-`agent/agent.py` 的 `ask()`/`ask_stream()` 并没有被删掉——它们仍然是"不经过 Coordinator
-规划、单 Agent 直接对话"的能力，继续给 `cli.py` 和下面的 `/ask/stream`（流式接口，
-Coordinator 目前不支持逐 token 流式输出）用。两套实现各自独立演化，`/ask` 用
-Coordinator、`/ask/stream` 用单 Agent 直接对话，是两条有意保留的不同路径，不是
-遗留的不一致。
+> **更新**：`agent/agent.py` 后来被彻底删除了。最初的想法是留着它给 `cli.py` 和
+> `/ask/stream` 用，`/ask` 单独走 Coordinator——但这样一来"要不要走 Coordinator
+> 规划"就取决于用户走了哪个入口，而不是任务本身的复杂度：同样一句"帮我审查这段代码
+> 顺便把测试也写一下"，走 `/ask` 会被拆成 `code_reviewer` + `test_writer` 两个子任务，
+> 走 `/ask/stream` 或 `cli.py` 却只有单 Agent 硬扛，行为不一致，用户体验也不统一。
+>
+> 所以后来把 `cli.py`、`/ask/stream`、`/session/clear` 全部改成调用
+> `coordinator/agent.py` 里的 `CoordinatorAgent`（`run()`/`ask_stream()`），
+> `agent/agent.py` 整个文件删掉，只留 `agent/loop.py`、`agent/executor.py`
+> 这些底层组件继续被 `sub_agents/base.py` 复用。现在无论从哪个入口进来，
+> 都是同一套"规划 → 分发 → 聚合"逻辑，行为完全一致。
 
 客户端调用时保持相同的 `session_id`，Agent 就会记住上下文：
 
@@ -7659,12 +7673,15 @@ curl -X POST http://localhost:8002/ask \
 
 ```python
 # main.py
+from coordinator.agent import CoordinatorAgent, clear_session
+
+_coordinator = CoordinatorAgent()
 
 @app.get("/ask/stream")
 async def ask_stream_endpoint(question: str, session_id: str | None = None):
     async def event_generator():
         try:
-            async for chunk in ask_stream(question, session_id=session_id):
+            async for chunk in _coordinator.ask_stream(question, session_id=session_id):
                 data = json.dumps({"type": "text_delta", "text": chunk}, ensure_ascii=False)
                 yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
@@ -7674,6 +7691,9 @@ async def ask_stream_endpoint(question: str, session_id: str | None = None):
 
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers={...})
 ```
+
+`CoordinatorAgent.ask_stream()` 的实现和推送粒度见 10.4b：不需要子 Agent 时整块推送
+回复，需要多个子 Agent 时哪个先跑完就先推送哪个，不是逐 token。
 
 再补一个清除会话的接口——10.3 的 `SessionStore.clear()` 之前只是个方法，没有任何路由
 接到它，前端的"清空"按钮点了也只是清空页面上的气泡，服务端历史其实还在：
@@ -8204,13 +8224,14 @@ class FeishuClient:
 import json
 import time
 from .client import FeishuClient
-from agent import ask   # 传 session_id 就是带记忆的调用
+from coordinator.agent import CoordinatorAgent, clear_session   # 传 session_id 就是带记忆的调用
 
 
 class MessageHandler:
 
     def __init__(self, client: FeishuClient):
         self.client = client
+        self._coordinator = CoordinatorAgent()
         self._processed_events: set[str] = set()   # 消息去重
 
     async def handle_event(self, event_data: dict):
@@ -8278,9 +8299,7 @@ class MessageHandler:
             return
 
         if text.strip() in ("/clear", "清除历史"):
-            from persistence.session_store import SessionStore
-            store = SessionStore()
-            await store.clear(session_key)
+            await clear_session(session_key)
             await self.client.send_text(receive_id, "对话历史已清除。", id_type=receive_id_type)
             return
 
@@ -8294,7 +8313,7 @@ class MessageHandler:
 
         # 调用 Agent
         try:
-            result = await ask(text, session_id=session_key)
+            result = await self._coordinator.run(text, session_id=session_key)
             await self.client.send_text(receive_id, result.text, id_type=receive_id_type)
         except Exception as e:
             await self.client.send_text(receive_id, f"处理时遇到错误，请稍后重试。", id_type=receive_id_type)
@@ -11583,101 +11602,76 @@ A：登录账户后进入「账户设置」→「升级套餐」，支持支付�
 
 ---
 
-## 15.11 更新 `agent/agent.py` 接入工具
+## 15.11 让知识库工具接入 Coordinator 架构
 
-用以下内容替换 `agent/agent.py`，让 `ask()` 带上知识库工具：
+> `agent/agent.py` 在第 10 章已经被删除了，所以知识库工具不是"整体替换一个单
+> Agent 的工具列表"，而是要接到 Coordinator 的"规划 → 分发 →聚合"结构里——
+> 知识库检索本质上是一类子任务，交给一个新的子 Agent 去做最自然，跟
+> `code_reviewer`、`test_writer` 是同一种模式（`sub_agents/base.py`）。
+
+新建 `sub_agents/knowledge_agent.py`，复用 `SubAgent` 基类，只需要声明
+`system_prompt` 和 `tools`：
 
 ```python
-# agent/agent.py（完整替换）
-
-import asyncio
-from asyncio import Queue
-from dataclasses import dataclass, field
-from typing import AsyncGenerator
-
-from .loop import run_agent_loop, LoopResult
-from providers.router import get_provider
+# sub_agents/knowledge_agent.py
+from .base import SubAgent
+from tools.knowledge_base import KnowledgeBaseTool
 
 
-SYSTEM_PROMPT = (
-    "你是一个智能助手，有知识库搜索能力。"
-    "当用户询问公司政策、产品信息、技术文档等内部知识时，"
-    "请先调用 search_knowledge_base 工具查询，再基于查询结果回答。"
-    "用中文回答，回答要简洁准确。"
-)
+class KnowledgeAgent(SubAgent):
 
+    def __init__(self, kb_dir: str = "knowledge_base"):
+        # kb_dir 可注入，方便测试时换成 tests/fixtures 下的测试知识库（16.10/16.11）
+        self._kb_dir = kb_dir
 
-@dataclass
-class AskResult:
-    text: str
-    input_tokens: int
-    output_tokens: int
-    turn_count: int = 1
+    @property
+    def name(self) -> str:
+        return "knowledge_agent"
 
-
-def _build_executor_and_tools():
-    """初始化工具注册表和执行器，返回 (executor, tool_definitions)。"""
-    from tools.registry import ToolRegistry
-    from agent.executor import ToolExecutor
-
-    registry = ToolRegistry.default()
-    executor = ToolExecutor(registry)
-    return executor, registry.all_definitions()
-
-
-async def ask(question: str) -> AskResult:
-    """非流式调用，使用 Agentic Loop + 知识库工具。"""
-    provider = get_provider()
-    executor, tools = _build_executor_and_tools()
-
-    result: LoopResult = await run_agent_loop(
-        prompt=question,
-        provider=provider,
-        system=SYSTEM_PROMPT,
-        tools=tools,
-        executor=executor,
-        max_turns=10,
-    )
-
-    return AskResult(
-        text=result.text,
-        input_tokens=result.total_usage.input_tokens,
-        output_tokens=result.total_usage.output_tokens,
-        turn_count=result.turn_count,
-    )
-
-
-async def ask_stream(question: str) -> AsyncGenerator[str, None]:
-    """流式调用。"""
-    queue: Queue[str | None] = Queue()
-
-    def on_delta(text: str):
-        queue.put_nowait(text)
-
-    async def run_loop():
-        provider = get_provider()
-        executor, tools = _build_executor_and_tools()
-        await run_agent_loop(
-            prompt=question,
-            provider=provider,
-            system=SYSTEM_PROMPT,
-            tools=tools,
-            executor=executor,
-            max_turns=10,
-            on_text_delta=on_delta,
+    @property
+    def system_prompt(self) -> str:
+        return (
+            "你是知识库检索专家，专注回答公司政策、产品信息、技术文档等内部知识类问题。"
+            "先调用 search_knowledge_base 工具查询，再基于查询结果用中文简洁准确地回答，"
+            "不要凭空编造知识库里没有的内容。"
         )
-        queue.put_nowait(None)
 
-    loop_task = asyncio.create_task(run_loop())
-
-    while True:
-        chunk = await queue.get()
-        if chunk is None:
-            break
-        yield chunk
-
-    await loop_task
+    @property
+    def tools(self):
+        return [KnowledgeBaseTool(kb_dir=self._kb_dir)]
 ```
+
+在 `coordinator/dispatcher.py` 的 `_get_sub_agents()` 里注册它：
+
+```python
+# coordinator/dispatcher.py
+
+def _get_sub_agents() -> dict:
+    from sub_agents.code_writer import CodeWriterAgent
+    from sub_agents.code_reviewer import CodeReviewerAgent
+    from sub_agents.debugger import DebuggerAgent
+    from sub_agents.test_writer import TestWriterAgent
+    from sub_agents.knowledge_agent import KnowledgeAgent
+    return {
+        "code_writer":     CodeWriterAgent(),
+        "code_reviewer":   CodeReviewerAgent(),
+        "debugger":        DebuggerAgent(),
+        "test_writer":     TestWriterAgent(),
+        "knowledge_agent": KnowledgeAgent(),
+    }
+```
+
+再让 `coordinator/planner.py` 的规划提示词知道有这么一个子 Agent 可用——在
+`_COORDINATOR_SYSTEM` 里补一条：
+
+```
+- knowledge_agent：回答公司政策、产品规格、内部文档类问题（会调用知识库检索工具）
+```
+
+这样"我们公司的退货政策是什么？"这类问题，规划阶段会生成一个
+`{"agent": "knowledge_agent", "input": "..."}` 的任务，交给 `dispatch()` 执行，
+跟审查代码、写测试走的是完全相同的分发和聚合逻辑——不需要再单独维护一套
+"给单 Agent 挂工具"的旁路实现。
 
 ---
 
@@ -12219,14 +12213,30 @@ async def run_agent_loop(
 
 ---
 
-## 16.6 更新 `agent/agent.py` 暴露指标
+## 16.6 更新 `coordinator/agent.py` 暴露指标
 
-在上一章修改后的 `agent/agent.py` 基础上，给 `AskResult` 加入 metrics 字段：
+`agent/agent.py` 已经删除了，`AskResult` 现在定义在 `coordinator/agent.py`。
+跟单 Agent 版本不同的是，Coordinator 一次 `run()` 背后是多次 LLM 调用（规划一次 +
+每个子 Agent 各一次），每次调用如果都用 16.5 埋点后的 `run_agent_loop`，会各自产出
+一个 `SessionMetrics`——所以这里要做的不是简单地把某一次 `result.metrics` 传下去，
+而是把它们合并成一份汇总指标：
 
 ```python
-# agent/agent.py — 修改 AskResult dataclass
+# core/metrics.py（新增一个合并函数）
 
-from core.metrics import SessionMetrics   # ← 新增导入
+def merge_metrics(session_id: str, question: str, parts: list[SessionMetrics]) -> SessionMetrics:
+    """把多个子调用（规划 + 各子 Agent）各自的 SessionMetrics 合并成一份汇总。"""
+    merged = SessionMetrics(session_id=session_id, question=question)
+    for part in parts:
+        merged.turns.extend(part.turns)
+        merged.tool_records.extend(part.tool_records)
+    return merged
+```
+
+```python
+# coordinator/agent.py — AskResult 加 metrics 字段，run() 里合并各子调用的指标
+
+from core.metrics import SessionMetrics, merge_metrics   # ← 新增导入
 
 @dataclass
 class AskResult:
@@ -12237,28 +12247,28 @@ class AskResult:
     metrics: SessionMetrics | None = None  # ← 新增字段
 
 
-# ask() 函数里，创建 AskResult 时传入 metrics：
-async def ask(question: str) -> AskResult:
-    provider = get_provider()
-    executor, tools = _build_executor_and_tools()
+class CoordinatorAgent:
+    async def run(self, user_request: str, session_id: str | None = None) -> AskResult:
+        ...
+        # make_plan() 内部的规划调用、dispatch() 里每个子 Agent 的调用，
+        # 都各自产出一个 SessionMetrics（16.5 埋点后 run_agent_loop 的返回值），
+        # 这里统一收集起来再合并
+        metrics_parts: list[SessionMetrics] = [plan_result.metrics]
+        if tasks:
+            metrics_parts.extend(sub_result.metrics for sub_result in dispatch_results)
 
-    result: LoopResult = await run_agent_loop(
-        prompt=question,
-        provider=provider,
-        system=SYSTEM_PROMPT,
-        tools=tools,
-        executor=executor,
-        max_turns=10,
-    )
-
-    return AskResult(
-        text=result.text,
-        input_tokens=result.total_usage.input_tokens,
-        output_tokens=result.total_usage.output_tokens,
-        turn_count=result.turn_count,
-        metrics=result.metrics,    # ← 新增这一行
-    )
+        total = _sum_usage(usages)
+        return AskResult(
+            text=text,
+            input_tokens=total.input_tokens,
+            output_tokens=total.output_tokens,
+            metrics=merge_metrics(session_id or "anonymous", user_request, metrics_parts),
+        )
 ```
+
+> 这里省略了 `make_plan`/`dispatch` 具体怎么把 `SessionMetrics` 一路传出来的
+> 管道代码——思路跟本章前面给 usage 加汇总（`_sum_usage`）完全一样：`make_plan`
+> 额外返回一份 metrics，`dispatch`/`_run_one` 也一样，最后在 `run()` 里统一合并。
 
 ---
 
@@ -12718,34 +12728,30 @@ async def test_execute_empty_query_does_not_crash(loaded_kb):
 """
 
 import pytest
-from agent import ask
+from coordinator.agent import CoordinatorAgent
+
+
+def _patch_knowledge_agent(monkeypatch, test_kb_dir):
+    """
+    把 dispatcher 里注册的 knowledge_agent 换成指向测试知识库目录的实例，
+    不影响真实的 knowledge_base/ 文件夹。15.11 里 KnowledgeAgent 支持传 kb_dir，
+    就是为了这里能这样注入测试夹具。
+    """
+    import coordinator.dispatcher as dispatcher_module
+    from sub_agents.knowledge_agent import KnowledgeAgent
+
+    agents = dispatcher_module._get_sub_agents()
+    agents["knowledge_agent"] = KnowledgeAgent(kb_dir=test_kb_dir)
+    monkeypatch.setattr(dispatcher_module, "_agents", agents)
 
 
 async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
-    """
-    问退货政策时，Agent 应该调用 search_knowledge_base 工具。
+    """问退货政策时，规划器应该把任务分给 knowledge_agent，并触发 search_knowledge_base 工具。"""
+    _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
-    monkeypatch 临时把知识库目录换成测试目录，
-    不影响真实的 knowledge_base/ 文件夹。
-    """
-    # 临时替换 agent/agent.py 里的工具注册逻辑，使用测试知识库
-    import agent.agent as agent_module
-    import tools.registry as reg_module
-    from tools.registry import ToolRegistry
-    from tools.knowledge_base import KnowledgeBaseTool
-    from agent.executor import ToolExecutor
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("我们公司的退货政策是什么？退货有什么条件？")
 
-    def mock_build_executor_and_tools():
-        registry = ToolRegistry()
-        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
-        executor = ToolExecutor(registry)
-        return executor, registry.all_definitions()
-
-    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build_executor_and_tools)
-
-    result = await ask("我们公司的退货政策是什么？退货有什么条件？")
-
-    # 断言 Agent 调用了知识库工具
     assert result.metrics is not None, "metrics 不应该为 None"
     assert "search_knowledge_base" in result.metrics.tool_names_called, (
         f"退货问题应该触发知识库工具，实际工具调用：{result.metrics.tool_names_called}"
@@ -12753,21 +12759,11 @@ async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
 
 
 async def test_product_spec_question_triggers_kb_tool(test_kb_dir, monkeypatch):
-    """问产品规格时，Agent 应该调用 search_knowledge_base 工具。"""
-    import agent.agent as agent_module
-    from tools.registry import ToolRegistry
-    from tools.knowledge_base import KnowledgeBaseTool
-    from agent.executor import ToolExecutor
+    """问产品规格时，同样应该路由到 knowledge_agent 并触发工具调用。"""
+    _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
-    def mock_build_executor_and_tools():
-        registry = ToolRegistry()
-        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
-        executor = ToolExecutor(registry)
-        return executor, registry.all_definitions()
-
-    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build_executor_and_tools)
-
-    result = await ask("ProCoder X1 的内存是多少？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("ProCoder X1 的内存是多少？")
 
     assert result.metrics is not None
     assert "search_knowledge_base" in result.metrics.tool_names_called, (
@@ -12777,17 +12773,16 @@ async def test_product_spec_question_triggers_kb_tool(test_kb_dir, monkeypatch):
 
 async def test_simple_question_does_not_need_tool():
     """
-    普通问题（不需要查知识库的）不应该触发工具调用。
-
-    Agent 的 system prompt 说明只有内部知识才查知识库，
-    像"1+1等于几"这种常识问题应该直接回答。
+    普通问题（不需要查知识库的）应该走 direct_reply，不经过任何子 Agent，
+    自然也就没有工具调用——规划器判断这类问题不需要拆解成任务。
     """
-    result = await ask("1 加 1 等于几？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("1 加 1 等于几？")
 
     assert result.metrics is not None
-    assert result.turn_count == 1, "数学问题不应该需要工具，应该一轮就完成"
-    # 可能调用了工具（如果 Agent 不确定），但更常见的是不调用
-    # 这里只验证回答里包含"2"
+    assert not result.metrics.tool_names_called, (
+        f"数学问题不应该触发任何工具调用，实际：{result.metrics.tool_names_called}"
+    )
     assert "2" in result.text, f"1+1 应该等于 2，实际回答：{result.text}"
 ```
 
@@ -12807,28 +12802,41 @@ Agent 端到端集成测试。
 """
 
 import pytest
-from agent import ask, AskResult
+from coordinator.agent import CoordinatorAgent, AskResult
 from core.metrics import SessionMetrics
+
+
+def _patch_knowledge_agent(monkeypatch, test_kb_dir):
+    """同 16.10：把 knowledge_agent 换成指向测试知识库目录的实例。"""
+    import coordinator.dispatcher as dispatcher_module
+    from sub_agents.knowledge_agent import KnowledgeAgent
+
+    agents = dispatcher_module._get_sub_agents()
+    agents["knowledge_agent"] = KnowledgeAgent(kb_dir=test_kb_dir)
+    monkeypatch.setattr(dispatcher_module, "_agents", agents)
 
 
 # ── 基础对话测试 ──────────────────────────────────────────────────────────────
 
 
 async def test_ask_returns_ask_result():
-    """ask() 应该返回 AskResult 类型，不崩溃。"""
-    result = await ask("用一句话解释什么是 Python")
+    """CoordinatorAgent.run() 应该返回 AskResult 类型，不崩溃。"""
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("用一句话解释什么是 Python")
     assert isinstance(result, AskResult)
 
 
 async def test_ask_returns_non_empty_text():
     """回答不应该为空。"""
-    result = await ask("用一句话解释什么是 Python")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("用一句话解释什么是 Python")
     assert len(result.text) > 10, f"回答太短：{result.text}"
 
 
 async def test_ask_returns_chinese_response():
     """Agent 应该用中文回答（system prompt 里要求了）。"""
-    result = await ask("What is Python?")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("What is Python?")
     has_chinese = any("一" <= ch <= "鿿" for ch in result.text)
     assert has_chinese, f"应该包含中文，实际回答：{result.text[:100]}"
 
@@ -12837,33 +12845,38 @@ async def test_ask_returns_chinese_response():
 
 
 async def test_metrics_populated_after_ask():
-    """ask() 完成后，metrics 应该被填充。"""
-    result = await ask("用一句话解释什么是机器学习")
+    """run() 完成后，metrics 应该被填充（规划调用 + 直接回复各自的 SessionMetrics 已被 merge_metrics 合并）。"""
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("用一句话解释什么是机器学习")
     assert result.metrics is not None, "metrics 不应该为 None"
     assert isinstance(result.metrics, SessionMetrics)
 
 
 async def test_metrics_has_at_least_one_turn():
-    """至少应该有一轮 LLM 调用记录。"""
-    result = await ask("2 + 2 等于多少？")
+    """至少应该有一轮 LLM 调用记录（规划本身也是一轮）。"""
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("2 + 2 等于多少？")
     assert len(result.metrics.turns) >= 1
 
 
 async def test_metrics_input_tokens_positive():
     """输入 token 数应该大于 0。"""
-    result = await ask("你好")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("你好")
     assert result.metrics.total_input_tokens > 0
 
 
 async def test_metrics_output_tokens_positive():
     """输出 token 数应该大于 0。"""
-    result = await ask("你好")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("你好")
     assert result.metrics.total_output_tokens > 0
 
 
 async def test_metrics_latency_positive():
     """LLM 调用延迟应该大于 0（毫秒）。"""
-    result = await ask("你好")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("你好")
     assert result.metrics.avg_llm_latency_ms > 0
 
 
@@ -12872,24 +12885,16 @@ async def test_metrics_latency_positive():
 
 async def test_kb_query_triggers_tool_call(test_kb_dir, monkeypatch):
     """
-    知识库相关问题应该触发工具调用，且回答基于知识库内容。
+    知识库相关问题应该被规划器路由给 knowledge_agent，触发工具调用，
+    且回答基于知识库内容。
 
     这是最重要的集成测试：验证 RAG 完整链路：
-    提问 → Agent 决定查知识库 → 检索到相关文档 → 基于文档回答
+    提问 → 规划器识别为知识库问题 → 分发给 knowledge_agent → 检索到相关文档 → 基于文档回答
     """
-    import agent.agent as agent_module
-    from tools.registry import ToolRegistry
-    from tools.knowledge_base import KnowledgeBaseTool
-    from agent.executor import ToolExecutor
+    _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
-    def mock_build():
-        registry = ToolRegistry()
-        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
-        return ToolExecutor(registry), registry.all_definitions()
-
-    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
-
-    result = await ask("请介绍一下退货政策，退货有什么条件？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("请介绍一下退货政策，退货有什么条件？")
 
     assert result.metrics is not None
     # 验证工具被调用了
@@ -12904,19 +12909,10 @@ async def test_kb_answer_contains_relevant_info(test_kb_dir, monkeypatch):
     """
     基于知识库的回答应该包含文档里的具体信息，而不是泛泛而谈。
     """
-    import agent.agent as agent_module
-    from tools.registry import ToolRegistry
-    from tools.knowledge_base import KnowledgeBaseTool
-    from agent.executor import ToolExecutor
+    _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
-    def mock_build():
-        registry = ToolRegistry()
-        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
-        return ToolExecutor(registry), registry.all_definitions()
-
-    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
-
-    result = await ask("ProCoder X1 的 CPU 规格是什么？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("ProCoder X1 的 CPU 规格是什么？")
 
     assert result.metrics is not None
     # test_products.md 里写了"8 核"
@@ -12930,32 +12926,28 @@ async def test_kb_answer_contains_relevant_info(test_kb_dir, monkeypatch):
 
 async def test_multi_turn_when_tool_used(test_kb_dir, monkeypatch):
     """
-    当 Agent 使用工具时，turn_count 应该 >= 2
-    （第 1 轮：决定调工具；第 2 轮：基于工具结果回答）。
+    当子 Agent 使用工具时，聚合后的 metrics.turns 长度应该 >= 2
+    （规划这一轮 + knowledge_agent 内部至少一轮工具调用轮次）。
+
+    注意：CoordinatorAgent.AskResult.turn_count 不再是"单个 Agent 循环的轮次数"
+    （Coordinator 本身涉及多次 LLM 调用），这里改成检查合并后的 metrics.turns，
+    语义更准确。
     """
-    import agent.agent as agent_module
-    from tools.registry import ToolRegistry
-    from tools.knowledge_base import KnowledgeBaseTool
-    from agent.executor import ToolExecutor
+    _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
-    def mock_build():
-        registry = ToolRegistry()
-        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
-        return ToolExecutor(registry), registry.all_definitions()
-
-    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
-
-    result = await ask("保修期多久？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("保修期多久？")
 
     if result.metrics.total_tool_calls > 0:
-        assert result.turn_count >= 2, (
-            f"调用了工具但 turn_count={result.turn_count}，应该 >= 2"
+        assert len(result.metrics.turns) >= 2, (
+            f"调用了工具但只有 {len(result.metrics.turns)} 轮记录，应该 >= 2"
         )
 
 
 async def test_cost_estimate_is_reasonable():
     """估算费用应该在合理范围内（不为 0，不超过 1 美元）。"""
-    result = await ask("你好，请问你是什么？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("你好，请问你是什么？")
     cost = result.metrics.estimated_cost_usd
     assert cost > 0, "费用估算不应该为 0"
     assert cost < 1.0, f"单次问答费用超过 1 美元，异常：${cost:.5f}"
@@ -13071,7 +13063,7 @@ if result.metrics:
 □ 准备了 tests/fixtures/knowledge_base/ 里的两个测试文档
 □ 运行 pytest tests/test_rag.py -v，全部通过
 □ 修改了 agent/loop.py，加入 metrics 埋点
-□ 修改了 agent/agent.py，AskResult 有 metrics 字段
+□ 修改了 coordinator/agent.py，AskResult 有 metrics 字段
 □ 运行 pytest tests/test_agent_e2e.py::test_ask_returns_ask_result -v，通过
 □ 运行全部集成测试 pytest tests/ -v，无错误（或仅有预期的 skip）
 □ 修改 cli.py 加入 metrics.print_report()，对话后能看到统计报告
