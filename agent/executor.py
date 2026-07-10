@@ -17,7 +17,6 @@ class ToolExecutor:
     def __init__(self, registry):
         """
         registry：工具注册表，根据工具名找到工具实现。
-        第 5 章会实现 ToolRegistry，现在暂时传入 None 也能运行（没有工具的情况）。
         """
         self.registry = registry
 
