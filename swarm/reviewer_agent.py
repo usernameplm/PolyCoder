@@ -9,6 +9,7 @@ import asyncio
 from .blackboard import Blackboard
 from .agent_base import SwarmAgent
 from .task_types import TASK_TYPE_CODE_REVIEW, TASK_TYPE_DEBUG
+from observability.logging import logger
 
 
 class ReviewerSwarmAgent(SwarmAgent):
@@ -37,7 +38,7 @@ class ReviewerSwarmAgent(SwarmAgent):
         filename = payload.get("file", "unknown.py")
         focus = payload.get("focus", "全面审查")
 
-        print(f"[{self.agent_id}] 开始审查：{filename}")
+        logger.info("reviewer_agent_started_review", agent_id=self.agent_id, file=filename)
 
         # 调用 LLM 执行审查
         from providers.router import get_provider
@@ -45,13 +46,14 @@ class ReviewerSwarmAgent(SwarmAgent):
 
         provider = get_provider()
 
-        system = """
+        base_system = """
 你是一名资深代码审查工程师。
 审查维度：SQL 注入、命令注入、硬编码密码、逻辑错误、边界条件、性能问题。
 每个问题输出：[Critical/Warning/Suggestion] 行号 - 问题描述 - 建议修复。
 发现 Critical 级别问题时，最后一行输出 NEEDS_FIX:true，否则输出 NEEDS_FIX:false。
 """
         prompt = f"文件：{filename}\n重点关注：{focus}\n\n```python\n{code}\n```"
+        system = self._enhance_system(base_system, prompt[:300])
 
         response = await provider.chat(
             messages=[Message(role="user", content=[TextBlock(text=prompt)])],
@@ -75,6 +77,10 @@ class ReviewerSwarmAgent(SwarmAgent):
                     "origin_task": task.id,
                 }
             )
-            print(f"[{self.agent_id}] 发现 Critical 问题，已发布 debug 任务 {debug_task_id}")
+            logger.info(
+                "reviewer_agent_critical_found",
+                agent_id=self.agent_id,
+                debug_task_id=debug_task_id,
+            )
 
         return result

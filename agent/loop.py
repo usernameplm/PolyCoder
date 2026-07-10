@@ -20,6 +20,7 @@ from providers.types import (
 from .state import LoopState
 from .executor import ToolExecutor
 from .context import should_compress, compress_messages
+from observability.logging import logger
 
 
 # ── 终止原因常量 ───────────────────────────────────────────────────────────────
@@ -47,6 +48,8 @@ async def run_agent_loop(
     max_turns: int = 10,
     max_tokens: int = 4096,
     on_text_delta: Callable[[str], None] | None = None,
+    initial_messages: list[Message] | None = None,
+    session_id: str | None = None,
 ) -> LoopResult:
     """
     Agentic Loop 主函数。
@@ -60,13 +63,19 @@ async def run_agent_loop(
         max_turns      最多循环几轮（防止无限循环，消耗过多 Token）
         max_tokens     每轮最大输出 Token
         on_text_delta  流式文本回调（传入则启用流式模式）
+        initial_messages  已有的历史消息（含本轮新问题），传入则跳过用 prompt
+                          单独构造首条消息——用于带会话记忆的多轮对话场景
+        session_id    会话标识，传入后所有日志自动带上 session_id 字段
 
     返回：
         LoopResult 包含最终文字、用量统计、轮次数、终止原因
     """
-    # 初始化状态：消息历史只有用户的第一条消息
-    initial_messages = [Message(role="user", content=[TextBlock(text=prompt)])]
-    state = LoopState(messages=tuple(initial_messages))
+    log = logger.bind(session_id=session_id) if session_id else logger
+    # 初始化状态：优先用调用方传入的完整历史；没有则退回单条用户消息
+    starting_messages = initial_messages if initial_messages is not None else [
+        Message(role="user", content=[TextBlock(text=prompt)])
+    ]
+    state = LoopState(messages=tuple(starting_messages))
 
     # ── 主循环 ─────────────────────────────────────────────────────────────────
     while True:
@@ -84,6 +93,12 @@ async def run_agent_loop(
 
         # [检查] 轮次限制
         if state.turn_count >= max_turns:
+            log.warning(
+                "agent_loop_max_turns",
+                turn=state.turn_count,
+                max_turns=max_turns,
+                reason=STOP_MAX_TURNS,
+            )
             return LoopResult(
                 text=f"（已达最大轮次限制 {max_turns}，任务可能未完成）",
                 total_usage=state.total_usage,
@@ -158,6 +173,13 @@ async def run_agent_loop(
         # [判断] 是否有工具调用
         if not tool_calls:
             # 没有工具调用 → LLM 给出了最终答案，Loop 结束
+            log.info(
+                "agent_loop_complete",
+                turn=state.turn_count,
+                total_input_tokens=state.total_usage.input_tokens,
+                total_output_tokens=state.total_usage.output_tokens,
+                stop_reason=STOP_COMPLETED,
+            )
             return LoopResult(
                 text="".join(text_chunks),
                 total_usage=state.total_usage,
@@ -167,7 +189,7 @@ async def run_agent_loop(
 
         # [执行] 并行执行所有工具
         if executor is None:
-            # 有工具调用但没有 executor，这是编程错误
+            log.error("agent_loop_no_executor", turn=state.turn_count)
             return LoopResult(
                 text="（错误：Agent 决定使用工具，但未配置 ToolExecutor）",
                 total_usage=state.total_usage,
@@ -175,7 +197,15 @@ async def run_agent_loop(
                 stop_reason=STOP_ABORTED,
             )
 
-        print(f"  [Loop] 第 {state.turn_count} 轮，执行 {len(tool_calls)} 个工具调用")
+        log.info(
+            "agent_loop_turn",
+            turn=state.turn_count,
+            provider=provider.model_name,
+            input_tokens=turn_usage.input_tokens,
+            output_tokens=turn_usage.output_tokens,
+            tool_calls=[tc.name for tc in tool_calls],
+            stop_reason="tool_use",
+        )
         tool_results = await executor.execute_all(tool_calls)
 
         # [构建] 下一轮的消息历史

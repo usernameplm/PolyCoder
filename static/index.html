@@ -141,6 +141,17 @@
         const BASE = window.location.origin;
         let markedReady = false;
 
+        // 会话 ID：同一浏览器多次打开页面复用同一个，Agent 才能记住上下文（第 10 章）
+        function getSessionId() {
+            let id = localStorage.getItem('session_id');
+            if (!id) {
+                id = crypto.randomUUID();
+                localStorage.setItem('session_id', id);
+            }
+            return id;
+        }
+        const SESSION_ID = getSessionId();
+
         // 等待 marked 加载完成
         if (typeof marked !== 'undefined') {
             marked.setOptions({ breaks: true, gfm: true });
@@ -217,7 +228,8 @@
 
             try {
                 if (stream) {
-                    const url = BASE + '/ask/stream?question=' + encodeURIComponent(question);
+                    const url = BASE + '/ask/stream?question=' + encodeURIComponent(question) +
+                        '&session_id=' + encodeURIComponent(SESSION_ID);
                     const resp = await fetch(url);
                     const reader = resp.body.getReader();
                     const decoder = new TextDecoder();
@@ -261,7 +273,7 @@
                     const resp = await fetch(BASE + '/ask', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ question }),
+                        body: JSON.stringify({ question, session_id: SESSION_ID }),
                     });
                     if (!resp.ok) {
                         assistantDiv.innerHTML = '错误：HTTP ' + resp.status;
@@ -280,8 +292,17 @@
             setButtons(false);
         }
 
-        function clearChat() {
+        async function clearChat() {
             document.getElementById('chat').innerHTML = '';
+            try {
+                await fetch(BASE + '/session/clear', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: SESSION_ID }),
+                });
+            } catch (e) {
+                console.warn('清除服务端会话失败：', e.message);
+            }
         }
 
         // ── Swarm 模式 ──────────────────────────────────────────────

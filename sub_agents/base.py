@@ -10,6 +10,8 @@ from agent.loop import run_agent_loop
 from agent.executor import ToolExecutor
 from providers.router import get_provider
 from tools.registry import ToolRegistry
+from skills.enhancer import enhance_system_prompt
+from observability.logging import logger
 
 
 class SubAgent(ABC):
@@ -38,22 +40,33 @@ class SubAgent(ABC):
         """子 Agent 可用的工具列表（默认无工具，子类按需覆盖）。"""
         return []
 
-    async def run(self, task: str, context: dict | None = None) -> str:
+    async def run(self, task: str, context: dict | None = None, session_id: str | None = None) -> str:
         """
         执行任务。
 
         参数：
             task    - 任务描述（自然语言）
             context - 前置任务的结果（由 dispatcher 注入）
+            session_id - 会话标识（用于日志追踪）
 
         返回：
             任务结果（字符串）
         """
+        log = logger.bind(agent=self.name, session_id=session_id) if session_id else logger.bind(agent=self.name)
+        log.info("sub_agent_start", task=task[:80])
+
         # 把上下文注入到任务描述里
         full_task = task
         if context:
             context_str = "\n".join(f"【{k}的结果】\n{v}" for k, v in context.items())
             full_task = f"{task}\n\n参考信息（来自前置任务）：\n{context_str}"
+
+        # 用任务描述搜索相关 Skill，动态增强 system prompt
+        system = enhance_system_prompt(
+            base_system=self.system_prompt,
+            context=full_task[:300],
+            agent_name=self.name,
+        )
 
         provider = get_provider()
 
@@ -67,10 +80,12 @@ class SubAgent(ABC):
         result = await run_agent_loop(
             prompt=full_task,
             provider=provider,
-            system=self.system_prompt,
+            system=system,
             tools=registry.get_all_definitions() if self.tools else None,
             executor=executor,
             max_turns=10,
+            session_id=session_id,
         )
 
+        log.info("sub_agent_done", result_chars=len(result.text))
         return result.text

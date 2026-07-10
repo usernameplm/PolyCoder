@@ -12,6 +12,7 @@ main.py — FastAPI Web 服务入口
 
 import json
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -25,12 +26,12 @@ from swarm.reviewer_agent import ReviewerSwarmAgent
 from swarm.debugger_agent import DebuggerSwarmAgent
 from swarm.test_writer_agent import TestWriterSwarmAgent
 from swarm.task_types import TaskType
-from swarm.redis_client import create_redis_client
+from persistence.redis_client import create_redis_client
 from swarm.code_extractor import extract_python_code
 from swarm.sandbox import resolve_safe_path, PathTraversalError
 
-from agent import ask_stream
-from coordinator.agent import CoordinatorAgent
+from agent import ask, ask_stream, clear_session
+from observability.logging import logger
 
 from typing import Any
 
@@ -45,13 +46,23 @@ class AskRequest(BaseModel):
         description="用户的问题",
         examples=["Python 是什么？"]
     )
+    session_id: str = Field(
+        default="web:default",
+        description="会话 ID，同一 session_id 的多次请求会共享对话历史（第 10 章）",
+    )
 
 
 class AskResponse(BaseModel):
     """POST /ask 的响应体格式"""
     text: str = Field(default="", description="Agent 的回答")
+    session_id: str = Field(default="", description="本次请求使用的会话 ID，回传给前端便于下一轮携带")
     usage: dict = Field(default_factory=dict, description="Token 用量")
     error: str | None = Field(default=None, description="错误信息")
+
+
+class ClearSessionRequest(BaseModel):
+    """POST /session/clear 的请求体格式"""
+    session_id: str = Field(..., min_length=1, description="要清除的会话 ID")
 
 
 class SwarmAskRequest(BaseModel):
@@ -103,7 +114,7 @@ async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 
         except Exception:
             fail_count += 1
             if fail_count == 1:
-                print("[periodic_save] Redis 不可用，降级为纯内存模式（后续不再重复打印）")
+                logger.warning("periodic_save_redis_unavailable")
             if fail_count >= 3:
                 await asyncio.sleep(60)  # Redis 持续不可用时放慢重试频率
 
@@ -112,9 +123,9 @@ async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 
 async def lifespan(app: FastAPI):
     global _swarm_save_task
 
-    print("服务启动中...")
-    print(f"API 文档地址：http://localhost:8002/docs")
-    print(f"流式测试：curl -N 'http://localhost:8002/ask/stream?question=你好'")
+    logger.info("server_starting")
+    logger.info("api_docs_url", url="http://localhost:8002/docs")
+    logger.info("stream_test_hint", hint="curl -N 'http://localhost:8002/ask/stream?question=你好'")
 
     # 1. 启动时先尝试从 Redis 恢复上次未完成的任务
     await _blackboard.load_from_redis(_redis_client)
@@ -140,7 +151,7 @@ async def lifespan(app: FastAPI):
     _swarm_save_task.cancel()
     await _blackboard.save_to_redis(_redis_client)
     await _redis_client.close()
-    print("服务已关闭。")
+    logger.info("server_shutdown")
 
 
 # ── 创建 FastAPI 实例 ─────────────────────────────────────────────
@@ -172,38 +183,43 @@ async def health_check():
     return {"status": "ok", "timestamp": int(time.time())}
 
 
-# 全局 Coordinator 实例（启动时初始化一次）
-_coordinator = CoordinatorAgent()
-
-
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(req: AskRequest) -> AskResponse:
     """
-    完整响应接口：通过 Coordinator 规划任务 → 分发执行 → 聚合结果。
+    完整响应接口：调用 Agent 回答问题，支持按 session_id 记忆多轮对话（第 10 章）。
 
-    请求体：{"question": "你的问题"}
-    响应体：{"text": "回答", "usage": {...}, "error": null}
+    请求体：{"question": "你的问题", "session_id": "可选，同一会话传相同值"}
+    响应体：{"text": "回答", "session_id": "...", "usage": {...}, "error": null}
     """
     start = time.time()
-    print(f"[/ask] 收到请求: {req.question[:60]}")
+    log = logger.bind(session_id=req.session_id)
+    log.info("ask_request_received", question=req.question[:60])
 
     try:
-        result = await _coordinator.run(req.question)
+        result = await ask(req.question, session_id=req.session_id)
         elapsed_ms = round((time.time() - start) * 1000)
-        print(f"[/ask] 完成，耗时 {elapsed_ms}ms")
-        return AskResponse(text=result)
+        log.info("ask_request_done", elapsed_ms=elapsed_ms)
+        return AskResponse(
+            text=result.text,
+            session_id=req.session_id,
+            usage={
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+                "turn_count": result.turn_count,
+            },
+        )
     except Exception as e:
         elapsed_ms = round((time.time() - start) * 1000)
-        print(f"[/ask] 出错，耗时 {elapsed_ms}ms：{e}")
-        return AskResponse(error=str(e))
+        log.error("ask_request_error", elapsed_ms=elapsed_ms, error=str(e))
+        return AskResponse(session_id=req.session_id, error=str(e))
 
 
 @app.get("/ask/stream")
-async def ask_stream_endpoint(question: str):
+async def ask_stream_endpoint(question: str, session_id: str | None = None):
     """
     SSE 流式响应接口：逐 token 实时推送，适合前端打字机效果。
 
-    URL 参数：?question=你的问题
+    URL 参数：?question=你的问题&session_id=可选，同一会话传相同值
     响应：text/event-stream 格式，逐块推送 JSON 数据
 
     测试方法：
@@ -216,7 +232,7 @@ async def ask_stream_endpoint(question: str):
         每次 yield 一条 SSE 格式的消息（'data: {...}\\n\\n'）。
         """
         try:
-            async for chunk in ask_stream(question):
+            async for chunk in ask_stream(question, session_id=session_id):
                 # 把文本片段包装成 SSE 格式
                 data = json.dumps(
                     {"type": "text_delta", "text": chunk},
@@ -240,6 +256,18 @@ async def ask_stream_endpoint(question: str):
             "X-Accel-Buffering": "no",            # 禁用 Nginx 缓冲（如果用了 Nginx 反代）
         },
     )
+
+
+@app.post("/session/clear")
+async def clear_session_endpoint(req: ClearSessionRequest) -> dict:
+    """
+    清除一个会话的历史（JSONL 文件 + Redis 缓存）。
+
+    请求体：{"session_id": "..."}
+    """
+    await clear_session(req.session_id)
+    return {"session_id": req.session_id, "cleared": True}
+
 
 @app.post("/swarm/ask", response_model=SwarmAskResponse)
 async def swarm_ask_endpoint(req: SwarmAskRequest) -> SwarmAskResponse:

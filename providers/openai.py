@@ -20,6 +20,7 @@ from .types import (
     StreamChunk, TextBlock, ToolUseBlock, ToolResultBlock,
     Usage, TextDelta, MessageStart, MessageStop,
 )
+from observability.logging import logger
 
 
 class OpenAIProvider(BaseProvider):
@@ -136,6 +137,11 @@ class OpenAIProvider(BaseProvider):
                     input=json.loads(tc.function.arguments),
                 ))
 
+        if resp.usage is None:
+            logger.warning("openai_chat_no_usage", model=self._model,
+                           has_choices=bool(resp.choices),
+                           resp_keys=list(resp.model_dump().keys()) if hasattr(resp, "model_dump") else "n/a")
+
         return ProviderResponse(
             content=content,
             stop_reason=self._parse_stop_reason(choice.finish_reason),
@@ -165,18 +171,22 @@ class OpenAIProvider(BaseProvider):
 
         yield MessageStart(usage=Usage())
 
+        final_usage = Usage()
+
         async for chunk in await self._client.chat.completions.create(**kwargs):
             if not chunk.choices:
                 if chunk.usage:
-                    yield MessageStop(
-                        stop_reason="end_turn",
-                        usage=Usage(
-                            input_tokens=chunk.usage.prompt_tokens,
-                            output_tokens=chunk.usage.completion_tokens,
-                        ),
+                    final_usage = Usage(
+                        input_tokens=chunk.usage.prompt_tokens,
+                        output_tokens=chunk.usage.completion_tokens,
                     )
                 continue
 
             choice = chunk.choices[0]
             if choice.delta.content:
                 yield TextDelta(text=choice.delta.content)
+
+        if final_usage.input_tokens == 0 and final_usage.output_tokens == 0:
+            logger.warning("openai_stream_no_usage", model=self._model)
+
+        yield MessageStop(stop_reason="end_turn", usage=final_usage)

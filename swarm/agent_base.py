@@ -9,6 +9,8 @@ Swarm Agent 基类。
 import asyncio
 from abc import ABC, abstractmethod
 from .blackboard import Blackboard, Task
+from skills.enhancer import enhance_system_prompt
+from observability.logging import logger
 
 
 class SwarmAgent(ABC):
@@ -37,10 +39,14 @@ class SwarmAgent(ABC):
         """
         ...
 
+    def _enhance_system(self, base_system: str, context: str) -> str:
+        """Skill 增强的便捷入口（调用公共模块）。"""
+        return enhance_system_prompt(base_system, context, agent_name=self.agent_id)
+
     async def start(self):
         """启动 Agent，持续监听白板上的任务。"""
         self._running = True
-        print(f"[{self.agent_id}] 已启动，监听任务类型：{self.task_types}")
+        logger.info("swarm_agent_started", agent_id=self.agent_id, task_types=self.task_types)
 
         while self._running:
             claimed_any = False
@@ -62,4 +68,4 @@ class SwarmAgent(ABC):
     def stop(self):
         """停止 Agent。"""
         self._running = False
-        print(f"[{self.agent_id}] 已停止")
+        logger.info("swarm_agent_stopped", agent_id=self.agent_id)

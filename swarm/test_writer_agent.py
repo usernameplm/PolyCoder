@@ -7,6 +7,7 @@ review → debug → test_write。
 from .blackboard import Blackboard
 from .agent_base import SwarmAgent
 from .task_types import TASK_TYPE_TEST_WRITE
+from observability.logging import logger
 
 
 class TestWriterSwarmAgent(SwarmAgent):
@@ -33,14 +34,14 @@ class TestWriterSwarmAgent(SwarmAgent):
         code = payload.get("code", "")
         filename = payload.get("file", "unknown.py")
 
-        print(f"[{self.agent_id}] 开始为 {filename} 生成测试")
+        logger.info("test_writer_agent_started", agent_id=self.agent_id, file=filename)
 
         from providers.router import get_provider
         from providers.types import Message, TextBlock
 
         provider = get_provider()
 
-        system = """
+        base_system = """
 你是一名测试工程师，专注于编写高质量的 pytest 单元测试。
 
 测试覆盖原则：
@@ -63,6 +64,7 @@ import pytest
             f"{code}\n\n"
             "请为这段代码编写 pytest 单元测试。"
         )
+        system = self._enhance_system(base_system, prompt[:300])
 
         response = await provider.chat(
             messages=[Message(role="user", content=[TextBlock(text=prompt)])],
@@ -74,5 +76,5 @@ import pytest
             if hasattr(block, "text"):
                 result += block.text
 
-        print(f"[{self.agent_id}] 测试生成完成")
+        logger.info("test_writer_agent_completed", agent_id=self.agent_id)
         return result

@@ -6,6 +6,7 @@ Swarm 模式下的调试修复 Agent。
 from .blackboard import Blackboard
 from .agent_base import SwarmAgent
 from .task_types import TASK_TYPE_DEBUG, TASK_TYPE_TEST_WRITE
+from observability.logging import logger
 
 
 class DebuggerSwarmAgent(SwarmAgent):
@@ -28,7 +29,7 @@ class DebuggerSwarmAgent(SwarmAgent):
 
         provider = get_provider()
 
-        system = """
+        base_system = """
 你是一名调试工程师，根据代码审查结果修复 Bug。
 输出格式：
 1. Bug 根因（一句话）
@@ -41,6 +42,7 @@ class DebuggerSwarmAgent(SwarmAgent):
             f"原始代码：\n```python\n{code}\n```\n\n"
             "请根据审查结果修复所有 Critical 级别的问题。"
         )
+        system = self._enhance_system(base_system, prompt[:300])
 
         response = await provider.chat(
             messages=[Message(role="user", content=[TextBlock(text=prompt)])],
@@ -62,5 +64,9 @@ class DebuggerSwarmAgent(SwarmAgent):
                 "origin_task": task.id,
             }
         )
-        print(f"[{self.agent_id}] 修复完成，已发布 test_write 任务 {test_write_task_id}")
+        logger.info(
+            "debugger_agent_fix_completed",
+            agent_id=self.agent_id,
+            test_write_task_id=test_write_task_id,
+        )
         return result

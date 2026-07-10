@@ -7,6 +7,7 @@ Agentic Loop 里的 ToolExecutor 通过注册表找到工具实现。
 """
 from .base import BaseTool
 from providers.types import ToolDefinition
+from observability.logging import logger
 
 
 class ToolRegistry:
@@ -17,7 +18,7 @@ class ToolRegistry:
     def register(self, tool: BaseTool) -> "ToolRegistry":
         """注册一个工具。返回 self，支持链式调用。"""
         self._tools[tool.name] = tool
-        print(f"[ToolRegistry] 已注册工具：{tool.name}")
+        logger.info("tool_registered", tool_name=tool.name)
         return self
 
     def get(self, name: str) -> BaseTool | None:

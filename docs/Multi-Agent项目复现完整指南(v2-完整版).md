@@ -28,7 +28,7 @@ Provider 层（3-4）：★ 新增，取代 claude-agent-sdk
 工程层（8-10）：
   阶段 8  → 上下文管理（Token 预算 + 压缩 + 缓存）
   阶段 9  → Skills 系统（SKILL.md 按需加载 + TF-IDF 工具搜索）
-  阶段 10 → 会话持久化（JSONL + Redis 索引 + 断点续传）
+  阶段 10 → 会话持久化（JSONL + Redis 缓存 + 断点续传）
 
 集成层（11-14）：
   阶段 11 → 可观测性（结构化日志 + Prometheus + 链路追踪）
@@ -98,6 +98,7 @@ lark-oapi>=1.6.0
 python-dotenv>=1.0.0
 httpx>=0.27.0
 tenacity>=9.0.0             # 重试（指数退避）
+jieba>=0.42.1               # 中文分词（Skill TF-IDF 搜索用，见 9.4 节）
 ```
 
 ### 0.3 .env 配置（多 Provider 支持）
@@ -2593,14 +2594,14 @@ async def run_agent_loop(
 
 ---
 
-## 4.6 新建 `agent/api.py`（对外接口）
+## 4.6 新建 `agent/agent.py`（对外接口）
 
 > **注意**：第 1-3 章的 `agent.py` 到这里可以删除。
 > 第 4 章起改用 `agent/` 包，`agent.py` 会被 `agent/` 目录遮蔽。
-> `agent/__init__.py` 只做导出，实现放在 `agent/api.py`。
+> `agent/__init__.py` 只做导出，实现放在 `agent/agent.py`。
 
 ```python
-# agent/api.py
+# agent/agent.py
 # 对外暴露的简洁接口：ask() 和 ask_stream()
 # cli.py、main.py、测试代码都从这里导入，不直接接触 loop.py
 
@@ -5228,7 +5229,7 @@ pip install "redis>=5.0.0"
 `redis_client`」——这一节把这句注释真正落成代码。新建一个小文件专门负责"连接"这一件事：
 
 ```python
-# swarm/redis_client.py
+# persistence/redis_client.py
 """
 创建 Redis 异步客户端。所有需要用 Redis 的模块（Blackboard、SessionStore）
 都从这里拿同一个客户端实例，不要各自建各自的连接。
@@ -5323,7 +5324,7 @@ async def load_from_redis(self, redis_client):
 
 ```python
 # main.py 顶部新增 import
-from swarm.redis_client import create_redis_client
+from persistence.redis_client import create_redis_client
 
 
 async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 5.0):
@@ -6317,9 +6318,15 @@ TF-IDF 是一种简单的文本相关性算法：
   - TF（词频）：词在查询中出现的频率
   - IDF（逆文档频率）：词在所有 Skill 中的"稀有程度"（越稀有越有区分度）
 
-不需要安装额外依赖，用纯 Python 实现。
+分词用 jieba：中文没有空格分隔单词，简单按正则切分会把一整段连续汉字
+当成一个词（比如"帮我写一个"整体算一个 token），导致中文 query 命中率很差。
+jieba 是成熟的中文分词库，能正确识别词边界，同时也兼容英文/数字分词。
 """
 import math
+import re
+
+import jieba
+
 from .loader import Skill, load_skills
 
 
@@ -6346,10 +6353,9 @@ class SkillSearcher:
         return {word: math.log(n / freq) for word, freq in doc_freq.items()}
 
     def _tokenize(self, text: str) -> list[str]:
-        """简单分词：按空格和标点切分，转小写。"""
-        import re
-        tokens = re.findall(r'[\w一-鿿]+', text.lower())
-        return tokens
+        """用 jieba 分词（中文按词切分，英文/数字按单词切分），转小写并过滤标点和空白。"""
+        raw_tokens = jieba.cut(text.lower())
+        return [t for t in raw_tokens if re.match(r'^[\w一-鿿]+$', t)]
 
     def search(self, query: str, top_k: int = 3) -> list[Skill]:
         """
@@ -6394,42 +6400,185 @@ class SkillSearcher:
 
 ---
 
-## 9.5 在 Agent 调用时动态加载 Skills
+## 9.5 在两套架构的子 Agent 中集成 Skill 加载
+
+本项目有两套并行的架构，各自都有子 Agent 需要集成 Skill：
+
+| 架构 | 入口 | 子 Agent 位置 | 基类 |
+|------|------|---------------|------|
+| Coordinator | `POST /ask` | `sub_agents/*.py` | `sub_agents/base.py → SubAgent` |
+| Swarm | `POST /swarm/ask` | `swarm/*_agent.py` | `swarm/agent_base.py → SwarmAgent` |
+
+两套子 Agent 有相同的痛点：固定的 system prompt 无法覆盖所有领域。例如：
+
+- Reviewer 审查的代码可能涉及数据库、异步、API 等不同领域
+- Debugger 修复的 Bug 可能需要参照不同的错误处理规范
+- TestWriter 针对不同模块需要遵循不同的测试策略
+
+### 方案：公共 Skill 增强函数
+
+创建一个公共模块，两套基类都调用它：
 
 ```python
-# 在 agent.py 或 sub_agents/base.py 的 run() 里
-
+# skills/enhancer.py
+"""
+Skill 增强模块：给 system prompt 动态拼接相关团队规范。
+两套架构的基类（SubAgent、SwarmAgent）都调用这个函数。
+"""
 from skills.searcher import SkillSearcher
 
+# 全局单例，避免重复加载和计算 IDF
 _searcher = SkillSearcher(skills_dir="skills/")
 
-async def ask_with_skills(question: str) -> str:
-    """按需加载 Skill 的 Agent 调用。"""
-    # 搜索相关 Skill
-    matched_skills = _searcher.search(question, top_k=2)
 
-    # 组合 system prompt
-    base_system = "你是一个智能助手，请用中文回答问题。"
-    if matched_skills:
-        skill_contents = "\n\n---\n\n".join(s.content for s in matched_skills)
-        system_prompt = f"{base_system}\n\n{skill_contents}"
-        print(f"[Skills] 加载了 {len(matched_skills)} 个 Skill：{[s.name for s in matched_skills]}")
-    else:
-        system_prompt = base_system
+def enhance_system_prompt(base_system: str, context: str, agent_name: str = "") -> str:
+    """
+    根据任务上下文搜索相关 Skill，拼接到 system prompt 后面。
 
-    provider = get_provider()
-    result = await run_agent_loop(
-        prompt=question,
-        provider=provider,
-        system=system_prompt,
-        max_turns=5,
+    参数：
+        base_system  原始 system prompt
+        context      搜索用的文本（任务描述、文件名、代码片段等拼接）
+        agent_name   调用者标识（打日志用）
+    """
+    matched = _searcher.search(context, top_k=2)
+    if not matched:
+        return base_system
+
+    skill_section = "\n\n---\n\n".join(
+        f"【团队规范 - {s.name}】\n{s.content}" for s in matched
     )
-    return result.text
+    print(f"[{agent_name or 'Skills'}] 加载 Skill：{[s.name for s in matched]}")
+    return f"{base_system}\n\n以下是团队规范，请在工作中遵守：\n\n{skill_section}"
 ```
 
 ---
 
-## 9.6 创建 Coding Agent 的 Skill 文件
+### Coordinator 架构集成：修改 `sub_agents/base.py`
+
+```python
+# sub_agents/base.py 的 run() 方法中
+
+from skills.enhancer import enhance_system_prompt
+
+class SubAgent(ABC):
+    # ...name、system_prompt、tools 属性不变...
+
+    async def run(self, task: str, context: dict | None = None) -> str:
+        full_task = task
+        if context:
+            context_str = "\n".join(f"【{k}的结果】\n{v}" for k, v in context.items())
+            full_task = f"{task}\n\n参考信息（来自前置任务）：\n{context_str}"
+
+        # ★ 新增：用任务描述搜索相关 Skill，动态增强 system prompt
+        system = enhance_system_prompt(
+            base_system=self.system_prompt,
+            context=full_task[:300],     # 取前 300 字符作为搜索依据
+            agent_name=self.name,
+        )
+
+        provider = get_provider()
+        # ...后续 run_agent_loop() 调用改为使用 system 而非 self.system_prompt...
+        result = await run_agent_loop(
+            prompt=full_task,
+            provider=provider,
+            system=system,              # ← 这里从 self.system_prompt 改为 system
+            tools=...,
+            executor=...,
+            max_turns=10,
+        )
+        return result.text
+```
+
+**效果**：当用户通过 `/ask` 问"帮我写一个 Redis 缓存的 API 接口"，Coordinator
+规划为 `code_writer` 任务，`code_writer` 在执行时会匹配到 `api-design.md` 和
+`env-config.md` Skill，自动遵循项目的路由命名规则和配置管理流程。
+
+---
+
+### Swarm 架构集成：修改 `swarm/agent_base.py`
+
+```python
+# swarm/agent_base.py（新增部分）
+
+from skills.enhancer import enhance_system_prompt
+
+class SwarmAgent(ABC):
+    # ...原有 __init__、task_types、handle 等不变...
+
+    def _enhance_system(self, base_system: str, context: str) -> str:
+        """Skill 增强的便捷入口（调用公共模块）。"""
+        return enhance_system_prompt(base_system, context, agent_name=self.agent_id)
+```
+
+### Swarm 子 Agent 调用示例（以 ReviewerAgent 为例）
+
+```python
+# swarm/reviewer_agent.py 的 handle() 方法中
+
+async def handle(self, task) -> str:
+    payload = task.payload
+    code = payload.get("code", "")
+    filename = payload.get("file", "unknown.py")
+    focus = payload.get("focus", "全面审查")
+
+    base_system = """
+你是一名资深代码审查工程师。
+审查维度：SQL 注入、命令注入、硬编码密码、逻辑错误、边界条件、性能问题。
+每个问题输出：[Critical/Warning/Suggestion] 行号 - 问题描述 - 建议修复。
+发现 Critical 级别问题时，最后一行输出 NEEDS_FIX:true，否则输出 NEEDS_FIX:false。
+"""
+    # ★ 新增：用文件名 + focus + 代码片段作为搜索上下文
+    search_context = f"{filename} {focus} {code[:200]}"
+    system = self._enhance_system(base_system, search_context)
+
+    # ...后续 provider.chat() 调用不变，只是 system 参数用增强后的版本...
+```
+
+---
+
+### 整体流程图
+
+```
+用户请求
+    │
+    ├─ POST /ask（Coordinator 架构）
+    │       ↓
+    │   planner.py → 规划子任务
+    │       ↓
+    │   dispatcher.py → 分发给 sub_agents
+    │       ↓
+    │   SubAgent.run()
+    │       ├── enhance_system_prompt(self.system_prompt, task[:300])
+    │       └── run_agent_loop(system=增强后的prompt)
+    │
+    └─ POST /swarm/ask（Swarm 架构）
+            ↓
+        Blackboard.post() → 发布任务
+            ↓
+        SwarmAgent.start() → 认领任务 → handle()
+            ├── self._enhance_system(base_system, context)
+            └── provider.chat(system=增强后的prompt)
+```
+
+**两套架构共用 `skills/` 目录下的同一组 Skill 文件**，只是加载时机不同：
+- Coordinator：在 `SubAgent.run()` 调用 `run_agent_loop()` 之前
+- Swarm：在 `handle()` 调用 `provider.chat()` 之前
+
+---
+
+## 9.6 团队规范 Skill 文件
+
+本节的 Skill 不是定义"Agent 是什么"（那是 system prompt 的事），而是定义
+**"团队怎么做事"**——编码规范、流程约定、架构决策。它们通过 9.5 的机制被子 Agent
+在工作时按需加载。
+
+每个 Skill 文件放在 `skills/` 目录下，被 `load_skills()` 扫描加载。当子 Agent
+处理任务时，`_enhance_system_prompt()` 根据任务内容搜索最相关的 Skill 并拼接。
+
+**适用场景举例**：
+- Reviewer 审查含 `asyncio` 的代码 → 加载 `async-patterns.md`，按规范检查是否有 Event 竞态
+- Debugger 修复 Redis 连接问题 → 加载 `error-handling.md`，按规范输出降级策略
+- TestWriter 为 API 端点写测试 → 加载 `api-design.md`，知道该测哪些状态码
 
 ```bash
 mkdir -p skills
@@ -6437,139 +6586,432 @@ mkdir -p skills
 
 ---
 
-**`skills/code-review.md`**（内容见 9.2 节）
+**`skills/error-handling.md`**：
 
----
-
-**`skills/debugging.md`**：
+> **触发场景**：Reviewer 审查到 try/except 代码时自动加载；Debugger 修复异常处理相关 Bug 时加载。
+> 本 Skill 内容直接对应项目中 `periodic_save()` 的降级设计和 `sandbox.py` 的自定义异常。
 
 ````markdown
 ---
-name: debugging
-description: 调试专家，擅长复现 Bug、定位根因并给出修复方案
+name: error-handling
+description: 本项目的异常处理规范——降级策略、日志格式、自定义异常
 triggers:
-  - debug
-  - 调试
-  - 报错
-  - bug
-  - 错误
   - 异常
-  - traceback
-  - 修复
+  - 错误处理
+  - try
+  - except
+  - raise
+  - 降级
+  - error
+  - 失败
 ---
 
-## 你的角色
+## 分层捕获原则
 
-你是一名专业调试工程师，使用二分法和最小可复现原则定位 Bug。
+本项目的分层结构决定了异常在哪里捕获：
 
-## 调试流程
+| 层 | 文件 | 策略 |
+|----|------|------|
+| HTTP 接口层 | `main.py` | 捕获 → 转为 HTTPException（404/409/422） |
+| Swarm 层 | `swarm/*.py` | 不捕获，让 `agent_base.py` 的 `start()` 统一 `fail()` |
+| 工具层 | `sandbox.py` | 抛出明确异常（`PathTraversalError`） |
+| 外部依赖 | Redis/LLM API | 捕获 → 降级 + 单次日志 |
 
-1. 用 read_file 读取出错的文件，理解代码逻辑
-2. 用 run_python 构造**最小可复现的测试用例**，确认能复现 Bug
-3. 用 search_code 追踪调用链，定位根因
-4. 构造修复方案，再次用 run_python 验证修复有效
-5. 确认修复没有引入新问题
+## 降级模式（已验证有效）
 
-## 输出格式
+参考 `main.py` 中 `periodic_save()` 的实现：
 
-**Bug 根因**：（一句话）
-**影响范围**：（哪些场景受影响）
-**修复方案**：
 ```python
-# 修复后的代码
+fail_count = 0
+while True:
+    try:
+        await blackboard.save_to_redis(redis)
+        fail_count = 0
+    except Exception as e:
+        fail_count += 1
+        if fail_count == 1:
+            print(f"[Save] Redis 保存失败：{e}")  # 只打一次
+        if fail_count >= 3:
+            await asyncio.sleep(60)  # 连续失败则降速
+            continue
+    await asyncio.sleep(5)
 ```
-**验证结果**：（附上 run_python 输出）
+
+核心：**不刷屏、不崩溃、自动降速**。
+
+## 日志格式
+
+```python
+# 正确：模块名 + 操作 + 原因 + 上下文 ID
+print(f"[Blackboard] 保存到 Redis 失败（降级为纯内存模式）：{e}")
+print(f"[{self.agent_id}] 任务 {task.id} 处理失败：{e}")
+
+# 错误：
+print("出错了")              # 没有上下文
+print(f"Error: {e}")         # 不知道是哪个模块
+```
+
+## 自定义异常
+
+- 继承 `ValueError`：用户输入不合法 → `PathTraversalError`
+- 继承 `RuntimeError`：运行时状态异常 → `TaskTypeUnknownError`
+- 类名必须以 `Error` 结尾
 ````
 
 ---
 
-**`skills/test-writing.md`**：
+**`skills/async-patterns.md`**：
+
+> **触发场景**：审查或修改含 `asyncio`/`async`/`await` 的代码时加载。
+> 本 Skill 内容直接对应项目中 Blackboard 的 Event 竞态修复、`periodic_save()` 的后台任务模式。
 
 ````markdown
 ---
-name: test-writing
-description: 测试工程师，生成高覆盖率的 pytest 单元测试
+name: async-patterns
+description: 本项目的 asyncio 规范——白板并发、后台任务、已踩过的坑
 triggers:
-  - 测试
-  - test
-  - 单元测试
-  - pytest
-  - 测试用例
-  - coverage
-  - 覆盖率
+  - 异步
+  - async
+  - await
+  - asyncio
+  - 并发
+  - 协程
+  - Lock
+  - Event
+  - Condition
 ---
 
-## 你的角色
+## 本项目的异步架构
 
-你是一名测试工程师，专注于编写高质量、高覆盖率的单元测试。
+```
+main.py (FastAPI + uvicorn 事件循环)
+  ├── lifespan()
+  │     ├── asyncio.create_task(periodic_save())   ← 后台常驻
+  │     └── asyncio.create_task(agent.start())     ← SwarmAgent 常驻循环
+  └── HTTP 处理函数（与 Agent 共用同一事件循环）
+```
 
-## 测试覆盖原则（必须包含）
-
-1. **Happy path**：功能正常工作的场景
-2. **边界条件**：空值、None、最大值、最小值、空列表
-3. **异常路径**：非法参数、外部依赖失败
-4. **安全场景**（如涉及用户输入）：注入尝试
-
-## 工作流程
-
-1. 用 read_file 读取源码，理解函数签名、入参和返回值
-2. 编写 pytest 风格测试，每个测试函数只测一个场景
-3. 用 run_python 执行测试，确认全部通过（如果失败要分析是测试写错了还是被测代码有 Bug）
-
-## 输出格式
+## 后台常驻任务模板
 
 ```python
-# test_xxx.py
-import pytest
-# 完整测试代码
+# 参考 main.py 的 periodic_save()
+async def background_loop():
+    while True:
+        try:
+            await do_work()
+        except Exception as e:
+            print(f"[Loop] 错误：{e}")
+        await asyncio.sleep(interval)
+
+# 启动
+_task = asyncio.create_task(background_loop())
+# 关闭
+_task.cancel()
+await asyncio.gather(_task, return_exceptions=True)
 ```
-测试覆盖说明：列出覆盖了哪些场景
-运行结果：附上 run_python 执行输出
+
+## 白板并发的关键约束
+
+1. **claim() 必须在 Lock 内完成读+写**：从"找到 pending 任务"到"标记为 claimed"
+   是原子操作，否则两个 Agent 会同时认领同一个任务。
+
+2. **通知新任务用 Condition，不用 Event**：
+   ```python
+   # ✗ 有竞态（本项目踩过的坑）
+   self._event.set()
+   self._event.clear()   # 如果 Agent 在 set 和 clear 之间还没醒来，通知丢失
+
+   # ✓ 正确做法
+   async with self._condition:
+       self._condition.notify_all()
+   ```
+
+3. **不要在 Lock 内做 I/O**：
+   ```python
+   # ✗ 持锁时间过长
+   async with self._lock:
+       data = await redis.get(...)    # 网络 I/O 阻塞其他协程获取锁
+
+   # ✓ 先读再锁
+   data = await redis.get(...)
+   async with self._lock:
+       self._tasks[tid] = Task(**data)
+   ```
+
+## asyncio.sleep vs time.sleep
+
+- `await asyncio.sleep(5)` → 让出控制权，其他协程可以运行
+- `time.sleep(5)` → 阻塞整个事件循环，所有 Agent 都卡住 5 秒
+
+本项目全部使用 `asyncio.sleep`，任何出现 `time.sleep` 的代码都是 Bug。
 ````
 
 ---
 
-**`skills/code-generation.md`**：
+**`skills/api-design.md`**：
+
+> **触发场景**：审查或生成 FastAPI 端点代码时加载。
+> 本 Skill 内容直接对应 `main.py` 中已实现的 `/swarm/tasks` 系列端点。
 
 ````markdown
 ---
-name: code-generation
-description: 代码生成专家，根据自然语言需求生成高质量、可运行的代码
+name: api-design
+description: 本项目 FastAPI 端点设计规范——路由、状态码、响应模型
 triggers:
-  - 帮我写
-  - 实现
-  - 生成代码
-  - 写一个
-  - 新增功能
-  - 开发
+  - 接口
+  - API
+  - REST
+  - 路由
+  - endpoint
+  - FastAPI
+  - HTTP
+  - 状态码
 ---
 
-## 你的角色
+## 已有端点参考（main.py）
 
-你是一名资深软件工程师，根据需求生成符合最佳实践的代码。
+| 方法 | 路由 | 用途 |
+|------|------|------|
+| POST | `/ask` | 通用对话入口 |
+| POST | `/swarm/ask` | 发布 Swarm 任务 |
+| GET | `/swarm/tasks/{task_id}` | 按 ID 查任务状态 |
+| GET | `/swarm/tasks` | 任务列表摘要 |
+| POST | `/swarm/tasks/{task_id}/apply` | 将已完成任务的代码写入文件 |
 
-## 工作流程
+## 路由命名规则
 
-1. 如果涉及已有项目，先用 read_file / list_dir 了解项目结构和代码风格
-2. 根据需求设计接口（函数签名、参数类型、返回值）
-3. 实现代码，遵循已有代码风格
-4. 用 run_python 验证代码能正常运行
-5. 如有错误，自动修复并重新验证
+- 资源名词复数：`/tasks`、`/sessions`
+- 层级嵌套表示从属：`/swarm/tasks/{id}/apply`
+- 操作用 HTTP 方法，不用动词路由（`/getTask` ✗）
 
-## 代码质量要求
+## 状态码使用（本项目已有的模式）
 
-- 所有函数必须有类型注解（Type Hints）
-- 公共函数必须有 docstring
-- 不引入不必要的第三方依赖
-- 输入参数必须做基本验证
-
-## 输出格式
-
-**设计思路**：（2-3 句说明）
 ```python
-# 完整实现代码
+# 404 - 资源不存在
+if not task:
+    raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+
+# 409 - 状态冲突
+if task.status != "done":
+    raise HTTPException(status_code=409, detail=f"任务状态为 {task.status}，只有 done 状态可以 apply")
 ```
-**使用示例**：（附上一个调用示例和预期输出）
+
+## 响应模型（Pydantic）
+
+每个端点必须有明确的 Response 模型：
+
+```python
+class SwarmAskResponse(BaseModel):
+    task_id: str
+    status: str
+    result: str | None = None
+    derived_task_ids: list[str] = []
+```
+
+禁止直接返回 `dict`——Pydantic 模型提供自动校验和 OpenAPI 文档。
+
+## 新增端点的清单
+
+1. 在 `main.py` 定义 Request/Response 模型
+2. 实现端点函数
+3. 在 `static/index.html` 加对应的前端调用
+4. 手动用 curl 或浏览器测试一遍
+````
+
+---
+
+**`skills/env-config.md`**：
+
+> **触发场景**：涉及 `.env`、`Settings`、新增配置项时加载。
+> 本 Skill 直接对应项目中 `core/config.py` 的 Pydantic Settings 机制和之前踩过的"extra fields forbidden"坑。
+
+````markdown
+---
+name: env-config
+description: 本项目配置管理规范——.env + Pydantic Settings 联动流程
+triggers:
+  - 环境变量
+  - 配置
+  - .env
+  - settings
+  - config
+  - Settings
+  - Pydantic
+---
+
+## 本项目的配置机制
+
+```
+.env 文件（实际值）
+    ↓ 被 Pydantic 自动读取
+core/config.py → Settings 类（声明字段 + 类型 + 默认值）
+    ↓ 被业务代码引用
+from core.config import settings
+settings.redis_host  # "localhost"
+```
+
+## ⚠️ 已知陷阱（本项目踩过）
+
+Pydantic Settings 默认 **`extra = "forbid"`**——如果 `.env` 里有字段但 `Settings`
+类没有声明，启动直接报错：
+
+```
+pydantic_core._pydantic_core.ValidationError:
+  Extra inputs are not permitted [type=extra_forbidden]
+```
+
+**解决方案：新增环境变量必须同时改两处**（缺一个就炸）。
+
+## 新增配置项的标准流程
+
+每新增一个配置项，必须同步修改：
+
+1. **`.env`**：加值（带注释）
+   ```bash
+   # Redis 连接配置
+   REDIS_HOST=localhost
+   REDIS_PORT=6379
+   ```
+
+2. **`core/config.py`**：加字段（含类型 + 默认值）
+   ```python
+   class Settings(BaseSettings):
+       redis_host: str = "localhost"
+       redis_port: int = 6379
+   ```
+
+## 命名规范
+
+- `.env` 里全大写：`REDIS_HOST`、`LLM_PROVIDER`
+- `Settings` 类里蛇形小写：`redis_host`、`llm_provider`
+- Pydantic 自动映射（大小写不敏感）
+
+## 默认值原则
+
+- 本地能跑的默认值（`localhost`、`6379`、`8002`）
+- 密钥默认空字符串 `""`：启动不报错，调用时才报错
+- 禁止把生产密钥写进代码或 `.env` 模板
+````
+
+---
+
+**`skills/prompt-engineering.md`**：
+
+> **触发场景**：修改子 Agent 的 system prompt 或新增 Agent 时加载。
+> 本 Skill 直接对应 `reviewer_agent.py` 和 `debugger_agent.py` 中 system prompt 的结构。
+
+````markdown
+---
+name: prompt-engineering
+description: 本项目 Agent 提示词规范——结构模板和输出解析约定
+triggers:
+  - 提示词
+  - prompt
+  - system prompt
+  - 系统提示
+  - Agent 指令
+  - NEEDS_FIX
+---
+
+## 本项目 system prompt 结构
+
+每个子 Agent 的 system prompt 必须包含：
+
+```
+1. 角色定位（一句话）
+2. 工作流程（编号步骤）
+3. 输出格式（精确模板，含解析标记）
+4. 约束（禁止项）
+```
+
+示例（reviewer_agent.py 的实际 system prompt）：
+```
+你是一名资深代码审查工程师。
+审查维度：SQL 注入、命令注入、硬编码密码、逻辑错误、边界条件、性能问题。
+每个问题输出：[Critical/Warning/Suggestion] 行号 - 问题描述 - 建议修复。
+发现 Critical 级别问题时，最后一行输出 NEEDS_FIX:true，否则输出 NEEDS_FIX:false。
+```
+
+## 输出解析约定
+
+本项目通过**约定格式标记**来让代码提取 LLM 的结构化输出：
+
+| 标记 | 用途 | 解析方 |
+|------|------|--------|
+| `NEEDS_FIX:true/false` | Reviewer 决定是否派生 debug 任务 | `reviewer_agent.py` 用 `in` 判断 |
+| ` ```python ... ``` ` | 代码块 | `code_extractor.py` 用正则提取 |
+| `Bug 根因：xxx` | Debugger 的诊断结论 | 人读 / 前端展示 |
+
+## 关键原则
+
+1. **用"必须"/"禁止"**，不用"建议"/"尽量"——模糊措辞让 LLM 自行发挥
+2. **输出格式写死**——方便下游代码用字符串匹配 / 正则提取
+3. **一个 Agent 只干一件事**——不要让 reviewer 又审查又修复
+
+## 新增 Agent 时的检查清单
+
+- [ ] system prompt 有没有明确输出格式？
+- [ ] 下游代码能不能稳定解析这个输出？
+- [ ] 异常情况（LLM 不遵守格式）有没有兜底？
+````
+
+---
+
+**`skills/security.md`**：
+
+> **触发场景**：审查涉及文件操作、用户输入、路径拼接的代码时加载。
+> 本 Skill 直接对应 `sandbox.py` 的路径遍历防护设计。
+
+````markdown
+---
+name: security
+description: 本项目安全规范——路径遍历防护、输入校验、沙箱写入
+triggers:
+  - 安全
+  - 路径
+  - path
+  - 注入
+  - sandbox
+  - 遍历
+  - traversal
+  - 用户输入
+  - 文件写入
+---
+
+## 路径遍历防护（已实现）
+
+本项目通过 `sandbox.py` 的 `resolve_safe_path()` 防止 LLM 输出的文件路径逃出
+工作目录：
+
+```python
+def resolve_safe_path(workspace: Path, relative: str) -> Path:
+    target = (workspace / relative).resolve()
+    if not str(target).startswith(str(workspace.resolve())):
+        raise PathTraversalError(f"路径 {relative} 逃出了工作区")
+    return target
+```
+
+**核心逻辑**：`.resolve()` 会把 `../../../etc/passwd` 解析为绝对路径，然后
+`startswith` 检查是否还在 workspace 下。
+
+## 必须使用沙箱的场景
+
+| 场景 | 正确做法 | 错误做法 |
+|------|----------|----------|
+| apply 端点写入代码 | `write_text_sandboxed(workspace, path, code)` | `open(path, 'w').write(code)` |
+| 任何用户/LLM 提供的路径 | 先过 `resolve_safe_path()` | 直接拼接使用 |
+
+## 输入校验原则
+
+- LLM 的输出视为**不可信输入**（它可能输出 `../../../../etc/crontab`）
+- 用户通过 API 传入的 `file_path` 也是不可信的
+- 只有代码里硬编码的路径（如 `skills/` 目录）才可信
+
+## 禁止事项
+
+- 禁止 `os.system()`、`subprocess.run(shell=True)` + 用户输入
+- 禁止 `eval()`、`exec()` 执行 LLM 输出
+- 禁止把密钥放在代码里或 Git 历史里
 ````
 
 ---
@@ -6577,17 +7019,23 @@ triggers:
 ## 9.7 本章检查清单
 
 ```
-□ skills/ 目录至少有一个 SKILL.md 文件，格式正确（有 frontmatter）
+□ skills/ 目录有 5+ 个 .md 文件，格式正确（有 frontmatter：name、description、triggers）
 
-□ load_skills() 能正确解析 frontmatter 的 name、description、triggers 字段
+□ 已 `pip install jieba`（TF-IDF 分词依赖，见 0.2 依赖清单）
 
-□ SkillSearcher.search("代码审查") 返回 code-review 这个 Skill
+□ load_skills() 能正确解析所有 Skill 文件，打印加载数量
+
+□ SkillSearcher.search("asyncio 竞态") 返回 async-patterns Skill
 
 □ 触发词匹配比 TF-IDF 匹配优先（score 差异体现在日志中）
 
-□ 加载 Skill 后的 system prompt 包含 Skill 的内容
+□ SwarmAgent 基类有 _enhance_system_prompt() 方法
 
-□ 无相关 Skill 时不崩溃，使用基础 system prompt
+□ ReviewerAgent 审查含 "async" 的代码时，日志显示加载了 async-patterns Skill
+
+□ 无相关 Skill 时不崩溃，子 Agent 使用原始 system prompt
+
+□ Skill 内容出现在 LLM 实际收到的 system prompt 中（可通过打印验证）
 ```
 
 **全部打勾之后，进入第 10 章。**
@@ -6597,26 +7045,40 @@ triggers:
 # 第 10 章：阶段 10 —— 会话持久化
 
 > **本章目标**：让 Agent 记住历史对话，重启后能从上次中断的地方继续。
-> 用 JSONL 文件作为主存储，Redis 作为索引，支持断点续传。
+> 用 JSONL 文件作为主存储，Redis 缓存最近消息内容加速加载，支持断点续传。
 
 ---
 
 ## 10.1 持久化架构
+
+JSONL 文件是唯一的"事实来源"（source of truth），永远全量、永久保存。Redis 只缓存**最近一段窗口内的消息内容本身**（用 List 类型），是可丢弃、可重建的加速层——丢了大不了退回读文件，不影响正确性。
+
+写入路径：
 
 ```
 用户发送消息
     ↓
 Agent 处理（Agentic Loop）
     ↓
-把这次对话追加写入 JSONL 文件（顺序写，高效）
-    ↓ 同时
-更新 Redis 索引（session_id → 文件中的最新位置）
-    ↓
-下次用户发送消息时：
-    从 Redis 找到 session_id 对应的 JSONL 文件
-    读取历史消息，注入 Agentic Loop 的初始 messages
-    Agent 带着完整上下文继续对话
+把这次对话追加写入 JSONL 文件（顺序写，高效，永久保存）
+    ↓ 同时（尽力而为，失败不影响主流程）
+把这条 message 记录 RPUSH 进 Redis List（session_msgs:{session_id}）
+并 LTRIM 只保留最近 N 轮，设置过期时间
 ```
+
+读取路径（下次用户发消息，需要加载历史时）：
+
+```
+优先查 Redis List（session_msgs:{session_id}）
+    ├─ 命中（List 非空 且 请求轮数在缓存窗口内）
+    │     → 直接从 Redis 内存里取，无需碰磁盘，速度快
+    │
+    └─ 未命中（Redis 未启用 / key 已过期 / 请求轮数超出缓存窗口）
+          → 退回读取 JSONL 文件（慢但一定拿得到完整历史）
+          → 顺手把读到的最近 N 轮回填进 Redis List（下次命中）
+```
+
+> 注意：之前版本里 Redis 只存了 `session_id → 文件路径 + 最后一条预览`（Hash），这其实**加速不了任何东西**——因为文件路径本来就能由 `session_id` 直接算出来（见 10.3 的 `_session_path`），查 Redis 反而多了一次网络往返。真正想让 Redis 起到加速作用，缓存的必须是**消息内容本身**，这样加载历史时才能跳过磁盘 I/O 和 JSONL 逐行解析。
 
 ---
 
@@ -6647,9 +7109,14 @@ JSONL（JSON Lines）格式：每行是一个独立的 JSON 对象，追加写�
 会话持久化存储。
 
 设计原则：
-1. 主存储：JSONL 文件（追加写，不修改，简单可靠）
-2. 索引：Redis（快速查找 session_id → 最新状态）
-3. 降级：Redis 不可用时，直接读 JSONL 文件（慢但可用）
+1. 主存储：JSONL 文件（追加写，不修改，简单可靠，永久保存全部历史）
+2. 缓存：Redis List（缓存最近 CACHE_MAX_TURNS 轮消息内容本身，加速加载）
+3. 降级：Redis 不可用 / 未命中时，直接读 JSONL 文件（慢但一定可用），
+   并顺手把读到的内容回填进 Redis，让下一次命中缓存
+
+关键点：Redis 缓存的必须是**消息内容本身**，而不是文件路径或摘要——
+文件路径本来就能由 session_id 直接算出来（见 _session_path），
+缓存路径没有意义；只有缓存内容才能真正省掉磁盘 I/O 和 JSONL 解析开销。
 """
 import json
 import time
@@ -6657,6 +7124,12 @@ import asyncio
 from pathlib import Path
 import aiofiles
 from providers.types import Message, TextBlock
+
+# Redis List 里最多缓存多少轮对话（每轮 = user + assistant，即 2 条记录）
+# 请求的 max_turns 超过这个窗口时，缓存肯定不完整，直接退回读文件。
+CACHE_MAX_TURNS = 20
+CACHE_MAX_RECORDS = CACHE_MAX_TURNS * 2
+CACHE_TTL_SECONDS = 7 * 24 * 3600   # 7 天没有新消息，缓存自动过期
 
 
 class SessionStore:
@@ -6673,8 +7146,11 @@ class SessionStore:
         dir_path.mkdir(exist_ok=True)
         return dir_path / f"{session_id}.jsonl"
 
+    def _cache_key(self, session_id: str) -> str:
+        return f"session_msgs:{session_id}"
+
     async def append_message(self, session_id: str, role: str, content: str):
-        """追加一条对话消息到 JSONL 文件。"""
+        """追加一条对话消息到 JSONL 文件，并同步进 Redis 缓存。"""
         record = {
             "type": "message",
             "ts": int(time.time()),
@@ -6682,10 +7158,10 @@ class SessionStore:
             "role": role,
             "content": content,
         }
-        await self._append_record(session_id, record)
+        await self._append_record(session_id, record, cache=True)
 
     async def append_tool_call(self, session_id: str, tool_name: str, inputs: dict, output: str):
-        """追加工具调用记录（仅审计用）。"""
+        """追加工具调用记录（仅审计用，不缓存——恢复历史时用不上）。"""
         record = {
             "type": "tool_call",
             "ts": int(time.time()),
@@ -6694,33 +7170,35 @@ class SessionStore:
             "input": inputs,
             "output": output[:500],   # 截断，避免大数据
         }
-        await self._append_record(session_id, record)
+        await self._append_record(session_id, record, cache=False)
 
-    async def _append_record(self, session_id: str, record: dict):
-        """把一条记录追加到 JSONL 文件，同时更新 Redis 索引。"""
+    async def _append_record(self, session_id: str, record: dict, cache: bool):
+        """把一条记录追加到 JSONL 文件；如果是 message 记录，同时推进 Redis List 缓存。"""
         path = self._session_path(session_id)
         line = json.dumps(record, ensure_ascii=False)
 
-        # 追加写入 JSONL 文件
+        # 追加写入 JSONL 文件——这一步是唯一"必须成功"的部分
         async with aiofiles.open(path, "a", encoding="utf-8") as f:
             await f.write(line + "\n")
 
-        # 更新 Redis 索引（记录最后更新时间）
-        if self.redis:
+        # 同步更新 Redis List 缓存（尽力而为，失败不影响主流程）
+        if self.redis and cache:
             try:
-                redis_key = f"session:{session_id}"
-                await self.redis.hset(redis_key, mapping={
-                    "file": str(path),
-                    "updated_at": int(time.time()),
-                    "last_record": line[:200],   # 存最后一条记录的预览
-                })
-                await self.redis.expire(redis_key, 7 * 24 * 3600)   # 7 天过期
+                cache_key = self._cache_key(session_id)
+                await self.redis.rpush(cache_key, line)
+                # 只保留最近 CACHE_MAX_RECORDS 条，防止 List 无限增长
+                await self.redis.ltrim(cache_key, -CACHE_MAX_RECORDS, -1)
+                await self.redis.expire(cache_key, CACHE_TTL_SECONDS)
             except Exception as e:
-                print(f"[SessionStore] Redis 更新失败（降级到纯文件模式）：{e}")
+                print(f"[SessionStore] Redis 缓存更新失败（降级到纯文件模式）：{e}")
 
     async def load_messages(self, session_id: str, max_turns: int = 20) -> list[Message]:
         """
-        从 JSONL 文件加载对话历史，重建 messages 列表。
+        加载对话历史，重建 messages 列表。
+
+        优先从 Redis List 缓存读取（快，内存命中）；
+        缓存未启用 / 未命中 / 请求轮数超出缓存窗口时，退回读 JSONL 文件（慢但保真），
+        并把读到的最近 CACHE_MAX_TURNS 轮回填进 Redis，供下次命中。
 
         参数：
             max_turns - 最多加载几轮（防止历史太长超出 Token 限制）
@@ -6728,27 +7206,41 @@ class SessionStore:
         返回：
             Message 对象列表，可直接传给 Agentic Loop
         """
-        path = self._session_path(session_id)
-        if not path.exists():
-            return []
+        raw_messages = None
 
-        # 读取所有 message 类型的记录
-        raw_messages = []
-        try:
-            async with aiofiles.open(path, "r", encoding="utf-8") as f:
-                async for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                        if record.get("type") == "message":
-                            raw_messages.append(record)
-                    except json.JSONDecodeError:
-                        continue   # 跳过损坏的行
-        except Exception as e:
-            print(f"[SessionStore] 读取会话文件失败：{e}")
-            return []
+        # 1. 尝试命中 Redis 缓存：只有当请求的轮数不超过缓存窗口时，缓存才可能是完整的
+        if self.redis and max_turns <= CACHE_MAX_TURNS:
+            try:
+                cache_key = self._cache_key(session_id)
+                cached_lines = await self.redis.lrange(cache_key, 0, -1)
+                if cached_lines:
+                    raw_messages = [json.loads(line) for line in cached_lines]
+            except Exception as e:
+                print(f"[SessionStore] Redis 缓存读取失败（降级到读文件）：{e}")
+
+        # 2. 缓存未命中：读 JSONL 文件（唯一保真的数据源）
+        if raw_messages is None:
+            raw_messages = await self._load_from_file(session_id)
+            # 把最近 CACHE_MAX_RECORDS 条回填进 Redis，供下次命中
+            if self.redis and raw_messages:
+                try:
+                    cache_key = self._cache_key(session_id)
+                    recent_for_cache = raw_messages[-CACHE_MAX_RECORDS:]
+                    lines = [json.dumps(r, ensure_ascii=False) for r in recent_for_cache]
+                    await self.redis.delete(cache_key)
+                    if lines:
+                        await self.redis.rpush(cache_key, *lines)
+                        await self.redis.expire(cache_key, CACHE_TTL_SECONDS)
+                except Exception as e:
+                    print(f"[SessionStore] Redis 缓存回填失败（不影响本次返回结果）：{e}")
+
+        # 3. 修补"孤儿 user 消息"：如果上一次调用在写完 user、还没写 assistant
+        #    时中途崩溃（比如 LLM 调用抛异常），文件/缓存会以一条没人回答的
+        #    user 记录结尾。留着它的话，本次会在它后面再拼一条新 user 消息，
+        #    形成连续两条 role="user"，违反 Anthropic API 的角色交替要求，
+        #    下一次请求会直接报错。这条记录反正没被回答过，丢弃它不影响历史完整性。
+        if raw_messages and raw_messages[-1].get("role") == "user":
+            raw_messages = raw_messages[:-1]
 
         # 只取最近 max_turns 轮（每轮 = user + assistant）
         max_records = max_turns * 2
@@ -6767,6 +7259,31 @@ class SessionStore:
 
         return messages
 
+    async def _load_from_file(self, session_id: str) -> list[dict]:
+        """从 JSONL 文件读取所有 message 类型的原始记录。"""
+        path = self._session_path(session_id)
+        if not path.exists():
+            return []
+
+        raw_messages = []
+        try:
+            async with aiofiles.open(path, "r", encoding="utf-8") as f:
+                async for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        if record.get("type") == "message":
+                            raw_messages.append(record)
+                    except json.JSONDecodeError:
+                        continue   # 跳过损坏的行
+        except Exception as e:
+            print(f"[SessionStore] 读取会话文件失败：{e}")
+            return []
+
+        return raw_messages
+
     async def clear(self, session_id: str):
         """清除会话历史（用户请求 /clear 时调用）。"""
         path = self._session_path(session_id)
@@ -6775,87 +7292,236 @@ class SessionStore:
 
         if self.redis:
             try:
-                await self.redis.delete(f"session:{session_id}")
+                await self.redis.delete(self._cache_key(session_id))
             except Exception:
                 pass
 
         print(f"[SessionStore] 已清除会话：{session_id}")
 ```
 
+> **为什么 `load_messages` 要专门丢弃末尾的孤儿 user 消息？** `append_message("user", ...)`
+> 和 `append_message("assistant", ...)` 是两次独立的写入（中间隔着一次完整的 Agentic
+> Loop 调用）。如果 Loop 在这中间抛异常（比如 LLM 调用超时/报错），JSONL 文件就会停在
+> 一条没人回答的 user 记录上。如果不处理，下次 `ask()` 会在它后面再拼一条新的 user
+> 消息，历史里出现连续两条 `role="user"`，直接违反 Anthropic API"必须 user/assistant
+> 交替"的硬性要求，那次请求会报错而不是"记忆稍微少了一点"。丢弃这条未完成的记录，
+> 是让历史"要么完整一轮、要么不存在"，代价是这条消息的内容确实会丢——但反正它也没被
+> 回答过，保留半条记录没有意义。
+
 ---
 
 ## 10.4 在 Agent 中使用会话持久化
 
+> 本章的 `SessionStore` 要接到项目实际的 `agent/agent.py` 里（第 4 章之后 `agent.py` 已经拆成了
+> `agent/` 包，对外接口实现在 `agent/agent.py`，`agent/__init__.py` 只做导出），
+> 而不是新建一个独立的 `agent.py`。这里复用 `ask()` 已有的 `_registry`（工具注册）、
+> `_executor`（工具执行器）、`SYSTEM_PROMPT`，只是多了"加载历史 / 存历史"两步。
+
+先给 `run_agent_loop` 补上 `initial_messages` 参数（对应第 4 章遗留的 TODO：调用方需要能传入
+包含历史的完整消息列表，而不是永远从 `prompt` 现造一条消息）：
+
 ```python
-# agent.py — 带会话记忆的 ask() 函数
+# agent/loop.py（run_agent_loop 签名变化）
 
+async def run_agent_loop(
+    prompt: str,
+    provider: BaseProvider,
+    system: str = "",
+    tools: list[ToolDefinition] | None = None,
+    executor: ToolExecutor | None = None,
+    max_turns: int = 10,
+    max_tokens: int = 4096,
+    on_text_delta: Callable[[str], None] | None = None,
+    initial_messages: list[Message] | None = None,   # 新增
+) -> LoopResult:
+    # 优先用调用方传入的完整历史（含本轮新问题）；没传则退回单条用户消息
+    starting_messages = initial_messages if initial_messages is not None else [
+        Message(role="user", content=[TextBlock(text=prompt)])
+    ]
+    state = LoopState(messages=tuple(starting_messages))
+    ...
+```
+
+> **为什么不单独写一个 `ask_with_memory()`？** 它跟 `ask()` 除了"要不要读写历史"之外，
+> 拿 provider、传 tools/executor、跑 loop、组装 `AskResult` 全部一样——两个函数并存只会
+> 变成重复代码，以后改一处很容易忘了改另一处。更好的做法是给 `ask()` 加一个可选的
+> `session_id`：不传（默认 `None`）就是原来的无记忆行为，完全兼容现有调用方
+> （`cli.py`、测试）；传了就自动读历史、拼历史、存历史。
+
+给 `agent/agent.py` 里已有的 `ask()` 加上 `session_id` 参数：
+
+```python
+# agent/agent.py（在文件顶部追加 import，并替换 ask()）
+
+from providers.types import Message, TextBlock
 from persistence.session_store import SessionStore
+from persistence.redis_client import create_redis_client
 
-# 全局 store（实际中应该在应用启动时初始化 redis_client）
-_store = SessionStore(base_dir="sessions/")
+# 会话存储：JSONL 落盘 + Redis 缓存最近历史。
+# redis_client 复用 persistence/redis_client.py 里的同一套连接配置（Blackboard 也是这么接的），
+# 不要各自硬编码 host/port。
+_store = SessionStore(base_dir="sessions/", redis_client=create_redis_client())
 
 
-async def ask_with_memory(question: str, session_id: str = "default") -> str:
+async def ask(question: str, session_id: str | None = None) -> AskResult:
     """
-    带多轮记忆的 Agent 调用。
+    调用 Agent 回答问题。
 
-    流程：
-    1. 从存储加载历史对话
-    2. 把新问题加到历史末尾
-    3. 用完整历史运行 Agentic Loop
-    4. 把新的问答追加存储
+    session_id 为 None（默认）时无记忆，每次调用互不影响；
+    传入 session_id 时会从 SessionStore 加载历史（最近 10 轮）、
+    拼到本次问题前面一起跑，并把这轮问答追加写回 SessionStore。
     """
     provider = get_provider()
 
-    # 加载历史（最近 10 轮）
-    history = await _store.load_messages(session_id, max_turns=10)
+    initial_messages = None
+    if session_id is not None:
+        history = await _store.load_messages(session_id, max_turns=10)
+        new_user_message = Message(role="user", content=[TextBlock(text=question)])
+        initial_messages = history + [new_user_message]
+        await _store.append_message(session_id, "user", question)
 
-    # 构建完整消息列表：历史 + 新问题
-    new_user_message = Message(role="user", content=[TextBlock(text=question)])
-    all_messages = history + [new_user_message]
-
-    # 保存用户消息
-    await _store.append_message(session_id, "user", question)
-
-    # 运行 Agentic Loop（传入历史消息）
-    from agent.loop import run_agent_loop, LoopResult
-
-    # 注意：run_agent_loop 的 prompt 参数是新增的用户输入，
-    # 但 messages 里已经有历史了，要改造一下 loop 接受初始 messages
     result = await run_agent_loop(
         prompt=question,
         provider=provider,
         system=SYSTEM_PROMPT,
-        # TODO: 把 initial_messages 改为 history + user_message（第 4 章的 loop 需要微调）
+        tools=_registry.get_all_definitions(),
+        executor=_executor,
         max_turns=10,
+        initial_messages=initial_messages,
     )
 
-    # 保存 Agent 回答
-    await _store.append_message(session_id, "assistant", result.text)
+    if session_id is not None:
+        await _store.append_message(session_id, "assistant", result.text)
 
-    return result.text
+    return AskResult(
+        text=result.text,
+        input_tokens=result.total_usage.input_tokens,
+        output_tokens=result.total_usage.output_tokens,
+        turn_count=result.turn_count,
+    )
 ```
 
-> 💡 **改造 run_agent_loop 以支持历史消息**：
-> 第 4 章实现的 loop 里，初始 messages 只有一条用户消息。要支持会话历史，
-> 需要给 run_agent_loop 加一个 `initial_messages` 参数，
-> 让调用方传入包含历史的完整消息列表。
+`ask_stream()`（流式接口）原来完全没有记忆能力，跟 `ask()` 相比是个明显的功能缺口——
+同样加一个可选的 `session_id`，逻辑跟 `ask()` 一致（加载历史 → 拼新问题 → 跑 Loop →
+存回历史），区别只是回复文字要靠回调边生成边收集，跑完才知道完整内容、才能写回
+`SessionStore`：
+
+```python
+# agent/agent.py
+
+async def clear_session(session_id: str):
+    """清除一个会话的历史（文件 + Redis 缓存），供 FastAPI /session/clear 调用。"""
+    await _store.clear(session_id)
+
+
+async def ask_stream(question: str, session_id: str | None = None) -> AsyncGenerator[str, None]:
+    """
+    流式调用，通过 on_text_delta 回调实时传出文本。
+
+    session_id 用法跟 ask() 一致：不传就是无记忆的一次性调用；
+    传入则加载/追加历史，效果与 ask() 相同，只是文本以流式方式返回。
+    """
+    queue: Queue[str | None] = Queue()
+
+    def on_delta(text: str):
+        queue.put_nowait(text)
+
+    async def run_loop():
+        provider = get_provider()
+
+        initial_messages = None
+        if session_id is not None:
+            history = await _store.load_messages(session_id, max_turns=10)
+            new_user_message = Message(role="user", content=[TextBlock(text=question)])
+            initial_messages = history + [new_user_message]
+            await _store.append_message(session_id, "user", question)
+
+        text_chunks: list[str] = []
+
+        def on_delta_and_collect(text: str):
+            text_chunks.append(text)
+            on_delta(text)
+
+        await run_agent_loop(
+            prompt=question,
+            provider=provider,
+            system=SYSTEM_PROMPT,
+            tools=_registry.get_all_definitions(),
+            executor=_executor,
+            max_turns=10,
+            on_text_delta=on_delta_and_collect,
+            initial_messages=initial_messages,
+        )
+
+        if session_id is not None:
+            await _store.append_message(session_id, "assistant", "".join(text_chunks))
+
+        queue.put_nowait(None)
+
+    loop_task = asyncio.create_task(run_loop())
+
+    while True:
+        chunk = await queue.get()
+        if chunk is None:
+            break
+        yield chunk
+
+    await loop_task
+```
+
+`agent/__init__.py` 补上新增的 `clear_session` 导出：
+
+```python
+# agent/__init__.py
+from .agent import ask, ask_stream, clear_session, AskResult
+```
 
 ---
 
 ## 10.5 在 FastAPI 接口中传入 session_id
 
+`main.py` 里的 `/ask` 目前还是走第 4 章留下的 `CoordinatorAgent`（规划 → 分发 → 聚合），
+跟这一章的 `ask()`/`SessionStore` 是两条不相关的链路，加 `session_id` 也不会有记忆效果。
+这里把 `/ask` 切回直接调用 `ask()`，`_coordinator` 也一并删掉（没有其它地方在用）：
+
 ```python
-# main.py 的 /ask 接口增加 session_id 支持
+# main.py
+
+from agent import ask, ask_stream   # 不再需要 CoordinatorAgent
+
 
 class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1)
-    session_id: str = Field(default="web:default", description="会话 ID，用于多轮对话记忆")
+    """POST /ask 的请求体格式"""
+    question: str = Field(..., min_length=1, description="用户的问题")
+    session_id: str = Field(
+        default="web:default",
+        description="会话 ID，同一 session_id 的多次请求会共享对话历史",
+    )
 
-@app.post("/ask")
-async def ask_endpoint(req: AskRequest):
-    result = await ask_with_memory(req.question, session_id=req.session_id)
-    return {"text": result, "session_id": req.session_id}
+
+class AskResponse(BaseModel):
+    """POST /ask 的响应体格式"""
+    text: str = Field(default="", description="Agent 的回答")
+    session_id: str = Field(default="", description="本次请求使用的会话 ID，回传给前端便于下一轮携带")
+    usage: dict = Field(default_factory=dict, description="Token 用量")
+    error: str | None = Field(default=None, description="错误信息")
+
+
+@app.post("/ask", response_model=AskResponse)
+async def ask_endpoint(req: AskRequest) -> AskResponse:
+    try:
+        result = await ask(req.question, session_id=req.session_id)
+        return AskResponse(
+            text=result.text,
+            session_id=req.session_id,
+            usage={
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+                "turn_count": result.turn_count,
+            },
+        )
+    except Exception as e:
+        return AskResponse(session_id=req.session_id, error=str(e))
 ```
 
 客户端调用时保持相同的 `session_id`，Agent 就会记住上下文：
@@ -6870,6 +7536,87 @@ curl -X POST http://localhost:8002/ask \
   -d '{"question": "帮我想想这个项目应该用什么数据库？", "session_id": "user_001"}'
 ```
 
+`/ask/stream`（SSE 流式接口）同样加上 `session_id`（URL 查询参数，可选）：
+
+```python
+# main.py
+
+@app.get("/ask/stream")
+async def ask_stream_endpoint(question: str, session_id: str | None = None):
+    async def event_generator():
+        try:
+            async for chunk in ask_stream(question, session_id=session_id):
+                data = json.dumps({"type": "text_delta", "text": chunk}, ensure_ascii=False)
+                yield f"data: {data}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            error_data = json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False)
+            yield f"data: {error_data}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers={...})
+```
+
+再补一个清除会话的接口——10.3 的 `SessionStore.clear()` 之前只是个方法，没有任何路由
+接到它，前端的"清空"按钮点了也只是清空页面上的气泡，服务端历史其实还在：
+
+```python
+# main.py
+
+class ClearSessionRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, description="要清除的会话 ID")
+
+
+@app.post("/session/clear")
+async def clear_session_endpoint(req: ClearSessionRequest) -> dict:
+    await clear_session(req.session_id)
+    return {"session_id": req.session_id, "cleared": True}
+```
+
+**前端怎么拿到 session_id？** 没有登录系统，`session_id` 就不能像飞书那样直接用平台
+自带的 `sender_id`/`chat_id`，得让浏览器自己造一个、并持久化下来——同一浏览器下次
+打开页面还是这个 ID，能接着聊；换个浏览器/清了缓存就是新会话。用 `localStorage` 存
+一个 `crypto.randomUUID()` 即可：
+
+```js
+// static/index.html
+
+function getSessionId() {
+    let id = localStorage.getItem('session_id');
+    if (!id) {
+        id = crypto.randomUUID();
+        localStorage.setItem('session_id', id);
+    }
+    return id;
+}
+const SESSION_ID = getSessionId();
+
+// POST /ask 时带上
+fetch(BASE + '/ask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question, session_id: SESSION_ID }),
+});
+
+// GET /ask/stream 时带上
+const url = BASE + '/ask/stream?question=' + encodeURIComponent(question) +
+    '&session_id=' + encodeURIComponent(SESSION_ID);
+
+// "清空"按钮：先清服务端历史，再清页面
+async function clearChat() {
+    document.getElementById('chat').innerHTML = '';
+    await fetch(BASE + '/session/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: SESSION_ID }),
+    });
+}
+```
+
+> `AskRequest.session_id` 上的默认值 `"web:default"` 只是兜底（比如直接用 curl 测试、
+> 没传这个字段的场景），走真正前端页面时请求体里一定会带上浏览器自己持久化的
+> `SESSION_ID`，不会落到这个默认值上，也就不会出现"所有访客共用一个会话、历史互相
+> 串"的问题。
+
 ---
 
 ## 10.6 本章检查清单
@@ -6883,11 +7630,30 @@ curl -X POST http://localhost:8002/ask \
 □ load_messages() 能正确重建 Message 对象列表
   验证：先对话 3 次，然后 python -c "import asyncio; from persistence.session_store import SessionStore; ..."
 
-□ 清除会话后再对话，Agent 不再记得之前的内容
+□ 调用 POST /session/clear 清除会话后再对话，Agent 不再记得之前的内容
+  （不是只清前端页面——之前 SessionStore.clear() 没有接任何路由，这一条测不了）
 
 □ 重启服务后，再次发同一 session_id 的请求，Agent 还记得之前的对话
 
-□ （可选）Redis 索引写入成功（redis-cli hgetall session:default）
+□ /ask/stream 传入 session_id 时也有记忆效果，跟 /ask 表现一致
+
+□ 前端刷新页面后 localStorage 里的 session_id 不变，Agent 还记得刷新前的对话；
+  换一个浏览器 / 清掉 localStorage 后是全新会话，不会看到别人的历史
+
+□ 人为让一次 ask() 调用在写完 user、还没写 assistant 时抛异常（比如临时改 provider
+  抛错），验证下一次同 session_id 的请求不会因为"连续两条 user 消息"报错
+  （load_messages() 应该已经丢弃了那条孤儿 user 记录）
+
+□ （可选，装了 Redis 才测）Redis List 缓存写入成功
+  验证：redis-cli lrange session_msgs:default 0 -1，应该能看到完整的消息 JSON（不只是预览）
+
+□ （可选）验证缓存确实被读到、而不是每次都在读文件
+  验证：先对话几轮预热缓存，然后临时把 sessions/ 目录改名（模拟文件不可读），
+  再发一条 max_turns 在缓存窗口内的请求，Agent 应该仍然记得历史（说明走的是 Redis 缓存）
+
+□ （可选）验证缓存未命中时能正确回填
+  验证：redis-cli del session_msgs:default 清空缓存后再发一条请求，
+  Agent 依然记得历史（退回读文件），且之后 lrange session_msgs:default 0 -1 能看到缓存已重新写入
 ```
 
 ---
@@ -7319,7 +8085,7 @@ class FeishuClient:
 import json
 import time
 from .client import FeishuClient
-from agent import ask_with_memory   # 使用带记忆的 ask
+from agent import ask   # 传 session_id 就是带记忆的调用
 
 
 class MessageHandler:
@@ -7409,8 +8175,8 @@ class MessageHandler:
 
         # 调用 Agent
         try:
-            result = await ask_with_memory(text, session_id=session_key)
-            await self.client.send_text(receive_id, result, id_type=receive_id_type)
+            result = await ask(text, session_id=session_key)
+            await self.client.send_text(receive_id, result.text, id_type=receive_id_type)
         except Exception as e:
             await self.client.send_text(receive_id, f"处理时遇到错误，请稍后重试。", id_type=receive_id_type)
             print(f"[Handler] 错误：{e}")
@@ -8378,7 +9144,7 @@ Commit 命名规范：
 | 历史压缩（摘要策略） | 超长对话自动压缩保留关键信息 |
 | Anthropic Prompt Cache | system prompt 缓存，5 分钟内复用降低 90% 费用 |
 | JSONL 会话持久化 | 对话历史落盘，支持断点续传 |
-| Redis 索引 | 会话快速检索，支持多用户并发隔离 |
+| Redis List 缓存 | 缓存最近 N 轮消息内容，加速会话加载；未命中时退回读文件 |
 | aioredis | 异步 Redis 客户端 |
 
 ### 可观测性层
@@ -10698,12 +11464,12 @@ A：登录账户后进入「账户设置」→「升级套餐」，支持支付�
 
 ---
 
-## 15.11 更新 `agent/api.py` 接入工具
+## 15.11 更新 `agent/agent.py` 接入工具
 
-用以下内容替换 `agent/api.py`，让 `ask()` 带上知识库工具：
+用以下内容替换 `agent/agent.py`，让 `ask()` 带上知识库工具：
 
 ```python
-# agent/api.py（完整替换）
+# agent/agent.py（完整替换）
 
 import asyncio
 from asyncio import Queue
@@ -10924,7 +11690,7 @@ tests/
 
 修改文件：
 agent/loop.py    ← 在 LLM 调用和工具执行处埋点，收集 metrics
-agent/api.py     ← AskResult 新增 metrics 字段
+agent/agent.py     ← AskResult 新增 metrics 字段
 pyproject.toml   ← pytest 异步配置
 ```
 
@@ -11334,12 +12100,12 @@ async def run_agent_loop(
 
 ---
 
-## 16.6 更新 `agent/api.py` 暴露指标
+## 16.6 更新 `agent/agent.py` 暴露指标
 
-在上一章修改后的 `agent/api.py` 基础上，给 `AskResult` 加入 metrics 字段：
+在上一章修改后的 `agent/agent.py` 基础上，给 `AskResult` 加入 metrics 字段：
 
 ```python
-# agent/api.py — 修改 AskResult dataclass
+# agent/agent.py — 修改 AskResult dataclass
 
 from core.metrics import SessionMetrics   # ← 新增导入
 
@@ -11843,8 +12609,8 @@ async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
     monkeypatch 临时把知识库目录换成测试目录，
     不影响真实的 knowledge_base/ 文件夹。
     """
-    # 临时替换 agent/api.py 里的工具注册逻辑，使用测试知识库
-    import agent.api as api_module
+    # 临时替换 agent/agent.py 里的工具注册逻辑，使用测试知识库
+    import agent.agent as agent_module
     import tools.registry as reg_module
     from tools.registry import ToolRegistry
     from tools.knowledge_base import KnowledgeBaseTool
@@ -11856,7 +12622,7 @@ async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
         executor = ToolExecutor(registry)
         return executor, registry.all_definitions()
 
-    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build_executor_and_tools)
+    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build_executor_and_tools)
 
     result = await ask("我们公司的退货政策是什么？退货有什么条件？")
 
@@ -11869,7 +12635,7 @@ async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
 
 async def test_product_spec_question_triggers_kb_tool(test_kb_dir, monkeypatch):
     """问产品规格时，Agent 应该调用 search_knowledge_base 工具。"""
-    import agent.api as api_module
+    import agent.agent as agent_module
     from tools.registry import ToolRegistry
     from tools.knowledge_base import KnowledgeBaseTool
     from agent.executor import ToolExecutor
@@ -11880,7 +12646,7 @@ async def test_product_spec_question_triggers_kb_tool(test_kb_dir, monkeypatch):
         executor = ToolExecutor(registry)
         return executor, registry.all_definitions()
 
-    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build_executor_and_tools)
+    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build_executor_and_tools)
 
     result = await ask("ProCoder X1 的内存是多少？")
 
@@ -11992,7 +12758,7 @@ async def test_kb_query_triggers_tool_call(test_kb_dir, monkeypatch):
     这是最重要的集成测试：验证 RAG 完整链路：
     提问 → Agent 决定查知识库 → 检索到相关文档 → 基于文档回答
     """
-    import agent.api as api_module
+    import agent.agent as agent_module
     from tools.registry import ToolRegistry
     from tools.knowledge_base import KnowledgeBaseTool
     from agent.executor import ToolExecutor
@@ -12002,7 +12768,7 @@ async def test_kb_query_triggers_tool_call(test_kb_dir, monkeypatch):
         registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
         return ToolExecutor(registry), registry.all_definitions()
 
-    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build)
+    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
 
     result = await ask("请介绍一下退货政策，退货有什么条件？")
 
@@ -12019,7 +12785,7 @@ async def test_kb_answer_contains_relevant_info(test_kb_dir, monkeypatch):
     """
     基于知识库的回答应该包含文档里的具体信息，而不是泛泛而谈。
     """
-    import agent.api as api_module
+    import agent.agent as agent_module
     from tools.registry import ToolRegistry
     from tools.knowledge_base import KnowledgeBaseTool
     from agent.executor import ToolExecutor
@@ -12029,7 +12795,7 @@ async def test_kb_answer_contains_relevant_info(test_kb_dir, monkeypatch):
         registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
         return ToolExecutor(registry), registry.all_definitions()
 
-    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build)
+    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
 
     result = await ask("ProCoder X1 的 CPU 规格是什么？")
 
@@ -12048,7 +12814,7 @@ async def test_multi_turn_when_tool_used(test_kb_dir, monkeypatch):
     当 Agent 使用工具时，turn_count 应该 >= 2
     （第 1 轮：决定调工具；第 2 轮：基于工具结果回答）。
     """
-    import agent.api as api_module
+    import agent.agent as agent_module
     from tools.registry import ToolRegistry
     from tools.knowledge_base import KnowledgeBaseTool
     from agent.executor import ToolExecutor
@@ -12058,7 +12824,7 @@ async def test_multi_turn_when_tool_used(test_kb_dir, monkeypatch):
         registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
         return ToolExecutor(registry), registry.all_definitions()
 
-    monkeypatch.setattr(api_module, "_build_executor_and_tools", mock_build)
+    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
 
     result = await ask("保修期多久？")
 
@@ -12186,7 +12952,7 @@ if result.metrics:
 □ 准备了 tests/fixtures/knowledge_base/ 里的两个测试文档
 □ 运行 pytest tests/test_rag.py -v，全部通过
 □ 修改了 agent/loop.py，加入 metrics 埋点
-□ 修改了 agent/api.py，AskResult 有 metrics 字段
+□ 修改了 agent/agent.py，AskResult 有 metrics 字段
 □ 运行 pytest tests/test_agent_e2e.py::test_ask_returns_ask_result -v，通过
 □ 运行全部集成测试 pytest tests/ -v，无错误（或仅有预期的 skip）
 □ 修改 cli.py 加入 metrics.print_report()，对话后能看到统计报告

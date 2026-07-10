@@ -1,4 +1,4 @@
-# agent.py（完整替换）
+# agent/agent.py
 import asyncio
 from asyncio import Queue
 from dataclasses import dataclass
@@ -6,12 +6,15 @@ from typing import AsyncGenerator
 from agent.loop import run_agent_loop
 from agent.executor import ToolExecutor
 from providers.router import get_provider
+from providers.types import Message, TextBlock
 from tools.registry import ToolRegistry
 from tools.builtin.read_file import ReadFileTool
 from tools.builtin.run_python import RunPythonTool
 from tools.builtin.search_code import SearchCodeTool
 from tools.builtin.list_dir import ListDirTool
 from tools.builtin.write_file import WriteFileTool
+from persistence.session_store import SessionStore
+from persistence.redis_client import create_redis_client
 
 SYSTEM_PROMPT = """
 你是一个专业的 Coding Agent，帮助用户完成代码相关任务。
@@ -48,9 +51,26 @@ _registry.register(ListDirTool())
 _registry.register(WriteFileTool())
 _executor = ToolExecutor(_registry)
 
+# 会话存储（第 10 章）：JSONL 落盘 + Redis 缓存最近历史
+_store = SessionStore(base_dir="sessions/", redis_client=create_redis_client())
 
-async def ask(question: str) -> AskResult:
+
+async def ask(question: str, session_id: str | None = None) -> AskResult:
+    """
+    调用 Agent 回答问题。
+
+    session_id 为 None（默认）时无记忆，每次调用互不影响；
+    传入 session_id 时会从 SessionStore 加载历史（最近 10 轮）、
+    拼到本次问题前面一起跑，并把这轮问答追加写回 SessionStore（第 10 章）。
+    """
     provider = get_provider()
+
+    initial_messages = None
+    if session_id is not None:
+        history = await _store.load_messages(session_id, max_turns=10)
+        new_user_message = Message(role="user", content=[TextBlock(text=question)])
+        initial_messages = history + [new_user_message]
+        await _store.append_message(session_id, "user", question)
 
     result = await run_agent_loop(
         prompt=question,
@@ -59,7 +79,12 @@ async def ask(question: str) -> AskResult:
         tools=_registry.get_all_definitions(),
         executor=_executor,
         max_turns=10,
+        initial_messages=initial_messages,
+        session_id=session_id,
     )
+
+    if session_id is not None:
+        await _store.append_message(session_id, "assistant", result.text)
 
     return AskResult(
         text=result.text,
@@ -69,8 +94,18 @@ async def ask(question: str) -> AskResult:
     )
 
 
-async def ask_stream(question: str) -> AsyncGenerator[str, None]:
-    """流式调用，通过 on_text_delta 回调实时传出文本。"""
+async def clear_session(session_id: str):
+    """清除一个会话的历史（文件 + Redis 缓存）。"""
+    await _store.clear(session_id)
+
+
+async def ask_stream(question: str, session_id: str | None = None) -> AsyncGenerator[str, None]:
+    """
+    流式调用，通过 on_text_delta 回调实时传出文本。
+
+    session_id 用法跟 ask() 一致：不传就是无记忆的一次性调用；
+    传入则加载/追加历史，效果与 ask() 相同，只是文本以流式方式返回。
+    """
     queue: Queue[str | None] = Queue()
 
     def on_delta(text: str):
@@ -78,6 +113,20 @@ async def ask_stream(question: str) -> AsyncGenerator[str, None]:
 
     async def run_loop():
         provider = get_provider()
+
+        initial_messages = None
+        if session_id is not None:
+            history = await _store.load_messages(session_id, max_turns=10)
+            new_user_message = Message(role="user", content=[TextBlock(text=question)])
+            initial_messages = history + [new_user_message]
+            await _store.append_message(session_id, "user", question)
+
+        text_chunks: list[str] = []
+
+        def on_delta_and_collect(text: str):
+            text_chunks.append(text)
+            on_delta(text)
+
         await run_agent_loop(
             prompt=question,
             provider=provider,
@@ -85,8 +134,14 @@ async def ask_stream(question: str) -> AsyncGenerator[str, None]:
             tools=_registry.get_all_definitions(),
             executor=_executor,
             max_turns=10,
-            on_text_delta=on_delta,
+            on_text_delta=on_delta_and_collect,
+            initial_messages=initial_messages,
+            session_id=session_id,
         )
+
+        if session_id is not None:
+            await _store.append_message(session_id, "assistant", "".join(text_chunks))
+
         queue.put_nowait(None)
 
     loop_task = asyncio.create_task(run_loop())

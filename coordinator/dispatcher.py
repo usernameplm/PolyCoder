@@ -5,6 +5,7 @@
 import asyncio
 from collections import defaultdict, deque
 from .planner import TaskSpec
+from observability.logging import logger
 
 
 def _get_sub_agents() -> dict:
@@ -34,7 +35,7 @@ def _get_agent(name: str):
     return _agents.get(name)
 
 
-async def dispatch(tasks: list[TaskSpec]) -> dict[str, str]:
+async def dispatch(tasks: list[TaskSpec], session_id: str | None = None) -> dict[str, str]:
     """
     按拓扑顺序执行所有任务，返回 {task_id: 结果文字} 的映射。
 
@@ -44,8 +45,11 @@ async def dispatch(tasks: list[TaskSpec]) -> dict[str, str]:
     3. 更新依赖计数，找出新解锁的任务 → 波次 2
     4. 重复直到所有任务完成
     """
+    log = logger.bind(session_id=session_id) if session_id else logger
     if not tasks:
         return {}
+
+    log.info("dispatch_start", task_count=len(tasks))
 
     # 建立索引
     spec_by_id = {t.id: t for t in tasks}
@@ -79,19 +83,19 @@ async def dispatch(tasks: list[TaskSpec]) -> dict[str, str]:
             )
             if failed_dep:
                 errors[tid] = f"前置任务 '{failed_dep}' 失败，跳过本任务"
-                print(f"[Dispatcher] 跳过 {tid}：{errors[tid]}")
+                log.warning("dispatch_task_skipped", task_id=tid, reason=errors[tid])
             else:
                 runnable.append(spec)
 
         # 并行执行这一波次的所有任务
         if runnable:
-            coros = [_run_one(spec, results) for spec in runnable]
+            coros = [_run_one(spec, results, log) for spec in runnable]
             done = await asyncio.gather(*coros, return_exceptions=True)
 
             for spec, outcome in zip(runnable, done):
                 if isinstance(outcome, Exception):
                     errors[spec.id] = str(outcome)
-                    print(f"[Dispatcher] 任务 {spec.id} 失败：{outcome}")
+                    log.error("dispatch_task_error", task_id=spec.id, agent=spec.agent, error=str(outcome))
                 else:
                     results[spec.id] = outcome
 
@@ -107,8 +111,10 @@ async def dispatch(tasks: list[TaskSpec]) -> dict[str, str]:
     return results
 
 
-async def _run_one(spec: TaskSpec, prior_results: dict[str, str]) -> str:
+async def _run_one(spec: TaskSpec, prior_results: dict[str, str], log=None) -> str:
     """执行单个任务，把前置任务的结果注入 context。"""
+    if log is None:
+        log = logger
     agent = _get_agent(spec.agent)
     if agent is None:
         raise ValueError(f"未知子 Agent：'{spec.agent}'。已注册：{list(_get_sub_agents().keys())}")
@@ -116,7 +122,7 @@ async def _run_one(spec: TaskSpec, prior_results: dict[str, str]) -> str:
     # 把前置任务的结果作为 context 传入
     context = {dep: prior_results[dep] for dep in spec.depends_on if dep in prior_results}
 
-    print(f"[Dispatcher] → {spec.agent} | {spec.input[:60]}")
+    log.info("dispatch_task_start", agent=spec.agent, task_id=spec.id)
     result = await agent.run(task=spec.input, context=context or None)
-    print(f"[Dispatcher] ← {spec.agent} | 完成（{len(result)} 字符）")
+    log.info("dispatch_task_done", agent=spec.agent, task_id=spec.id, result_chars=len(result))
     return result

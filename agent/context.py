@@ -3,6 +3,7 @@
 上下文管理：Token 预算检查 + 历史压缩。
 """
 from providers.types import Message, TextBlock
+from observability.logging import logger
 
 # Claude 的上下文窗口（不同模型不同，claude-sonnet-4 是 200k）
 MAX_CONTEXT_TOKENS = 180_000   # 留 20k 余量
@@ -36,7 +37,7 @@ def should_compress(messages: list[Message]) -> bool:
     estimated = estimate_tokens(messages)
     threshold = MAX_CONTEXT_TOKENS * COMPRESS_THRESHOLD
     if estimated > threshold:
-        print(f"[Context] 估算 {estimated} tokens，超过阈值 {threshold}，触发压缩")
+        logger.info("context_compress_triggered", estimated_tokens=estimated, threshold=threshold)
         return True
     return False
 
@@ -102,5 +103,9 @@ async def compress_messages(
         content=[TextBlock(text=f"【对话历史摘要】\n{summary_text}")]
     )
 
-    print(f"[Context] 压缩完成：{len(messages)} 条 → 1条摘要 + {len(recent_messages)} 条")
+    logger.info(
+        "context_compress_completed",
+        original_count=len(messages),
+        recent_count=len(recent_messages),
+    )
     return [summary_message] + recent_messages
