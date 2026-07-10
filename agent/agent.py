@@ -80,6 +80,7 @@ async def ask(question: str, session_id: str | None = None) -> AskResult:
         executor=_executor,
         max_turns=10,
         initial_messages=initial_messages,
+        session_id=session_id,
     )
 
     if session_id is not None:
@@ -135,6 +136,7 @@ async def ask_stream(question: str, session_id: str | None = None) -> AsyncGener
             max_turns=10,
             on_text_delta=on_delta_and_collect,
             initial_messages=initial_messages,
+            session_id=session_id,
         )
 
         if session_id is not None:

@@ -7,6 +7,7 @@ import re
 from providers.router import get_provider
 from providers.types import Message, TextBlock
 from dataclasses import dataclass, field
+from observability.logging import logger
 
 
 @dataclass
@@ -53,7 +54,7 @@ _COORDINATOR_SYSTEM = """
 """
 
 
-async def make_plan(user_request: str) -> tuple[list[TaskSpec], str | None]:
+async def make_plan(user_request: str, session_id: str | None = None) -> tuple[list[TaskSpec], str | None]:
     """
     调用 LLM 生成任务计划。
 
@@ -62,6 +63,7 @@ async def make_plan(user_request: str) -> tuple[list[TaskSpec], str | None]:
         - 如果有任务：(tasks, None)
         - 如果不需要子 Agent：([], 直接回复文字)
     """
+    log = logger.bind(session_id=session_id) if session_id else logger
     provider = get_provider()
 
     response = await provider.chat(
@@ -75,11 +77,13 @@ async def make_plan(user_request: str) -> tuple[list[TaskSpec], str | None]:
         if isinstance(block, TextBlock):
             raw_text += block.text
 
-    return _parse_plan(raw_text)
+    return _parse_plan(raw_text, log)
 
 
-def _parse_plan(text: str) -> tuple[list[TaskSpec], str | None]:
+def _parse_plan(text: str, log=None) -> tuple[list[TaskSpec], str | None]:
     """解析 LLM 输出的 JSON 任务计划。"""
+    if log is None:
+        log = logger
     # 去掉可能的 Markdown 代码块标记
     cleaned = re.sub(r"```(?:json)?\s*", "", text).strip()
 
@@ -93,7 +97,7 @@ def _parse_plan(text: str) -> tuple[list[TaskSpec], str | None]:
     try:
         plan = json.loads(cleaned[start:end + 1])
     except json.JSONDecodeError as e:
-        print(f"[Planner] JSON 解析失败：{e}\n原始文本：{text[:300]}")
+        log.warning("planner_json_error", error=str(e), raw_text=text[:200])
         return [], text.strip()
 
     tasks_raw = plan.get("tasks", [])

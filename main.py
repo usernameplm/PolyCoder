@@ -12,6 +12,7 @@ main.py — FastAPI Web 服务入口
 
 import json
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -30,6 +31,7 @@ from swarm.code_extractor import extract_python_code
 from swarm.sandbox import resolve_safe_path, PathTraversalError
 
 from agent import ask, ask_stream, clear_session
+from observability.logging import logger
 
 from typing import Any
 
@@ -112,7 +114,7 @@ async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 
         except Exception:
             fail_count += 1
             if fail_count == 1:
-                print("[periodic_save] Redis 不可用，降级为纯内存模式（后续不再重复打印）")
+                logger.warning("periodic_save_redis_unavailable")
             if fail_count >= 3:
                 await asyncio.sleep(60)  # Redis 持续不可用时放慢重试频率
 
@@ -121,9 +123,9 @@ async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 
 async def lifespan(app: FastAPI):
     global _swarm_save_task
 
-    print("服务启动中...")
-    print(f"API 文档地址：http://localhost:8002/docs")
-    print(f"流式测试：curl -N 'http://localhost:8002/ask/stream?question=你好'")
+    logger.info("server_starting")
+    logger.info("api_docs_url", url="http://localhost:8002/docs")
+    logger.info("stream_test_hint", hint="curl -N 'http://localhost:8002/ask/stream?question=你好'")
 
     # 1. 启动时先尝试从 Redis 恢复上次未完成的任务
     await _blackboard.load_from_redis(_redis_client)
@@ -149,7 +151,7 @@ async def lifespan(app: FastAPI):
     _swarm_save_task.cancel()
     await _blackboard.save_to_redis(_redis_client)
     await _redis_client.close()
-    print("服务已关闭。")
+    logger.info("server_shutdown")
 
 
 # ── 创建 FastAPI 实例 ─────────────────────────────────────────────
@@ -190,12 +192,13 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
     响应体：{"text": "回答", "session_id": "...", "usage": {...}, "error": null}
     """
     start = time.time()
-    print(f"[/ask] 收到请求: {req.question[:60]}（session_id={req.session_id}）")
+    log = logger.bind(session_id=req.session_id)
+    log.info("ask_request_received", question=req.question[:60])
 
     try:
         result = await ask(req.question, session_id=req.session_id)
         elapsed_ms = round((time.time() - start) * 1000)
-        print(f"[/ask] 完成，耗时 {elapsed_ms}ms")
+        log.info("ask_request_done", elapsed_ms=elapsed_ms)
         return AskResponse(
             text=result.text,
             session_id=req.session_id,
@@ -207,7 +210,7 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
         )
     except Exception as e:
         elapsed_ms = round((time.time() - start) * 1000)
-        print(f"[/ask] 出错，耗时 {elapsed_ms}ms：{e}")
+        log.error("ask_request_error", elapsed_ms=elapsed_ms, error=str(e))
         return AskResponse(session_id=req.session_id, error=str(e))
 
 
