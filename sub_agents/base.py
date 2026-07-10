@@ -6,8 +6,8 @@ SubAgent 基类。
 run() 方法接收任务描述（字符串），返回处理结果（字符串）。
 """
 from abc import ABC, abstractmethod
-from agent.loop import run_agent_loop
-from agent.executor import ToolExecutor
+from agent_core.loop import run_agent_loop
+from agent_core.executor import ToolExecutor
 from providers.router import get_provider
 from providers.types import Usage
 from tools.registry import ToolRegistry

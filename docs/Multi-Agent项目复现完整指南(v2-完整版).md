@@ -2688,6 +2688,16 @@ from .api import ask, ask_stream, AskResult
 > `agent/loop.py`、`agent/executor.py` 这些底层组件保留，继续被
 > `sub_agents/base.py` 复用；只是不再有 `agent/agent.py` 这层"对外接口"，
 > CLI 和 Web 接口统一走 `coordinator/agent.py`。
+>
+> **再后续更新**：`agent/agent.py` 删除之后，`agent/` 这个包名本身也不太
+> 准确了——里面已经没有任何"Agent"（没有 system prompt、没有对话入口），
+> 纯粹是被 `sub_agents/base.py` 复用的底层执行引擎。于是整个目录改名为
+> `agent_core/`：`agent/loop.py`→`agent_core/loop.py`，
+> `agent/executor.py`→`agent_core/executor.py`，
+> `agent/state.py`→`agent_core/state.py`，
+> `agent/context.py`→`agent_core/context.py`。`sub_agents/base.py` 里
+> `from agent.loop import run_agent_loop` 等导入相应改成
+> `from agent_core.loop import run_agent_loop`。
 
 ---
 
@@ -3721,6 +3731,11 @@ class SubAgent(ABC):
 
         return result.text
 ```
+
+> **后续更新**：`agent/` 包在第 10 章之后改名为 `agent_core/`（见 4.6 更新说明），
+> 上面 `from agent.loop import run_agent_loop`、`from agent.executor import
+> ToolExecutor` 两行导入相应变成 `from agent_core.loop import run_agent_loop`、
+> `from agent_core.executor import ToolExecutor`，其余逻辑不变。
 
 ---
 
@@ -7654,7 +7669,8 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
 > 所以后来把 `cli.py`、`/ask/stream`、`/session/clear` 全部改成调用
 > `coordinator/agent.py` 里的 `CoordinatorAgent`（`run()`/`ask_stream()`），
 > `agent/agent.py` 整个文件删掉，只留 `agent/loop.py`、`agent/executor.py`
-> 这些底层组件继续被 `sub_agents/base.py` 复用。现在无论从哪个入口进来，
+> 这些底层组件继续被 `sub_agents/base.py` 复用（这个包后来又改名为
+> `agent_core/`，见 4.6 更新说明）。现在无论从哪个入口进来，
 > 都是同一套"规划 → 分发 → 聚合"逻辑，行为完全一致。
 
 客户端调用时保持相同的 `session_id`，Agent 就会记住上下文：
@@ -9065,9 +9081,8 @@ my-agent/
 │   ├── openai.py
 │   └── gemini.py
 │
-├── agent/                  ← 阶段 4：Agentic Loop
-│   ├── __init__.py         ← 只做导出（from .api import ...）
-│   ├── api.py              ← 对外接口（ask、ask_stream、AskResult）
+├── agent_core/              ← 阶段 4：Agentic Loop（后期从 agent/ 改名而来，见 4.6 更新说明）
+│   ├── __init__.py
 │   ├── loop.py
 │   ├── state.py
 │   ├── executor.py
@@ -9881,7 +9896,7 @@ A：登录账户后进入「账户设置」→「升级套餐」，支持支付�
 在已有的 Agentic Loop（第 4-5 章实现）里，工具通过 `ToolRegistry` 注册：
 
 ```python
-# 在 main.py 或 agent/ 入口文件里，初始化时注册工具
+# 在 main.py 或 agent_core/ 入口文件里，初始化时注册工具
 
 from tools.weather import WeatherTool
 from tools.knowledge_base import KnowledgeBaseTool
@@ -10390,14 +10405,14 @@ import textwrap
 
 sys.path.insert(0, ".")
 
-from agent.loop import run_agent_loop
+from agent_core.loop import run_agent_loop
 from providers.router import get_provider
 from providers.types import Message, TextBlock
 from tools.builtin.read_file import ReadFileTool
 from tools.builtin.run_python import RunPythonTool
 from tools.builtin.search_code import SearchCodeTool
 from tools.registry import ToolRegistry
-from agent.executor import ToolExecutor
+from agent_core.executor import ToolExecutor
 from core.metrics import SessionMetrics
 
 
@@ -11802,8 +11817,8 @@ tests/
 └── test_agent_e2e.py                  ← Agent 端到端集成测试（调 LLM）
 
 修改文件：
-agent/loop.py    ← 在 LLM 调用和工具执行处埋点，收集 metrics
-agent/agent.py     ← AskResult 新增 metrics 字段
+agent_core/loop.py     ← 在 LLM 调用和工具执行处埋点，收集 metrics
+coordinator/agent.py   ← AskResult 新增 metrics 字段
 pyproject.toml   ← pytest 异步配置
 ```
 
@@ -12056,9 +12071,9 @@ class SessionMetrics:
 
 ---
 
-## 16.5 在 Agentic Loop 中埋点 `agent/loop.py`
+## 16.5 在 Agentic Loop 中埋点 `agent_core/loop.py`
 
-在现有 `agent/loop.py` 的基础上添加 metrics 收集。
+在现有 `agent_core/loop.py` 的基础上添加 metrics 收集。
 这里给出完整的替换版本，便于直接对比：
 
 **修改点 1：顶部添加导入**
@@ -13062,7 +13077,7 @@ if result.metrics:
 □ 运行 pytest tests/test_metrics.py -v，全部通过（不需要 API Key）
 □ 准备了 tests/fixtures/knowledge_base/ 里的两个测试文档
 □ 运行 pytest tests/test_rag.py -v，全部通过
-□ 修改了 agent/loop.py，加入 metrics 埋点
+□ 修改了 agent_core/loop.py，加入 metrics 埋点
 □ 修改了 coordinator/agent.py，AskResult 有 metrics 字段
 □ 运行 pytest tests/test_agent_e2e.py::test_ask_returns_ask_result -v，通过
 □ 运行全部集成测试 pytest tests/ -v，无错误（或仅有预期的 skip）
