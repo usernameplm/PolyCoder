@@ -3,7 +3,7 @@ main.py — FastAPI Web 服务入口
 
 提供两个接口：
   POST /ask        → 完整响应（等待全部内容）
-  GET  /ask/stream → SSE 流式响应（逐 token 实时推送）
+  GET  /ask/stream → SSE 流式响应（按子任务完成顺序推送，均走 Coordinator 架构）
 
 额外接口：
   GET /health      → 健康检查（运维用）
@@ -30,7 +30,7 @@ from persistence.redis_client import create_redis_client
 from swarm.code_extractor import extract_python_code
 from swarm.sandbox import resolve_safe_path, PathTraversalError
 
-from agent import ask, ask_stream, clear_session
+from coordinator.agent import CoordinatorAgent, clear_session
 from observability.logging import logger
 
 from typing import Any
@@ -95,7 +95,11 @@ class ApplyResponse(BaseModel):
 
 # ── 应用生命周期（启动/关闭钩子）────────────────────────────────────
 
-# 全局白板 + Swarm Agent 后台任务（跟 _coordinator 一样，启动时初始化一次）
+# 全局 Coordinator 实例（POST /ask 走这条架构：规划 → 分发 → 聚合）
+_coordinator = CoordinatorAgent()
+
+# 全局白板 + Swarm Agent 后台任务（POST /swarm/ask 走这条架构：发布任务到白板，
+# 由常驻 Swarm Agent 异步认领执行），跟 _coordinator 一样，启动时初始化一次
 _blackboard = Blackboard()
 _swarm_agent_tasks: list[asyncio.Task] = []
 _redis_client = create_redis_client()
@@ -186,7 +190,8 @@ async def health_check():
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(req: AskRequest) -> AskResponse:
     """
-    完整响应接口：调用 Agent 回答问题，支持按 session_id 记忆多轮对话（第 10 章）。
+    完整响应接口：走 Coordinator 架构（规划 → 分发 → 聚合，第 6 章），
+    支持按 session_id 记忆多轮对话（第 10 章，已接入 CoordinatorAgent）。
 
     请求体：{"question": "你的问题", "session_id": "可选，同一会话传相同值"}
     响应体：{"text": "回答", "session_id": "...", "usage": {...}, "error": null}
@@ -196,7 +201,7 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
     log.info("ask_request_received", question=req.question[:60])
 
     try:
-        result = await ask(req.question, session_id=req.session_id)
+        result = await _coordinator.run(req.question, session_id=req.session_id)
         elapsed_ms = round((time.time() - start) * 1000)
         log.info("ask_request_done", elapsed_ms=elapsed_ms)
         return AskResponse(
@@ -205,7 +210,6 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
             usage={
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
-                "turn_count": result.turn_count,
             },
         )
     except Exception as e:
@@ -217,7 +221,10 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
 @app.get("/ask/stream")
 async def ask_stream_endpoint(question: str, session_id: str | None = None):
     """
-    SSE 流式响应接口：逐 token 实时推送，适合前端打字机效果。
+    SSE 流式响应接口：走 Coordinator 架构（跟 /ask 一致，规划→分发→聚合），
+    按子任务完成顺序推送——不需要子 Agent 时整块推送回复，需要多个子 Agent 时
+    哪个先跑完就先推送哪个，不等全部任务聚合完（不是逐 token，规划阶段要拿到
+    完整 JSON 才能解析出任务列表，没法边生成边流）。
 
     URL 参数：?question=你的问题&session_id=可选，同一会话传相同值
     响应：text/event-stream 格式，逐块推送 JSON 数据
@@ -232,7 +239,7 @@ async def ask_stream_endpoint(question: str, session_id: str | None = None):
         每次 yield 一条 SSE 格式的消息（'data: {...}\\n\\n'）。
         """
         try:
-            async for chunk in ask_stream(question, session_id=session_id):
+            async for chunk in _coordinator.ask_stream(question, session_id=session_id):
                 # 把文本片段包装成 SSE 格式
                 data = json.dumps(
                     {"type": "text_delta", "text": chunk},

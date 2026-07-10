@@ -7401,93 +7401,207 @@ async def ask(question: str, session_id: str | None = None) -> AskResult:
     )
 ```
 
-`ask_stream()`（流式接口）原来完全没有记忆能力，跟 `ask()` 相比是个明显的功能缺口——
-同样加一个可选的 `session_id`，逻辑跟 `ask()` 一致（加载历史 → 拼新问题 → 跑 Loop →
-存回历史），区别只是回复文字要靠回调边生成边收集，跑完才知道完整内容、才能写回
-`SessionStore`：
+> **`ask_stream()` / `clear_session()` 不在这里**：早期版本曾经把这两个函数也放在
+> `agent/agent.py`，跟 `ask()` 抄同一套"加载历史 → 拼新问题 → 跑 Loop → 存回历史"逻辑。
+> 后来发现这样会导致 `/ask`（走 Coordinator）和 `/ask/stream`/`/session/clear`
+> （走单 Agent 直接对话）用的是两套不同的会话读写实现，行为容易走偏（比如流式接口
+> 里"审查+修复+写测试"这类复合请求不会被拆成子任务）。所以 `ask_stream()` 和
+> `clear_session()` 挪到了 10.4b 节，跟 `/ask` 用的是同一个 `CoordinatorAgent`。
+> `agent/agent.py` 里只保留 `ask()`（无 Coordinator 规划能力的单 Agent 直接对话，
+> 供 `cli.py` 和基础测试用）。
+
+---
+
+## 10.4b 在 Coordinator 中实现流式与清除会话 `coordinator/agent.py`
+
+`/ask` 走的是 `CoordinatorAgent`（第 6 章），`/ask/stream` 和 `/session/clear` 也应该
+落在同一套架构上，而不是像早期版本那样绕回 `agent/agent.py` 的单 Agent 实现——否则
+"帮我审查这段代码顺便把测试也写一下"这种应该拆成 `code_reviewer → debugger →
+test_writer` 三个任务的请求，走流式接口时会退化成单 Agent 自己硬扛，跟 `/ask` 的
+行为不一致。
+
+**流式的粒度**：Coordinator 内部是"规划一次 LLM 调用 + N 个子 Agent 各一次 LLM 调用"，
+不是像 `agent/agent.py` 那样单次 `run_agent_loop` 天然支持逐 token 回调。规划阶段
+必须拿到完整 JSON 才能解析出任务列表，没法边生成边流式；所以粒度选在**子任务完成
+即推送**，而不是逐 token：
+- 不需要子 Agent（`direct_reply`）：只有一次完整回复，作为一个整块推送
+- 需要拆解成多个子任务：每个子 Agent 跑完就立刻推送它的结果，不用等其他并行任务
+  也跑完（比 `/ask` 等全部任务聚合完才返回更快看到进展）
+
+先给 `dispatch()`（`coordinator/dispatcher.py`）加一个可选的 `on_task_done` 回调，
+在 `_run_one` 里子任务算完就立刻调用——因为多个任务在同一波次里用
+`asyncio.gather` 并发执行，`_run_one` 内部调用回调的时机是"这一个任务完成"，不是
+"整个波次/整个 gather 完成"，所以先跑完的子 Agent 能先被推送出去：
 
 ```python
-# agent/agent.py
+# coordinator/dispatcher.py
+
+async def dispatch(
+    tasks: list[TaskSpec],
+    session_id: str | None = None,
+    on_task_done: Callable[[TaskSpec, str], None] | None = None,
+) -> tuple[dict[str, str], Usage]:
+    ...
+    if runnable:
+        coros = [_run_one(spec, results, log, on_task_done) for spec in runnable]
+        done = await asyncio.gather(*coros, return_exceptions=True)
+    ...
+
+
+async def _run_one(spec, prior_results, log=None, on_task_done=None) -> tuple[str, Usage]:
+    ...
+    text, usage = await agent.run(task=spec.input, context=context or None)
+    if on_task_done:
+        on_task_done(spec, text)
+    return text, usage
+```
+
+`CoordinatorAgent` 新增 `ask_stream()`，用跟 `agent/agent.py` 原来一样的
+"Queue + 回调 + 后台 Task"模式桥接同步回调和异步生成器；`clear_session()` 也搬过来，
+直接复用 `CoordinatorAgent.run()` 已经用的 `_store`：
+
+```python
+# coordinator/agent.py
 
 async def clear_session(session_id: str):
     """清除一个会话的历史（文件 + Redis 缓存），供 FastAPI /session/clear 调用。"""
     await _store.clear(session_id)
 
 
-async def ask_stream(question: str, session_id: str | None = None) -> AsyncGenerator[str, None]:
-    """
-    流式调用，通过 on_text_delta 回调实时传出文本。
+class CoordinatorAgent:
+    ...
 
-    session_id 用法跟 ask() 一致：不传就是无记忆的一次性调用；
-    传入则加载/追加历史，效果与 ask() 相同，只是文本以流式方式返回。
-    """
-    queue: Queue[str | None] = Queue()
-
-    def on_delta(text: str):
-        queue.put_nowait(text)
-
-    async def run_loop():
-        provider = get_provider()
-
-        initial_messages = None
+    async def ask_stream(self, user_request: str, session_id: str | None = None) -> AsyncGenerator[str, None]:
+        """
+        流式版本的 run()：不需要子 Agent 时整块推送回复；需要子 Agent 时按任务完成
+        顺序逐个推送，不等全部任务聚合完。session_id 用法跟 run() 一致。
+        """
+        history = None
         if session_id is not None:
-            history = await _store.load_messages(session_id, max_turns=10)
-            new_user_message = Message(role="user", content=[TextBlock(text=question)])
-            initial_messages = history + [new_user_message]
-            await _store.append_message(session_id, "user", question)
+            history = await self._store.load_messages(session_id, max_turns=10)
+            await self._store.append_message(session_id, "user", user_request)
 
-        text_chunks: list[str] = []
+        tasks, direct_reply, _ = await make_plan(user_request, session_id=session_id, history=history)
 
-        def on_delta_and_collect(text: str):
-            text_chunks.append(text)
-            on_delta(text)
+        queue: Queue[str | None] = Queue()
+        collected: list[str] = []
 
-        await run_agent_loop(
-            prompt=question,
-            provider=provider,
-            system=SYSTEM_PROMPT,
-            tools=_registry.get_all_definitions(),
-            executor=_executor,
-            max_turns=10,
-            on_text_delta=on_delta_and_collect,
-            initial_messages=initial_messages,
-        )
+        def emit(text: str):
+            collected.append(text)
+            queue.put_nowait(text)
 
-        if session_id is not None:
-            await _store.append_message(session_id, "assistant", "".join(text_chunks))
+        async def run_loop():
+            if direct_reply is not None:
+                emit(direct_reply)
+            elif tasks:
+                def on_task_done(spec, text):
+                    emit(f"**[{spec.agent}]**\n{text}\n\n---\n\n")
+                await dispatch(tasks, session_id=session_id, on_task_done=on_task_done)
+            else:
+                emit("无法理解请求，请提供更多信息。")
 
-        queue.put_nowait(None)
+            if session_id is not None:
+                await self._store.append_message(session_id, "assistant", "".join(collected))
+            queue.put_nowait(None)
 
-    loop_task = asyncio.create_task(run_loop())
+        loop_task = asyncio.create_task(run_loop())
 
-    while True:
-        chunk = await queue.get()
-        if chunk is None:
-            break
-        yield chunk
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            yield chunk
 
-    await loop_task
+        await loop_task
 ```
 
-`agent/__init__.py` 补上新增的 `clear_session` 导出：
-
-```python
-# agent/__init__.py
-from .agent import ask, ask_stream, clear_session, AskResult
-```
+> **为什么用 `Queue` 桥接，不直接 `async for` 子 Agent 的结果？** `dispatch()` 内部
+> 是并发跑多个任务（`asyncio.gather`），跑完的顺序和 `tasks` 列表顺序不一定一致，
+> 也没有现成的"边跑边产出"的异步迭代器接口。用 `Queue` 是第 2 章 `ask_stream()` 就用
+> 过的模式——启动一个后台 `Task` 去跑真正的逻辑，通过回调把结果 `put` 进队列，
+> 主协程只管 `await queue.get()` 消费，两边通过队列解耦，不用改 `dispatch()` 的
+> 并发结构。
 
 ---
 
 ## 10.5 在 FastAPI 接口中传入 session_id
 
-`main.py` 里的 `/ask` 目前还是走第 4 章留下的 `CoordinatorAgent`（规划 → 分发 → 聚合），
-跟这一章的 `ask()`/`SessionStore` 是两条不相关的链路，加 `session_id` 也不会有记忆效果。
-这里把 `/ask` 切回直接调用 `ask()`，`_coordinator` 也一并删掉（没有其它地方在用）：
+`main.py` 里的 `/ask` 按 7.1.1 节定下的分工继续走 `CoordinatorAgent`（规划 → 分发 →
+聚合），不切回单 Agent 直接调用——`/swarm/ask` 才是"提交任务、内部另一套编排"的入口，
+两者的分界是"编排方式不同"，不是"要不要记忆"。要让 `/ask` 也有记忆，正确做法是给
+`CoordinatorAgent` 本身加上 `session_id`，而不是绕开它退回没有规划/分发能力的
+`ask()`。
+
+> **踩过的坑**：早期一版实现图省事，直接把 `/ask` 改成调用 `agent/agent.py` 的
+> `ask()`（第 4/5 章留下的单 Agent 直接对话实现），因为 `SessionStore` 先接在了那里、
+> 改起来最快。这样虽然让 `/ask` 有了记忆，但代价是丢掉了规划/分发能力——原本一句
+> "审查这段代码顺便把测试也写一下"会被 Coordinator 拆成
+> `code_reviewer → debugger → test_writer` 三个任务串行执行，改完之后就变成单个
+> Agent 自己硬扛，行为和文档描述的不一致。教训是：**给一条链路加新能力时，加到它
+> 该在的那一层（这里是 Coordinator），不要因为另一层实现起来更省事就把调用方悄悄
+> 切过去**。
+
+`CoordinatorAgent.run()` 加一个可选的 `session_id` 参数，内部直接复用 10.3 节的
+`SessionStore`——调用前加载历史（喂给 `make_plan`，让规划器理解"这个""那个文件"这类
+指代），调用后把最终聚合结果写回历史：
+
+```python
+# coordinator/agent.py
+
+from persistence.session_store import SessionStore
+from persistence.redis_client import create_redis_client
+
+_store = SessionStore(base_dir="sessions/", redis_client=create_redis_client())
+
+
+class CoordinatorAgent:
+    async def run(self, user_request: str, session_id: str | None = None) -> AskResult:
+        history = None
+        if session_id is not None:
+            history = await _store.load_messages(session_id, max_turns=10)
+            await _store.append_message(session_id, "user", user_request)
+
+        # 把历史传给规划器，理解上下文里的指代
+        tasks, direct_reply, plan_usage = await make_plan(
+            user_request, session_id=session_id, history=history,
+        )
+        ...
+        # 聚合出 text 之后
+        if session_id is not None:
+            await _store.append_message(session_id, "assistant", text)
+
+        return AskResult(text=text, input_tokens=..., output_tokens=...)
+```
+
+`make_plan()` 也要能接收历史（`coordinator/planner.py`），把历史消息拼进发给 LLM 的
+`messages` 列表里：
+
+```python
+# coordinator/planner.py
+
+async def make_plan(user_request, session_id=None, history=None):
+    messages = list(history) if history else []
+    messages.append(Message(role="user", content=[TextBlock(text=user_request)]))
+    response = await provider.chat(messages=messages, system=_COORDINATOR_SYSTEM, max_tokens=2048)
+    ...
+    return tasks, direct_reply, response.usage   # usage 一起带出来，给 /ask 算 Token 用量
+```
+
+> **usage 从哪来？** Coordinator 一次 `/ask` 背后可能是多次 LLM 调用（规划一次 + 每个
+> 子 Agent 各一次），跟 `agent/agent.py` 里单 Agent 一次调用就有 `total_usage` 不一样，
+> 需要 `coordinator/dispatcher.py` 的 `dispatch()` 把各子 Agent（`sub_agents/base.py`
+> 的 `run()` 现在返回 `(文字, usage)` 而不是纯文字）的用量也汇总一遍，连同规划阶段的
+> 用量一起加总，才能给 `/ask` 返回完整的 `usage.input_tokens` / `output_tokens`。
+
+`main.py` 里 `/ask` 的写法不变，还是调用一个全局单例，只是这个单例现在是
+`CoordinatorAgent`：
 
 ```python
 # main.py
 
-from agent import ask, ask_stream   # 不再需要 CoordinatorAgent
+from coordinator.agent import CoordinatorAgent
+
+_coordinator = CoordinatorAgent()   # 全局单例，启动时初始化一次
 
 
 class AskRequest(BaseModel):
@@ -7510,19 +7624,24 @@ class AskResponse(BaseModel):
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(req: AskRequest) -> AskResponse:
     try:
-        result = await ask(req.question, session_id=req.session_id)
+        result = await _coordinator.run(req.question, session_id=req.session_id)
         return AskResponse(
             text=result.text,
             session_id=req.session_id,
             usage={
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
-                "turn_count": result.turn_count,
             },
         )
     except Exception as e:
         return AskResponse(session_id=req.session_id, error=str(e))
 ```
+
+`agent/agent.py` 的 `ask()`/`ask_stream()` 并没有被删掉——它们仍然是"不经过 Coordinator
+规划、单 Agent 直接对话"的能力，继续给 `cli.py` 和下面的 `/ask/stream`（流式接口，
+Coordinator 目前不支持逐 token 流式输出）用。两套实现各自独立演化，`/ask` 用
+Coordinator、`/ask/stream` 用单 Agent 直接对话，是两条有意保留的不同路径，不是
+遗留的不一致。
 
 客户端调用时保持相同的 `session_id`，Agent 就会记住上下文：
 

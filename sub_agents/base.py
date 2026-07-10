@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from agent.loop import run_agent_loop
 from agent.executor import ToolExecutor
 from providers.router import get_provider
+from providers.types import Usage
 from tools.registry import ToolRegistry
 from skills.enhancer import enhance_system_prompt
 from observability.logging import logger
@@ -40,7 +41,7 @@ class SubAgent(ABC):
         """子 Agent 可用的工具列表（默认无工具，子类按需覆盖）。"""
         return []
 
-    async def run(self, task: str, context: dict | None = None, session_id: str | None = None) -> str:
+    async def run(self, task: str, context: dict | None = None, session_id: str | None = None) -> tuple[str, Usage]:
         """
         执行任务。
 
@@ -50,7 +51,8 @@ class SubAgent(ABC):
             session_id - 会话标识（用于日志追踪）
 
         返回：
-            任务结果（字符串）
+            (任务结果文字, 本次调用的 Token 用量) —— Coordinator 需要汇总各子 Agent
+            的用量才能给 /ask 返回完整的 usage 统计（第 10 章记忆功能引入的需求）。
         """
         log = logger.bind(agent=self.name, session_id=session_id) if session_id else logger.bind(agent=self.name)
         log.info("sub_agent_start", task=task[:80])
@@ -88,4 +90,4 @@ class SubAgent(ABC):
         )
 
         log.info("sub_agent_done", result_chars=len(result.text))
-        return result.text
+        return result.text, result.total_usage
