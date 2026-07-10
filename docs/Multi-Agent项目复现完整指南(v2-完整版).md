@@ -5229,7 +5229,7 @@ pip install "redis>=5.0.0"
 `redis_client`」——这一节把这句注释真正落成代码。新建一个小文件专门负责"连接"这一件事：
 
 ```python
-# swarm/redis_client.py
+# persistence/redis_client.py
 """
 创建 Redis 异步客户端。所有需要用 Redis 的模块（Blackboard、SessionStore）
 都从这里拿同一个客户端实例，不要各自建各自的连接。
@@ -5324,7 +5324,7 @@ async def load_from_redis(self, redis_client):
 
 ```python
 # main.py 顶部新增 import
-from swarm.redis_client import create_redis_client
+from persistence.redis_client import create_redis_client
 
 
 async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 5.0):
@@ -7355,10 +7355,10 @@ async def run_agent_loop(
 
 from providers.types import Message, TextBlock
 from persistence.session_store import SessionStore
-from swarm.redis_client import create_redis_client
+from persistence.redis_client import create_redis_client
 
 # 会话存储：JSONL 落盘 + Redis 缓存最近历史。
-# redis_client 复用 swarm/redis_client.py 里的同一套连接配置（Blackboard 也是这么接的），
+# redis_client 复用 persistence/redis_client.py 里的同一套连接配置（Blackboard 也是这么接的），
 # 不要各自硬编码 host/port。
 _store = SessionStore(base_dir="sessions/", redis_client=create_redis_client())
 

@@ -1,4 +1,4 @@
-# swarm/redis_client.py
+# persistence/redis_client.py
 """
 创建 Redis 异步客户端。所有需要用 Redis 的模块（Blackboard、SessionStore）
 都从这里拿同一个客户端实例，不要各自建各自的连接。

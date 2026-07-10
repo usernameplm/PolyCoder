@@ -25,7 +25,7 @@ from swarm.reviewer_agent import ReviewerSwarmAgent
 from swarm.debugger_agent import DebuggerSwarmAgent
 from swarm.test_writer_agent import TestWriterSwarmAgent
 from swarm.task_types import TaskType
-from swarm.redis_client import create_redis_client
+from persistence.redis_client import create_redis_client
 from swarm.code_extractor import extract_python_code
 from swarm.sandbox import resolve_safe_path, PathTraversalError
 

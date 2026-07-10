@@ -14,7 +14,7 @@ from tools.builtin.search_code import SearchCodeTool
 from tools.builtin.list_dir import ListDirTool
 from tools.builtin.write_file import WriteFileTool
 from persistence.session_store import SessionStore
-from swarm.redis_client import create_redis_client
+from persistence.redis_client import create_redis_client
 
 SYSTEM_PROMPT = """
 你是一个专业的 Coding Agent，帮助用户完成代码相关任务。
