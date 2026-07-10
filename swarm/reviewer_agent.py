@@ -9,6 +9,7 @@ import asyncio
 from .blackboard import Blackboard
 from .agent_base import SwarmAgent
 from .task_types import TASK_TYPE_CODE_REVIEW, TASK_TYPE_DEBUG
+from observability.logging import logger
 
 
 class ReviewerSwarmAgent(SwarmAgent):
@@ -37,7 +38,7 @@ class ReviewerSwarmAgent(SwarmAgent):
         filename = payload.get("file", "unknown.py")
         focus = payload.get("focus", "全面审查")
 
-        print(f"[{self.agent_id}] 开始审查：{filename}")
+        logger.info("reviewer_agent_started_review", agent_id=self.agent_id, file=filename)
 
         # 调用 LLM 执行审查
         from providers.router import get_provider
@@ -76,6 +77,10 @@ class ReviewerSwarmAgent(SwarmAgent):
                     "origin_task": task.id,
                 }
             )
-            print(f"[{self.agent_id}] 发现 Critical 问题，已发布 debug 任务 {debug_task_id}")
+            logger.info(
+                "reviewer_agent_critical_found",
+                agent_id=self.agent_id,
+                debug_task_id=debug_task_id,
+            )
 
         return result

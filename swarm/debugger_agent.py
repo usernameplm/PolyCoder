@@ -6,6 +6,7 @@ Swarm 模式下的调试修复 Agent。
 from .blackboard import Blackboard
 from .agent_base import SwarmAgent
 from .task_types import TASK_TYPE_DEBUG, TASK_TYPE_TEST_WRITE
+from observability.logging import logger
 
 
 class DebuggerSwarmAgent(SwarmAgent):
@@ -63,5 +64,9 @@ class DebuggerSwarmAgent(SwarmAgent):
                 "origin_task": task.id,
             }
         )
-        print(f"[{self.agent_id}] 修复完成，已发布 test_write 任务 {test_write_task_id}")
+        logger.info(
+            "debugger_agent_fix_completed",
+            agent_id=self.agent_id,
+            test_write_task_id=test_write_task_id,
+        )
         return result

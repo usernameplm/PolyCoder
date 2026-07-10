@@ -7,6 +7,7 @@ review → debug → test_write。
 from .blackboard import Blackboard
 from .agent_base import SwarmAgent
 from .task_types import TASK_TYPE_TEST_WRITE
+from observability.logging import logger
 
 
 class TestWriterSwarmAgent(SwarmAgent):
@@ -33,7 +34,7 @@ class TestWriterSwarmAgent(SwarmAgent):
         code = payload.get("code", "")
         filename = payload.get("file", "unknown.py")
 
-        print(f"[{self.agent_id}] 开始为 {filename} 生成测试")
+        logger.info("test_writer_agent_started", agent_id=self.agent_id, file=filename)
 
         from providers.router import get_provider
         from providers.types import Message, TextBlock
@@ -75,5 +76,5 @@ import pytest
             if hasattr(block, "text"):
                 result += block.text
 
-        print(f"[{self.agent_id}] 测试生成完成")
+        logger.info("test_writer_agent_completed", agent_id=self.agent_id)
         return result

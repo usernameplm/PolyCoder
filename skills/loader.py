@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from dataclasses import dataclass
 
+from observability.logging import logger
+
 
 @dataclass
 class Skill:
@@ -30,9 +32,9 @@ def load_skills(skills_dir: str = "skills/") -> list[Skill]:
             if skill:
                 skills.append(skill)
         except Exception as e:
-            print(f"[Skills] 加载 {path.name} 失败：{e}")
+            logger.warning("skill_load_failed", file=path.name, error=str(e))
 
-    print(f"[Skills] 已加载 {len(skills)} 个 Skill")
+    logger.info("skills_loaded", count=len(skills))
     return skills
 
 

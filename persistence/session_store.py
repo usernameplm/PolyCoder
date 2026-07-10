@@ -18,6 +18,7 @@ import asyncio
 from pathlib import Path
 import aiofiles
 from providers.types import Message, TextBlock
+from observability.logging import logger
 
 # Redis List 里最多缓存多少轮对话（每轮 = user + assistant，即 2 条记录）
 # 请求的 max_turns 超过这个窗口时，缓存肯定不完整，直接退回读文件。
@@ -84,7 +85,7 @@ class SessionStore:
                 await self.redis.ltrim(cache_key, -CACHE_MAX_RECORDS, -1)
                 await self.redis.expire(cache_key, CACHE_TTL_SECONDS)
             except Exception as e:
-                print(f"[SessionStore] Redis 缓存更新失败（降级到纯文件模式）：{e}")
+                logger.warning("session_store_redis_write_failed", session_id=session_id, error=str(e))
 
     async def load_messages(self, session_id: str, max_turns: int = 20) -> list[Message]:
         """
@@ -110,7 +111,7 @@ class SessionStore:
                 if cached_lines:
                     raw_messages = [json.loads(line) for line in cached_lines]
             except Exception as e:
-                print(f"[SessionStore] Redis 缓存读取失败（降级到读文件）：{e}")
+                logger.warning("session_store_redis_read_failed", session_id=session_id, error=str(e))
 
         # 2. 缓存未命中：读 JSONL 文件（唯一保真的数据源）
         if raw_messages is None:
@@ -126,7 +127,7 @@ class SessionStore:
                         await self.redis.rpush(cache_key, *lines)
                         await self.redis.expire(cache_key, CACHE_TTL_SECONDS)
                 except Exception as e:
-                    print(f"[SessionStore] Redis 缓存回填失败（不影响本次返回结果）：{e}")
+                    logger.warning("session_store_redis_backfill_failed", session_id=session_id, error=str(e))
 
         # 3. 修补"孤儿 user 消息"：如果上一次调用在写完 user、还没写 assistant
         #    时中途崩溃（比如 LLM 调用抛异常），文件/缓存会以一条没人回答的
@@ -173,7 +174,7 @@ class SessionStore:
                     except json.JSONDecodeError:
                         continue   # 跳过损坏的行
         except Exception as e:
-            print(f"[SessionStore] 读取会话文件失败：{e}")
+            logger.error("session_store_file_read_failed", session_id=session_id, error=str(e))
             return []
 
         return raw_messages
@@ -190,4 +191,4 @@ class SessionStore:
             except Exception:
                 pass
 
-        print(f"[SessionStore] 已清除会话：{session_id}")
+        logger.info("session_store_cleared", session_id=session_id)

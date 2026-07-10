@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from observability.logging import logger
+
 
 @dataclass
 class Task:
@@ -77,7 +79,7 @@ class Blackboard:
         self._new_task_event.set()
         self._new_task_event.clear()
 
-        print(f"[Blackboard] 新任务 {task_id}（类型：{task_type}）")
+        logger.info("blackboard_task_posted", task_id=task_id, task_type=task_type)
         return task_id
 
     async def claim(self, task_type: str, agent_id: str) -> Task | None:
@@ -104,7 +106,7 @@ class Blackboard:
             if task_id in self._tasks:
                 self._tasks[task_id].status = "done"
                 self._tasks[task_id].result = result
-                print(f"[Blackboard] 任务 {task_id} 完成")
+                logger.info("blackboard_task_completed", task_id=task_id)
 
     async def fail(self, task_id: str, error: str):
         """标记任务为失败并记录错误。"""
@@ -112,7 +114,7 @@ class Blackboard:
             if task_id in self._tasks:
                 self._tasks[task_id].status = "failed"
                 self._tasks[task_id].error = error
-                print(f"[Blackboard] 任务 {task_id} 失败：{error}")
+                logger.warning("blackboard_task_failed", task_id=task_id, error=error)
 
     async def wait_for_task(self, timeout: float = 5.0):
         """等待新任务到来（供 Agent 的轮询循环使用）。"""
@@ -137,8 +139,11 @@ class Blackboard:
             if parent is not None:
                 parent.derived_task_ids.append(child_id)
             else:
-                print(f"[Blackboard] post_derived: 父任务 {parent_task_id} 不存在，"
-                      f"子任务 {child_id} 仍正常发布，但不会出现在任何 derived_task_ids 里")
+                logger.warning(
+                    "blackboard_post_derived_parent_missing",
+                    parent_task_id=parent_task_id,
+                    child_id=child_id,
+                )
 
         return child_id
 
@@ -166,18 +171,18 @@ class Blackboard:
                 tasks_data = {tid: dataclasses.asdict(t) for tid, t in self._tasks.items()}
             await redis_client.set("blackboard:tasks", json.dumps(tasks_data))
         except Exception as e:
-            print(f"[Blackboard] 保存到 Redis 失败（降级为纯内存模式）：{e}")
+            logger.warning("blackboard_redis_save_failed", error=str(e))
 
     async def load_from_redis(self, redis_client):
         """从 Redis 恢复白板状态（进程启动时调用一次）。"""
         try:
             data = await redis_client.get("blackboard:tasks")
         except Exception as e:
-            print(f"[Blackboard] 连接 Redis 失败，跳过恢复，从空白板启动：{e}")
+            logger.warning("blackboard_redis_connect_failed", error=str(e))
             return
 
         if not data:
-            print("[Blackboard] Redis 里没有历史任务数据，从空白板启动")
+            logger.info("blackboard_redis_empty")
             return
 
         tasks_data = json.loads(data)
@@ -187,4 +192,4 @@ class Blackboard:
                     t_dict["status"] = "pending"
                     t_dict["owner"] = None
                     self._tasks[tid] = Task(**t_dict)
-        print(f"[Blackboard] 从 Redis 恢复了 {len(self._tasks)} 个未完成任务")
+        logger.info("blackboard_redis_restored", task_count=len(self._tasks))
