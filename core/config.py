@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     llm_model: str = "claude-sonnet-4-6"
     app_port: int = 8002
 
+    # 可观测性：OpenTelemetry 链路追踪导出地址（Jaeger/Tempo 等），不填则不导出
+    otel_exporter_otlp_endpoint: str = ""
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

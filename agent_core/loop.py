@@ -21,6 +21,7 @@ from .state import LoopState
 from .executor import ToolExecutor
 from .context import should_compress, compress_messages
 from observability.logging import logger
+from observability.tracing import tracer
 
 
 # ── 终止原因常量 ───────────────────────────────────────────────────────────────
@@ -78,157 +79,168 @@ async def run_agent_loop(
     state = LoopState(messages=tuple(starting_messages))
 
     # ── 主循环 ─────────────────────────────────────────────────────────────────
-    while True:
+    with tracer.start_as_current_span("agent_loop") as loop_span:
+        loop_span.set_attribute("session_id", session_id or "")
+        loop_span.set_attribute("provider", provider.model_name)
 
-        # [检查] 上下文压缩：Token 超限时自动压缩早期历史
-        current_messages = list(state.messages)
-        if should_compress(current_messages):
-            current_messages = await compress_messages(current_messages, provider)
-            state = LoopState(
-                messages=tuple(current_messages),
-                turn_count=state.turn_count,
-                total_usage=state.total_usage,
-                last_transition="compressed",
-            )
+        while True:
 
-        # [检查] 轮次限制
-        if state.turn_count >= max_turns:
-            log.warning(
-                "agent_loop_max_turns",
-                turn=state.turn_count,
-                max_turns=max_turns,
-                reason=STOP_MAX_TURNS,
-            )
-            return LoopResult(
-                text=f"（已达最大轮次限制 {max_turns}，任务可能未完成）",
-                total_usage=state.total_usage,
-                turn_count=state.turn_count,
-                stop_reason=STOP_MAX_TURNS,
-            )
+            # [检查] 上下文压缩：Token 超限时自动压缩早期历史
+            current_messages = list(state.messages)
+            if should_compress(current_messages):
+                current_messages = await compress_messages(current_messages, provider)
+                state = LoopState(
+                    messages=tuple(current_messages),
+                    turn_count=state.turn_count,
+                    total_usage=state.total_usage,
+                    last_transition="compressed",
+                )
 
-        # [执行] 调用 LLM，收集本轮输出
-        text_chunks: list[str] = []
-        tool_calls: list[ToolUseBlock] = []
-        turn_usage = Usage()
+            # [检查] 轮次限制
+            if state.turn_count >= max_turns:
+                log.warning(
+                    "agent_loop_max_turns",
+                    turn=state.turn_count,
+                    max_turns=max_turns,
+                    reason=STOP_MAX_TURNS,
+                )
+                return LoopResult(
+                    text=f"（已达最大轮次限制 {max_turns}，任务可能未完成）",
+                    total_usage=state.total_usage,
+                    turn_count=state.turn_count,
+                    stop_reason=STOP_MAX_TURNS,
+                )
 
-        if on_text_delta:
-            # 流式模式：边生成边通过回调传出文本
-            pending_tool_inputs: dict[str, str] = {}   # tool_id → 累积的 JSON 字符串
-            pending_tool_names: dict[str, str] = {}    # tool_id → tool_name
+            # [执行] 调用 LLM，收集本轮输出
+            text_chunks: list[str] = []
+            tool_calls: list[ToolUseBlock] = []
+            turn_usage = Usage()
 
-            async for chunk in provider.stream(
-                messages=list(state.messages),
-                system=system,
-                tools=tools or None,
-                max_tokens=max_tokens,
-            ):
-                from providers.types import ToolUseStart, ToolInputDelta
+            with tracer.start_as_current_span(f"turn_{state.turn_count}") as turn_span:
+                if on_text_delta:
+                    # 流式模式：边生成边通过回调传出文本
+                    pending_tool_inputs: dict[str, str] = {}   # tool_id → 累积的 JSON 字符串
+                    pending_tool_names: dict[str, str] = {}    # tool_id → tool_name
 
-                if isinstance(chunk, TextDelta):
-                    text_chunks.append(chunk.text)
-                    on_text_delta(chunk.text)
+                    async for chunk in provider.stream(
+                        messages=list(state.messages),
+                        system=system,
+                        tools=tools or None,
+                        max_tokens=max_tokens,
+                    ):
+                        from providers.types import ToolUseStart, ToolInputDelta
 
-                elif isinstance(chunk, ToolUseStart):
-                    pending_tool_names[chunk.tool_id] = chunk.tool_name
+                        if isinstance(chunk, TextDelta):
+                            text_chunks.append(chunk.text)
+                            on_text_delta(chunk.text)
 
-                elif isinstance(chunk, ToolInputDelta):
-                    pending_tool_inputs.setdefault(chunk.tool_id, "")
-                    pending_tool_inputs[chunk.tool_id] += chunk.partial_json
+                        elif isinstance(chunk, ToolUseStart):
+                            pending_tool_names[chunk.tool_id] = chunk.tool_name
 
-                elif isinstance(chunk, MessageStop):
-                    turn_usage = chunk.usage
+                        elif isinstance(chunk, ToolInputDelta):
+                            pending_tool_inputs.setdefault(chunk.tool_id, "")
+                            pending_tool_inputs[chunk.tool_id] += chunk.partial_json
 
-            # 流结束后，从累积的 JSON 重建 ToolUseBlock
-            import json
-            for tool_id, json_str in pending_tool_inputs.items():
-                try:
-                    tool_calls.append(ToolUseBlock(
-                        id=tool_id,
-                        name=pending_tool_names.get(tool_id, "unknown"),
-                        input=json.loads(json_str),
-                    ))
-                except json.JSONDecodeError:
-                    pass
+                        elif isinstance(chunk, MessageStop):
+                            turn_usage = chunk.usage
 
-        else:
-            # 非流式模式：等待完整响应
-            response = await provider.chat(
-                messages=list(state.messages),
-                system=system,
-                tools=tools or None,
-                max_tokens=max_tokens,
-            )
+                    # 流结束后，从累积的 JSON 重建 ToolUseBlock
+                    import json
+                    for tool_id, json_str in pending_tool_inputs.items():
+                        try:
+                            tool_calls.append(ToolUseBlock(
+                                id=tool_id,
+                                name=pending_tool_names.get(tool_id, "unknown"),
+                                input=json.loads(json_str),
+                            ))
+                        except json.JSONDecodeError:
+                            pass
 
-            for block in response.content:
-                if isinstance(block, TextBlock):
-                    text_chunks.append(block.text)
-                elif isinstance(block, ToolUseBlock):
-                    tool_calls.append(block)
+                else:
+                    # 非流式模式：等待完整响应
+                    response = await provider.chat(
+                        messages=list(state.messages),
+                        system=system,
+                        tools=tools or None,
+                        max_tokens=max_tokens,
+                    )
 
-            turn_usage = response.usage
+                    for block in response.content:
+                        if isinstance(block, TextBlock):
+                            text_chunks.append(block.text)
+                        elif isinstance(block, ToolUseBlock):
+                            tool_calls.append(block)
 
-        # 累积 Token 用量
-        state = state.next_turn("processing", turn_usage)
+                    turn_usage = response.usage
 
-        # [判断] 是否有工具调用
-        if not tool_calls:
-            # 没有工具调用 → LLM 给出了最终答案，Loop 结束
+                turn_span.set_attribute("input_tokens", turn_usage.input_tokens)
+                turn_span.set_attribute("output_tokens", turn_usage.output_tokens)
+                turn_span.set_attribute("tool_calls", [tc.name for tc in tool_calls])
+
+            # 累积 Token 用量
+            state = state.next_turn("processing", turn_usage)
+
+            # [判断] 是否有工具调用
+            if not tool_calls:
+                # 没有工具调用 → LLM 给出了最终答案，Loop 结束
+                log.info(
+                    "agent_loop_complete",
+                    turn=state.turn_count,
+                    total_input_tokens=state.total_usage.input_tokens,
+                    total_output_tokens=state.total_usage.output_tokens,
+                    stop_reason=STOP_COMPLETED,
+                )
+                return LoopResult(
+                    text="".join(text_chunks),
+                    total_usage=state.total_usage,
+                    turn_count=state.turn_count,
+                    stop_reason=STOP_COMPLETED,
+                )
+
+            # [执行] 并行执行所有工具
+            if executor is None:
+                log.error("agent_loop_no_executor", turn=state.turn_count)
+                return LoopResult(
+                    text="（错误：Agent 决定使用工具，但未配置 ToolExecutor）",
+                    total_usage=state.total_usage,
+                    turn_count=state.turn_count,
+                    stop_reason=STOP_ABORTED,
+                )
+
             log.info(
-                "agent_loop_complete",
+                "agent_loop_turn",
                 turn=state.turn_count,
-                total_input_tokens=state.total_usage.input_tokens,
-                total_output_tokens=state.total_usage.output_tokens,
-                stop_reason=STOP_COMPLETED,
+                provider=provider.model_name,
+                input_tokens=turn_usage.input_tokens,
+                output_tokens=turn_usage.output_tokens,
+                tool_calls=[tc.name for tc in tool_calls],
+                stop_reason="tool_use",
             )
-            return LoopResult(
-                text="".join(text_chunks),
-                total_usage=state.total_usage,
+            # 工具并行执行（ToolExecutor 内部用 asyncio.gather），
+            # 每个工具调用的 Span 在 executor._execute_one 里创建，见该文件
+            tool_results = await executor.execute_all(tool_calls)
+
+            # [构建] 下一轮的消息历史
+            # 协议要求：
+            #   1. 把本轮的 assistant 回复（包含 ToolUseBlock）加入历史
+            #   2. 把工具结果（ToolResultBlock）作为 user 消息加入历史
+            new_messages = list(state.messages)
+
+            # assistant 消息：本轮文字 + 工具调用决策
+            assistant_content: list[ContentBlock] = []
+            if text_chunks:
+                assistant_content.append(TextBlock(text="".join(text_chunks)))
+            assistant_content.extend(tool_calls)
+            new_messages.append(Message(role="assistant", content=assistant_content))
+
+            # user 消息：工具执行结果
+            new_messages.append(Message(role="user", content=tool_results))
+
+            # [更新] 状态，进入下一轮
+            state = LoopState(
+                messages=tuple(new_messages),
                 turn_count=state.turn_count,
-                stop_reason=STOP_COMPLETED,
-            )
-
-        # [执行] 并行执行所有工具
-        if executor is None:
-            log.error("agent_loop_no_executor", turn=state.turn_count)
-            return LoopResult(
-                text="（错误：Agent 决定使用工具，但未配置 ToolExecutor）",
                 total_usage=state.total_usage,
-                turn_count=state.turn_count,
-                stop_reason=STOP_ABORTED,
+                last_transition="tool_use",
             )
-
-        log.info(
-            "agent_loop_turn",
-            turn=state.turn_count,
-            provider=provider.model_name,
-            input_tokens=turn_usage.input_tokens,
-            output_tokens=turn_usage.output_tokens,
-            tool_calls=[tc.name for tc in tool_calls],
-            stop_reason="tool_use",
-        )
-        tool_results = await executor.execute_all(tool_calls)
-
-        # [构建] 下一轮的消息历史
-        # 协议要求：
-        #   1. 把本轮的 assistant 回复（包含 ToolUseBlock）加入历史
-        #   2. 把工具结果（ToolResultBlock）作为 user 消息加入历史
-        new_messages = list(state.messages)
-
-        # assistant 消息：本轮文字 + 工具调用决策
-        assistant_content: list[ContentBlock] = []
-        if text_chunks:
-            assistant_content.append(TextBlock(text="".join(text_chunks)))
-        assistant_content.extend(tool_calls)
-        new_messages.append(Message(role="assistant", content=assistant_content))
-
-        # user 消息：工具执行结果
-        new_messages.append(Message(role="user", content=tool_results))
-
-        # [更新] 状态，进入下一轮
-        state = LoopState(
-            messages=tuple(new_messages),
-            turn_count=state.turn_count,
-            total_usage=state.total_usage,
-            last_transition="tool_use",
-        )
-        # → 继续 while True
+            # → 继续 while True

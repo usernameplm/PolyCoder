@@ -10,6 +10,7 @@ ToolExecutor 用 asyncio.gather() 并行执行，比串行快很多。
 """
 import asyncio
 from providers.types import ToolUseBlock, ToolResultBlock
+from observability.tracing import tracer
 
 
 class ToolExecutor:
@@ -36,32 +37,38 @@ class ToolExecutor:
     async def _execute_one(self, tool_call: ToolUseBlock) -> ToolResultBlock:
         """执行单个工具调用，捕获所有异常，包装成 ToolResultBlock。"""
 
-        if self.registry is None:
-            return ToolResultBlock(
-                tool_use_id=tool_call.id,
-                content="错误：未配置工具注册表（ToolRegistry）",
-                is_error=True,
-            )
+        with tracer.start_as_current_span(f"tool_{tool_call.name}") as tool_span:
+            tool_span.set_attribute("tool.name", tool_call.name)
 
-        tool = self.registry.get(tool_call.name)
+            if self.registry is None:
+                tool_span.set_attribute("tool.error", "no_registry")
+                return ToolResultBlock(
+                    tool_use_id=tool_call.id,
+                    content="错误：未配置工具注册表（ToolRegistry）",
+                    is_error=True,
+                )
 
-        if tool is None:
-            return ToolResultBlock(
-                tool_use_id=tool_call.id,
-                content=f"错误：工具 '{tool_call.name}' 未注册。已注册的工具：{self.registry.list_names()}",
-                is_error=True,
-            )
+            tool = self.registry.get(tool_call.name)
 
-        try:
-            result = await tool.execute(tool_call.input)
-            return ToolResultBlock(
-                tool_use_id=tool_call.id,
-                content=str(result),
-                is_error=False,
-            )
-        except Exception as e:
-            return ToolResultBlock(
-                tool_use_id=tool_call.id,
-                content=f"工具执行失败（{tool_call.name}）: {type(e).__name__}: {e}",
-                is_error=True,
-            )
+            if tool is None:
+                tool_span.set_attribute("tool.error", "not_registered")
+                return ToolResultBlock(
+                    tool_use_id=tool_call.id,
+                    content=f"错误：工具 '{tool_call.name}' 未注册。已注册的工具：{self.registry.list_names()}",
+                    is_error=True,
+                )
+
+            try:
+                result = await tool.execute(tool_call.input)
+                return ToolResultBlock(
+                    tool_use_id=tool_call.id,
+                    content=str(result),
+                    is_error=False,
+                )
+            except Exception as e:
+                tool_span.set_attribute("tool.error", type(e).__name__)
+                return ToolResultBlock(
+                    tool_use_id=tool_call.id,
+                    content=f"工具执行失败（{tool_call.name}）: {type(e).__name__}: {e}",
+                    is_error=True,
+                )

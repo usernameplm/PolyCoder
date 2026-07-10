@@ -15,10 +15,13 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
+
+from observability.metrics import generate_latest, CONTENT_TYPE_LATEST, record_request
+from providers.types import Usage
 
 import asyncio
 from swarm.blackboard import Blackboard
@@ -31,7 +34,9 @@ from swarm.code_extractor import extract_python_code
 from swarm.sandbox import resolve_safe_path, PathTraversalError
 
 from coordinator.agent import CoordinatorAgent, clear_session
-from observability.logging import logger
+from observability.logging import logger, setup_logging
+from observability.tracing import setup_tracing
+from core.config import settings
 
 from typing import Any
 
@@ -127,6 +132,9 @@ async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 
 async def lifespan(app: FastAPI):
     global _swarm_save_task
 
+    setup_logging()
+    setup_tracing(service_name="my-agent", otlp_endpoint=settings.otel_exporter_otlp_endpoint or None)
+
     logger.info("server_starting")
     logger.info("api_docs_url", url="http://localhost:8002/docs")
     logger.info("stream_test_hint", hint="curl -N 'http://localhost:8002/ask/stream?question=你好'")
@@ -187,6 +195,15 @@ async def health_check():
     return {"status": "ok", "timestamp": int(time.time())}
 
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus 指标端点（Prometheus 服务器来拉取数据）。"""
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
+
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(req: AskRequest) -> AskResponse:
     """
@@ -204,6 +221,13 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
         result = await _coordinator.run(req.question, session_id=req.session_id)
         elapsed_ms = round((time.time() - start) * 1000)
         log.info("ask_request_done", elapsed_ms=elapsed_ms)
+        record_request(
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            status="success",
+            latency=time.time() - start,
+            usage=Usage(input_tokens=result.input_tokens, output_tokens=result.output_tokens),
+        )
         return AskResponse(
             text=result.text,
             session_id=req.session_id,
@@ -215,6 +239,12 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
     except Exception as e:
         elapsed_ms = round((time.time() - start) * 1000)
         log.error("ask_request_error", elapsed_ms=elapsed_ms, error=str(e))
+        record_request(
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            status="error",
+            latency=time.time() - start,
+        )
         return AskResponse(session_id=req.session_id, error=str(e))
 
 

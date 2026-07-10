@@ -212,6 +212,7 @@ aiofiles>=24.0.0            # 异步文件读写（会话持久化用）
 structlog>=24.0.0           # 结构化日志（JSON 格式，便于日志聚合）
 opentelemetry-sdk>=1.25.0   # OpenTelemetry 链路追踪
 prometheus-client>=0.21.0   # Prometheus 指标暴露
+opentelemetry-exporter-otlp-proto-grpc>=1.25.0   # 可选：不装也能跑，只是 Span 不会导出到 Jaeger/Tempo（tracing.py 里 ImportError 会被吞掉，打印一行提示）
 
 # ── 存储 ──────────────────────────────────────────────────────────
 redis>=5.0.0                # Redis 客户端（5.x 起自带 redis.asyncio 异步支持，aioredis 已停止维护，不需要再装）
@@ -7856,8 +7857,6 @@ def setup_logging(log_level: str = "INFO"):
 
     structlog.configure(
         processors=[
-            structlog.stdlib.filter_by_level,
-            structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
@@ -7873,6 +7872,19 @@ def setup_logging(log_level: str = "INFO"):
 # 全局 logger（各模块 from observability.logging import logger）
 logger = structlog.get_logger()
 ```
+
+> **⚠️ 踩坑记录：`structlog.stdlib.filter_by_level` / `add_logger_name` 不能和 `PrintLoggerFactory` 一起用**
+>
+> `structlog.stdlib.filter_by_level` 和 `structlog.stdlib.add_logger_name` 这两个processor，设计前提是底层 `logger_factory` 产出的是**真正的 `logging.Logger`**（比如用 `structlog.stdlib.LoggerFactory()`）——前者要读 `logger.disabled`，后者要读 `logger.name`。
+>
+> 但这里为了直接输出 JSON、不依赖 Python 标准 logging 的 handler 机制，用的是 `structlog.PrintLoggerFactory()`，它产出的 `PrintLogger` 根本没有 `.disabled` / `.name` 这两个属性。只要调用 `logger.info(...)`，就会在这两个 processor 里炸出：
+> ```
+> AttributeError: 'PrintLogger' object has no attribute 'disabled'
+> AttributeError: 'PrintLogger' object has no attribute 'name'
+> ```
+> 这个 bug 在代码写好之后不会立刻暴露——因为只要没人调用 `setup_logging()`，`structlog.configure()` 就不会生效，用的是 structlog 默认配置，不会报错。**只有在服务启动时真正调用了 `setup_logging()`，第一条 `logger.info()` 才会崩掉。** 所以本章的代码必须按上面的最终版本抄（不含这两行），或者干脆把 `logger_factory` 换成 `structlog.stdlib.LoggerFactory()`（那样就需要这两个 processor 配合工作）。
+>
+> 这里选择保留 `PrintLoggerFactory()`，直接删掉这两个 processor：日志级别过滤已经由 `wrapper_class=structlog.make_filtering_bound_logger(logging.INFO)` 处理，`add_logger_name` 只是加个 `logger_name` 字段，不影响功能，删掉不影响可观测性目标。
 
 **使用示例（在 Agentic Loop 里）：**
 
@@ -7978,10 +7990,11 @@ def record_request(provider: str, model: str, status: str, latency: float, usage
 **在 FastAPI 中暴露 /metrics 端点：**
 
 ```python
-# main.py 里添加
+# main.py
 
-from fastapi import Response
-from observability.metrics import generate_latest, CONTENT_TYPE_LATEST
+from fastapi import FastAPI, HTTPException, Response
+from observability.metrics import generate_latest, CONTENT_TYPE_LATEST, record_request
+from providers.types import Usage
 
 @app.get("/metrics")
 async def metrics():
@@ -7991,6 +8004,59 @@ async def metrics():
         media_type=CONTENT_TYPE_LATEST,
     )
 ```
+
+放在 `/health` 之后、`/ask` 之前即可，路由顺序不影响功能。
+
+**在 `/ask` 里调用 `record_request()`——成功和失败都要记：**
+
+只暴露端点还不够，指标数字要有人在业务代码里"打点"才会变化。`/ask` 是完整响应接口（第 6 章的 `CoordinatorAgent.run()`），在它的成功分支和异常分支都调用一次 `record_request()`，这样无论请求成不成功，`agent_requests_total{status=...}` 都会增加：
+
+```python
+# main.py
+@app.post("/ask", response_model=AskResponse)
+async def ask_endpoint(req: AskRequest) -> AskResponse:
+    start = time.time()
+    log = logger.bind(session_id=req.session_id)
+    log.info("ask_request_received", question=req.question[:60])
+
+    try:
+        result = await _coordinator.run(req.question, session_id=req.session_id)
+        elapsed_ms = round((time.time() - start) * 1000)
+        log.info("ask_request_done", elapsed_ms=elapsed_ms)
+
+        # 成功：记 provider/model/status=success 三个维度 + 延迟 + token 用量
+        record_request(
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            status="success",
+            latency=time.time() - start,
+            usage=Usage(input_tokens=result.input_tokens, output_tokens=result.output_tokens),
+        )
+        return AskResponse(
+            text=result.text,
+            session_id=req.session_id,
+            usage={
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+            },
+        )
+    except Exception as e:
+        elapsed_ms = round((time.time() - start) * 1000)
+        log.error("ask_request_error", elapsed_ms=elapsed_ms, error=str(e))
+
+        # 失败：status=error，不传 usage（这次请求没有真实 token 用量数据）
+        record_request(
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            status="error",
+            latency=time.time() - start,
+        )
+        return AskResponse(session_id=req.session_id, error=str(e))
+```
+
+> **注意 1**：`AskResult`（`coordinator/agent.py` 里 `CoordinatorAgent.run()` 的返回类型）没有 `provider`/`model` 字段，所以这里的 label 直接取 `settings.llm_provider` / `settings.llm_model`（全局配置），而不是从 result 里取——单 provider 部署场景下这是等价的，如果以后要支持每次请求动态切换 provider，需要把 provider/model 一起放进 `AskResult`。
+>
+> **注意 2**：`GET /ask/stream`（SSE 流式接口）**没有**接入 `record_request()`——它的生成器只管边生成边往外推文本增量，函数返回前拿不到聚合后的最终 usage 和总耗时，要打点得先改造流式生成器在结束时收集 usage，本次没有做这一步，如果需要可以补。
 
 ---
 
@@ -8041,40 +8107,133 @@ tracer = trace.get_tracer("my-agent")
 
 **在 Agentic Loop 里添加追踪：**
 
+`run_agent_loop`（`agent_core/loop.py`）里，一次调用是一个 Trace：外层一个 `agent_loop` Span 贯穿整个 while 循环，每一轮 LLM 调用是一个 `turn_N` 子 Span。
+
 ```python
 from observability.tracing import tracer
 
-# 在 run_agent_loop 函数里：
+# agent_core/loop.py — run_agent_loop 函数体
 with tracer.start_as_current_span("agent_loop") as loop_span:
-    loop_span.set_attribute("session_id", session_id)
+    loop_span.set_attribute("session_id", session_id or "")
     loop_span.set_attribute("provider", provider.model_name)
 
     while True:
-        with tracer.start_as_current_span(f"turn_{state.turn_count}") as turn_span:
-            # ... LLM 调用
+        # ...（压缩检查 / 轮次限制检查）
 
-        if tool_calls:
-            for tc in tool_calls:
-                with tracer.start_as_current_span(f"tool_{tc.name}") as tool_span:
-                    tool_span.set_attribute("tool.name", tc.name)
-                    # ... 工具执行
+        with tracer.start_as_current_span(f"turn_{state.turn_count}") as turn_span:
+            # ... LLM 调用（流式/非流式）
+            turn_span.set_attribute("input_tokens", turn_usage.input_tokens)
+            turn_span.set_attribute("output_tokens", turn_usage.output_tokens)
+            turn_span.set_attribute("tool_calls", [tc.name for tc in tool_calls])
+
+        # ...
+        tool_results = await executor.execute_all(tool_calls)   # 见下方
 ```
+
+**工具调用的 Span 要放在 `ToolExecutor` 内部，不要放在 loop 里的 `for` 循环：**
+
+`ToolExecutor.execute_all()`（`agent_core/executor.py`）用 `asyncio.gather()` **并行**执行所有工具调用（见 6.x 章）。如果照搬"每个工具一个 Span"的直觉写法，在 `run_agent_loop` 里用 `for tc in tool_calls:` 顺序创建 Span，会把并行执行改成串行，白白拖慢速度。正确做法是把 Span 下沉到实际执行单个工具的 `_execute_one` 里，`asyncio.gather` 调度多个协程时各自的 Span 仍然独立记录，互不影响并发：
+
+```python
+# agent_core/executor.py
+from observability.tracing import tracer
+
+class ToolExecutor:
+    async def execute_all(self, tool_calls):
+        # 保持并行：Span 不在这里逐个创建
+        tasks = [self._execute_one(tc) for tc in tool_calls]
+        return list(await asyncio.gather(*tasks))
+
+    async def _execute_one(self, tool_call):
+        with tracer.start_as_current_span(f"tool_{tool_call.name}") as tool_span:
+            tool_span.set_attribute("tool.name", tool_call.name)
+            # ... 执行工具，异常时 tool_span.set_attribute("tool.error", ...)
+```
+
+**在服务启动时初始化：`setup_logging()` + `setup_tracing()`**
+
+两者都必须在服务启动时各调用一次，且顺序是先日志、后追踪（这样 `setup_tracing()` 内部如果打日志，走的已经是配置好的结构化 logger）：
+
+- `setup_logging()` 不调用 → 用 structlog 默认配置，日志不是 JSON 格式，`session_id` 等字段也不会自动带上。
+- `setup_tracing()` 不调用 → `tracer` 用的是 OpenTelemetry 默认 `TracerProvider`（No-op），Span 正常创建但不会导出到任何地方，`agent_loop`/`turn_N`/`tool_xxx` 全部是空转。
+
+`otlp_endpoint` 从配置读取，不填就只在本地"空转"（不报错，也不导出）：
+
+```python
+# core/config.py
+class Settings(BaseSettings):
+    ...
+    # 可观测性：OpenTelemetry 链路追踪导出地址（Jaeger/Tempo 等），不填则不导出
+    otel_exporter_otlp_endpoint: str = ""
+```
+
+```python
+# main.py
+from observability.logging import logger, setup_logging
+from observability.tracing import setup_tracing
+from core.config import settings
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _swarm_save_task
+
+    setup_logging()
+    setup_tracing(service_name="my-agent", otlp_endpoint=settings.otel_exporter_otlp_endpoint or None)
+
+    logger.info("server_starting")
+    logger.info("api_docs_url", url="http://localhost:8002/docs")
+    logger.info("stream_test_hint", hint="curl -N 'http://localhost:8002/ask/stream?question=你好'")
+
+    # ... 原有的 Redis 恢复 / 常驻 Swarm Agent 启动 / 后台备份任务逻辑不变
+
+    yield
+
+    # ... 原有的收尾逻辑不变
+    logger.info("server_shutdown")
+```
+
+**验证方式**：用 `TestClient` 触发一次完整的 `lifespan`（比直接跑 `uvicorn` 更快看到启动阶段的报错），确认没有异常且能拿到 `/metrics` 数据：
+
+```python
+import main
+from fastapi.testclient import TestClient
+
+with TestClient(main.app) as c:
+    r = c.get("/metrics")
+    print(r.status_code)   # 200
+    print([l for l in r.text.splitlines() if "agent_requests_total" in l])
+```
+
+如果这里报 `AttributeError: 'PrintLogger' object has no attribute 'disabled'`（或 `'name'`），说明 `observability/logging.py` 还是旧版本，回到 11.2 节把 `filter_by_level` / `add_logger_name` 从 processors 列表删掉。
 
 ---
 
 ## 11.5 本章检查清单
 
 ```
+□ observability/logging.py 的 processors 里不含 structlog.stdlib.filter_by_level /
+  add_logger_name（跟 PrintLoggerFactory 不兼容，会在第一条日志时报 AttributeError）
+
 □ setup_logging() 在 lifespan 里调用，日志输出为 JSON 格式
+  验证：用 TestClient 触发 lifespan，看到 {"event": "server_starting", ...} 而不报错
 
 □ /metrics 端点可访问
   验证：curl http://localhost:8002/metrics | grep agent_requests
 
-□ 发送几次请求后，agent_requests_total 计数器增加
+□ /ask 的成功分支和异常分支都调用了 record_request()
+  验证：发送几次 /ask 请求后，agent_requests_total{status="success"} 计数器增加；
+        故意触发一次异常，agent_requests_total{status="error"} 也增加
+
+□ （已知缺口）/ask/stream 暂未接入 record_request()——流式生成器结束时拿不到聚合 usage，
+  如需要，要先改造生成器在收尾时收集 usage 再打点
 
 □ Grafana 能连接到 Prometheus 并展示 agent_latency_seconds 的图表
 
-□ （可选）Jaeger 中能看到一条完整的链路（包含各个 Span）
+□ setup_tracing() 在 lifespan 里调用，且在 setup_logging() 之后（否则 Span 只在本地创建，不会导出）
+
+□ 工具 Span（tool_{name}）建在 ToolExecutor._execute_one 里，不要改成串行 for 循环
+
+□ （可选）配置 OTEL_EXPORTER_OTLP_ENDPOINT 后，Jaeger 中能看到一条完整的链路（agent_loop → turn_N → tool_xxx）
 ```
 
 ---
