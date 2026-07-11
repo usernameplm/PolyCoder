@@ -8060,6 +8060,131 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
 
 ---
 
+### 11.3.1 Docker 部署 Prometheus + Grafana
+
+Prometheus 和 Grafana 都是独立部署的服务，推荐用 Docker 一键拉起。
+
+**项目根目录下创建 `docker-compose.yml`：**
+
+```yaml
+# docker-compose.yml
+version: "3.8"
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:
+```
+
+**项目根目录下创建 `prometheus.yml`：**
+
+```yaml
+# prometheus.yml
+global:
+  scrape_interval: 15s      # 每 15 秒抓一次指标
+  evaluation_interval: 15s  # 每 15 秒评估一次告警规则
+
+scrape_configs:
+  - job_name: "polycoder"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["host.docker.internal:8002"]  # 在 Docker 容器内访问宿主机端口
+        labels:
+          service: "polycoder"
+```
+
+> **targets 说明**：`host.docker.internal` 是 Docker 提供的特殊 DNS，让容器能访问宿主机的 localhost。如果你的 PolyCoder 跑在另一台机器上，改成那台机器的 IP 即可（如 `192.168.1.100:8002`）。
+
+**启动：**
+
+```bash
+# 1. 先把 docker-compose.yml 和 prometheus.yml 放在项目根目录
+# 2. 确保 PolyCoder 在运行（uvicorn main:app --port 8002）
+
+# 3. 启动 Prometheus + Grafana
+docker compose up -d
+```
+
+**验证 Prometheus：**
+
+```bash
+# 浏览器打开 http://localhost:9090
+# 点 Status → Targets，看到 polycoder 状态为 UP 即成功
+
+# 或者直接在 Graph 页面输入查询：
+agent_requests_total
+```
+
+**配置 Grafana 连接 Prometheus：**
+
+1. 浏览器打开 `http://localhost:3000`，用 `admin / admin` 登录，首次登录会要求改密码
+2. 左侧菜单 **Connections → Data sources → Add data source → 选 Prometheus**
+3. **Connection** 一栏填 `http://prometheus:9090`（容器内部 DNS，不是 localhost）
+4. 点 **Save & test**，显示绿色 ✓ 即连通
+
+**在 Grafana 中建仪表盘：**
+
+1. 左侧菜单 **Dashboards → New → Import**（或 New Dashboard → Add visualization）
+2. 选择刚创建的 Prometheus 数据源
+3. 用 PromQL 写查询，几个常用示例：
+
+```
+# /ask 接口 QPS（每秒请求数）
+rate(agent_requests_total[5m])
+
+# 按 status 分类的成功/失败请求数变化率
+rate(agent_requests_total{status="success"}[5m])
+
+# P99 请求延迟（99% 的请求在多少秒内完成）
+histogram_quantile(0.99, rate(agent_latency_seconds_bucket[5m]))
+
+# Token 消耗速率（每秒消耗的 input token 数）
+rate(token_usage_total{type="input"}[5m])
+
+# 当前活跃请求数
+active_requests
+```
+
+4. 保存 Dashboard，右上角可设置自动刷新间隔（10s / 30s）
+
+**停止：**
+
+```bash
+docker compose down         # 停止但保留数据卷
+docker compose down -v      # 停止并删除数据卷（清空所有历史数据）
+```
+
+---
+
 ## 11.4 OpenTelemetry 链路追踪 `observability/tracing.py`
 
 ```python

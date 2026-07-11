@@ -1,7 +1,7 @@
 # observability/metrics.py
 """
 Prometheus 指标定义。
-
+数据来源仍然是手动获得 metrics只是把传入的值写入Prometheus
 Prometheus 是业界标准的监控系统，Grafana 可以展示 Prometheus 数据。
 指标数据通过 /metrics 端点暴露，Prometheus 服务器定期来"拉取"。
 """
