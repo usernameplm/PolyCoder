@@ -12849,9 +12849,9 @@ async def main():
 
     # 故意用和原文不同的说法，验证"语义匹配"而非"字面匹配"
     queries = [
-        "买了东西不想要了怎么办",   # 语义 ≈ 退货政策（原文没有"不想要"这几个字）
-        "支持苹果手机吗",           # 语义 ≈ 支持哪些平台
-        "怎么充钱变成会员",         # 语义 ≈ 如何升级付费版
+        "怎么发 HTTP 请求？",       # 语义 ≈ 内部请求封装（原文写的是 HttpClient / 对外请求）
+        "变量和类应该怎么命名",     # 语义 ≈ 命名规范
+        "并发跑多个协程怎么写",     # 语义 ≈ 异步规范（asyncio.gather）
         "今天天气怎么样",           # 无关：应命中不到或分数很低
     ]
 
@@ -12886,76 +12886,102 @@ python demo_kb.py
   [KnowledgeBase] 向量索引完成，共 2 个向量（模型 BAAI/bge-small-zh-v1.5，维度 512）
 
 ============================================================
-查询：买了东西不想要了怎么办
-  1. [0.61] company_policy（knowledge_base/company_policy.md）
-     # 公司退换货政策 ## 退货条件 - 购买后 7 天内可无理由退货...
+查询：怎么发 HTTP 请求？
+  1. [0.61] api_spec（knowledge_base/api_spec.md）
+     # 内部 HTTP 客户端规范 ## 统一请求封装 - 所有对外请求必须通过 core.http.HttpClient...
 
 ============================================================
-查询：支持苹果手机吗
-  1. [0.58] product_faq（knowledge_base/product_faq.md）
-     # 产品常见问题 ## Q：支持哪些平台？...
+查询：变量和类应该怎么命名
+  1. [0.60] coding_style（knowledge_base/coding_style.md）
+     # Python 编码规范 ## 命名 - 函数 / 变量：snake_case；类：PascalCase...
 
 ============================================================
-查询：怎么充钱变成会员
-  1. [0.55] product_faq（knowledge_base/product_faq.md）
-     ...如何升级到付费版...
+查询：并发跑多个协程怎么写
+  1. [0.57] coding_style（knowledge_base/coding_style.md）
+     ...并发多个协程用 asyncio.gather，不要手动创建裸 Task 不管理...
 
 ============================================================
 查询：今天天气怎么样
   → 未命中（符合无关查询的预期）
 ```
 
-> **看点**：前三个查询用的词和原文几乎不重合（"不想要"→"退货"、"苹果手机"→"平台"、"充钱变会员"→"升级付费"），
-> 但都命中了正确文档——这正是 TF-IDF 做不到、向量检索能做到的**语义匹配**。最后一个无关查询被
-> `_SCORE_THRESHOLD` 过滤掉，返回"未命中"。如果这里也返回了文档，说明阈值偏低，可上调 `_SCORE_THRESHOLD`。
+> **看点**：前三个查询用的词和原文几乎不重合（"发 HTTP 请求"→"对外请求 / HttpClient"、
+> "命名"→"snake_case / PascalCase"、"并发跑协程"→"asyncio.gather"），但都命中了正确文档——
+> 这正是 TF-IDF 做不到、向量检索能做到的**语义匹配**。最后一个无关查询被 `_SCORE_THRESHOLD`
+> 过滤掉，返回"未命中"。如果这里也返回了文档，说明阈值偏低，可上调 `_SCORE_THRESHOLD`。
 
 ---
 
 ## 15.10 准备知识库测试文档
 
+> **知识库该装什么？** 本项目的子 Agent 全是编码相关的（code_writer / code_reviewer /
+> debugger / test_writer），所以知识库要装的不是"退换货政策"这类客服问答，而是**能给代码
+> 生成/审查当上下文的领域知识**——内部 API 规范、编码规范、错误码表、架构约定等。这样
+> RAG 检索出来的内容会被编码子 Agent 直接消费，形成真正的闭环（详见 15.11）。
+
 ```bash
 mkdir knowledge_base
 ```
 
-新建 `knowledge_base/company_policy.md`：
+新建 `knowledge_base/api_spec.md`（内部 API 规范）：
 
 ```markdown
-# 公司退换货政策
+# 内部 HTTP 客户端规范
 
-## 退货条件
-- 购买后 7 天内可无理由退货
-- 商品需保持原包装，未使用状态
-- 促销活动商品不支持退货
+## 统一请求封装
+- 所有对外请求必须通过 `core.http.HttpClient`，禁止直接使用 requests / httpx
+- `HttpClient` 已内置超时（默认 10s）、重试（指数退避，最多 3 次）、链路追踪 header
+- 用法：`await HttpClient.request(method, url, *, json=None, headers=None)`
 
-## 换货条件
-- 商品存在质量问题可申请换货
-- 换货周期：收到退回商品后 3 个工作日内发出新品
+## 认证
+- 内部服务调用统一走 `HttpClient`，会自动从环境变量注入 `X-Internal-Token`
+- 调用第三方 API 时，在 headers 里显式传 `Authorization`，不要写死在代码里
 
-## 退款说明
-- 退款将在审核通过后 1-3 个工作日内原路返回
-- 运费由买家承担（质量问题除外）
+## 统一响应结构
+所有内部接口返回 JSON，结构固定：
+```json
+{"code": 0, "message": "ok", "data": {...}}
+```
+- `code == 0` 表示成功，`data` 是业务数据
+- `code != 0` 表示失败，`message` 是错误描述，`data` 为 null
+- 业务代码应先判断 `code`，非 0 时抛 `ApiError(code, message)`
 
-## 联系方式
-- 客服电话：400-xxx-xxxx
-- 工作时间：周一至周五 9:00-18:00
+## 分页约定
+- 列表接口统一用 `page`（从 1 开始）和 `page_size`（默认 20，最大 100）两个参数
+- 返回的 `data` 里含 `items` 列表和 `total` 总数
 ```
 
-新建 `knowledge_base/product_faq.md`：
+新建 `knowledge_base/coding_style.md`（编码规范 + 错误码）：
 
 ```markdown
-# 产品常见问题
+# Python 编码规范
 
-## Q：支持哪些平台？
-A：支持 Windows 10+、macOS 12+、iOS 15+、Android 10+。
+## 命名
+- 函数 / 变量：snake_case；类：PascalCase；常量：UPPER_SNAKE_CASE
+- 私有成员以单下划线开头（`_internal`）；模块级私有函数同样以 `_` 开头
 
-## Q：免费版和付费版的区别？
-A：免费版每月 100 次调用额度；付费版无限调用，额外包含数据导出和 API 访问。
+## 类型注解
+- 所有公开函数必须写完整类型注解（参数 + 返回值）
+- 优先用 `list[str]`、`dict[str, int]` 等内置泛型，不用 `typing.List`
 
-## Q：数据安全如何保障？
-A：所有数据采用 AES-256 加密存储，符合数据安全法要求。
+## 异步
+- IO 操作（网络、文件、DB）一律用 async/await，禁止在协程里做阻塞调用
+- 并发多个协程用 `asyncio.gather`，不要手动创建裸 Task 不管理
 
-## Q：如何升级到付费版？
-A：登录账户后进入「账户设置」→「升级套餐」，支持支付宝和微信支付。
+## 异常处理
+- 只在系统边界（入口、外部调用）捕获异常，内部逻辑让异常自然向上抛
+- 自定义异常继承项目基类 `AppError`，禁止裸 `raise Exception(...)`
+
+# 统一错误码表
+| code | 常量名 | 含义 |
+|---|---|---|
+| 0 | OK | 成功 |
+| 1001 | ERR_INVALID_PARAM | 参数校验失败 |
+| 1002 | ERR_UNAUTHORIZED | 未认证或 token 失效 |
+| 1003 | ERR_FORBIDDEN | 无权限 |
+| 2001 | ERR_NOT_FOUND | 资源不存在 |
+| 5001 | ERR_INTERNAL | 服务内部错误 |
+| 5002 | ERR_UPSTREAM_TIMEOUT | 上游服务超时 |
 ```
 
 ---
@@ -12966,6 +12992,10 @@ A：登录账户后进入「账户设置」→「升级套餐」，支持支付�
 > Agent 的工具列表"，而是要接到 Coordinator 的"规划 → 分发 →聚合"结构里——
 > 知识库检索本质上是一类子任务，交给一个新的子 Agent 去做最自然，跟
 > `code_reviewer`、`test_writer` 是同一种模式（`sub_agents/base.py`）。
+>
+> **定位很关键**：本项目的子 Agent 都是编码相关的，所以 `knowledge_agent` 不是通用问答机器人，
+> 而是**编码任务的"领域知识供给方"**——它查出内部 API 规范、编码规范、错误码等信息，
+> 作为前置任务的产出，供后续 `code_writer` / `code_reviewer` 当上下文使用（见文末的编排示例）。
 
 新建 `sub_agents/knowledge_agent.py`，复用 `SubAgent` 基类，只需要声明
 `system_prompt` 和 `tools`：
@@ -12989,9 +13019,15 @@ class KnowledgeAgent(SubAgent):
     @property
     def system_prompt(self) -> str:
         return (
-            "你是知识库检索专家，专注回答公司政策、产品信息、技术文档等内部知识类问题。"
-            "先调用 search_knowledge_base 工具查询，再基于查询结果用中文简洁准确地回答，"
-            "不要凭空编造知识库里没有的内容。"
+            "你是团队内部技术知识库检索专家，服务于编码类子任务。"
+            "你的职责是：当 code_writer / code_reviewer / debugger 需要遵循团队的"
+            "内部 API 规范、编码规范、错误码约定、架构约定时，你负责从知识库里检索出"
+            "相关规范条目，作为它们编码或审查的依据。\n"
+            "工作方式：先调用 search_knowledge_base 工具查询，再把检索到的规范"
+            "**原样、结构化地**整理出来（保留接口签名、错误码、约定原文），"
+            "不要自行发挥或改写规范内容；知识库里没有的，明确说'知识库中无相关规范'，"
+            "绝不凭空编造 API 或规范。你的输出会作为上下文传给编码子 Agent，"
+            "所以要准确、可直接引用，而不是面向最终用户的口语化回答。"
         )
 
     @property
@@ -13023,13 +13059,33 @@ def _get_sub_agents() -> dict:
 `_COORDINATOR_SYSTEM` 里补一条：
 
 ```
-- knowledge_agent：回答公司政策、产品规格、内部文档类问题（会调用知识库检索工具）
+- knowledge_agent：检索团队内部 API 规范、编码规范、错误码等技术约定。
+  当编码 / 审查任务需要遵循内部规范时，先用它查出规范，再把结果作为上下文
+  交给 code_writer / code_reviewer（作为它们的前置依赖任务）。
 ```
 
-这样"我们公司的退货政策是什么？"这类问题，规划阶段会生成一个
-`{"agent": "knowledge_agent", "input": "..."}` 的任务，交给 `dispatch()` 执行，
-跟审查代码、写测试走的是完全相同的分发和聚合逻辑——不需要再单独维护一套
-"给单 Agent 挂工具"的旁路实现。
+这样"按我们内部规范写一个调用用户服务的函数"这类请求，规划阶段会生成**两步有依赖的任务**，例如：
+
+```json
+{
+  "tasks": [
+    {"id": 1, "agent": "knowledge_agent",
+     "input": "检索内部 HTTP 客户端规范、统一响应结构和错误码约定"},
+    {"id": 2, "agent": "code_writer",
+     "input": "按检索到的规范，写一个调用用户服务、带分页的函数",
+     "depends_on": [1]}
+  ]
+}
+```
+
+`dispatch()` 会先跑 `knowledge_agent`，把它检索到的规范作为 `context` 注入到
+`code_writer` 的输入里（`SubAgent.run(context=...)`，见 6.4 节），于是生成的代码
+就会遵循 `HttpClient` 封装、统一响应结构和错误码——跟审查代码、写测试走的是完全
+相同的分发和聚合逻辑，不需要再单独维护一套"给单 Agent 挂工具"的旁路实现。
+
+> **对比之前的错配**：如果知识库里装的是"退换货政策"这类内容，planner 面对编码请求
+> 根本不会分派给 `knowledge_agent`，这个 RAG 就成了摆设。把知识库换成技术规范、并让
+> `knowledge_agent` 明确服务于编码子任务后，它才真正嵌入到 Coordinator 的编码主线里。
 
 ---
 
@@ -13062,10 +13118,11 @@ python test_kb_load.py
 ```
   [KnowledgeBase] 发现 2 个文件（文本 2，PDF 0，图片 0）
   [KnowledgeBase] 加载完成，共 2 个文档块
+  [KnowledgeBase] 向量索引完成，共 2 个向量（模型 BAAI/bge-small-zh-v1.5，维度 512）
 
 加载完成：2 个文档块
-  [knowledge_base\company_policy.md]  图片数=0  字符数=371
-  [knowledge_base\product_faq.md]  图片数=0  字符数=288
+  [knowledge_base\api_spec.md]  图片数=0  字符数=...
+  [knowledge_base\coding_style.md]  图片数=0  字符数=...
 ```
 
 ### 验证检索效果
@@ -13079,9 +13136,10 @@ from tools.knowledge_base import KnowledgeBaseTool
 async def test_search():
     kb = KnowledgeBaseTool(kb_dir="knowledge_base")
 
+    # 故意用和原文不同的说法，验证"语义匹配"
     queries = [
-        ("退货需要几天？", "company_policy"),
-        ("支持哪些平台？",  "product_faq"),
+        ("怎么发 HTTP 请求？",       "api_spec"),
+        ("变量和类应该怎么命名？",   "coding_style"),
     ]
 
     for query, expected_source in queries:
@@ -13100,15 +13158,17 @@ asyncio.run(test_search())
 python cli.py
 ```
 
-输入问题并观察 Agent 是否调用工具：
+输入一个"需要遵循内部规范"的编码请求，观察 Agent 是否先查知识库再写代码：
 ```
-你：我们公司的退货政策是什么？
+你：请按我们内部的 API 规范，写一个调用用户服务、带分页的函数。
 ```
 
-预期（Agent 先调用工具，再基于结果回答）：
+预期（规划器先派 knowledge_agent 查规范，再交给 code_writer 按规范写）：
 ```
-  [Loop] 第 1 轮，执行 1 个工具调用
-Agent：根据公司退货政策，购买后 7 天内可无理由退货，但商品需保持原包装...
+  [Planner] 生成 2 个任务：knowledge_agent（查规范）→ code_writer（依赖任务 1）
+  [Loop] knowledge_agent 第 1 轮，执行 1 个工具调用（search_knowledge_base）
+Agent：（生成的代码通过 core.http.HttpClient 发请求，返回值按 code/message/data 解析，
+       分页用 page/page_size —— 完全遵循检索到的内部规范）
 ```
 
 ---
@@ -13116,10 +13176,13 @@ Agent：根据公司退货政策，购买后 7 天内可无理由退货，但商
 ## 15.13 本章检查清单
 
 ```
-□ 运行：python -c "import fitz; import PIL; print('OK')"  → 输出 OK
-□ 运行 test_kb_load.py，知识库正常加载，输出 2 个文档块
-□ 检索测试通过：查询「退货」返回 company_policy 文档
-□ cli.py 问退货政策，Agent 日志显示执行了 search_knowledge_base 工具
+□ 运行：python -c "import fitz, PIL; from sentence_transformers import SentenceTransformer; from qdrant_client import QdrantClient; print('OK')"  → 输出 OK
+□ Qdrant 已启动：curl http://localhost:6333/healthz 返回 healthz check passed
+  （或改用 qdrant_url=":memory:" 免容器）
+□ 运行 test_kb_load.py，知识库正常加载并建向量索引，输出 2 个文档块 + 向量索引完成日志
+□ 检索测试通过：查询「怎么发 HTTP 请求？」返回 api_spec 文档（语义匹配，非字面匹配）
+□ cli.py 提"按内部规范写代码"，日志显示规划出 knowledge_agent → code_writer 两步任务，
+  且 knowledge_agent 执行了 search_knowledge_base 工具
 □ （可选）在 knowledge_base/ 放一个 PDF，重跑加载，确认提取了图片描述
 □ （可选）在 knowledge_base/ 放一张 PNG 图片，确认生成了文字描述
 □ 验证视觉 Provider 独立配置生效：临时设 VISION_PROVIDER=openai + OPENAI_MODEL=deepseek-chat
@@ -13155,8 +13218,8 @@ tests/
 ├── conftest.py                        ← pytest 配置和公共 fixtures
 ├── fixtures/
 │   └── knowledge_base/
-│       ├── test_policy.md             ← 测试用知识库（内容固定，可重复测试）
-│       └── test_products.md
+│       ├── test_api_spec.md           ← 测试用知识库：内部 API 规范（内容固定，可重复测试）
+│       └── test_coding_style.md       ← 测试用知识库：编码规范 + 错误码
 ├── test_metrics.py                    ← 指标单元测试（不调 LLM）
 ├── test_rag.py                        ← RAG 检索质量测试（不调 LLM）
 ├── test_tool_accuracy.py              ← 工具调用准确率测试（调 LLM）
@@ -13644,46 +13707,43 @@ class CoordinatorAgent:
 mkdir -p tests/fixtures/knowledge_base
 ```
 
-新建 `tests/fixtures/knowledge_base/test_policy.md`：
+> 测试文档要和 15.10 的定位一致——装**技术规范**，而不是客服问答。下面两篇分别对应
+> "内部 API 规范"和"编码规范"，用来验证向量检索在技术知识场景下的语义匹配。
+
+新建 `tests/fixtures/knowledge_base/test_api_spec.md`：
 
 ```markdown
-# PolyCoder 测试退货政策
+# PolyCoder 内部 API 规范
 
-## 退货条件
-购买后 30 天内可无理由退货。
-退货商品需保持全新状态，包装完好。
-数字商品和定制商品不支持退货。
+## 统一请求封装
+所有对外请求必须通过 core.http.HttpClient，禁止直接使用 requests 或 httpx。
+HttpClient 内置超时（默认 10 秒）、重试（指数退避，最多 3 次）和链路追踪 header。
 
-## 退款流程
-申请退货后，仓库收到商品 48 小时内处理退款。
-退款金额原路退回，不收取手续费。
+## 统一响应结构
+内部接口返回 JSON，固定结构为 code、message、data 三个字段。
+code 等于 0 表示成功，data 是业务数据；code 非 0 表示失败，需抛出 ApiError。
 
-## 联系退货客服
-退货专线：010-12345678
-工作时间：周一到周五 9:00-17:00
+## 分页约定
+列表接口统一使用 page（从 1 开始）和 page_size（默认 20，最大 100）两个参数。
+返回的 data 里包含 items 列表和 total 总数。
 ```
 
-新建 `tests/fixtures/knowledge_base/test_products.md`：
+新建 `tests/fixtures/knowledge_base/test_coding_style.md`：
 
 ```markdown
-# PolyCoder 产品规格
+# PolyCoder 编码规范
 
-## ProCoder X1 型号
-- CPU：8 核处理器
-- 内存：16GB DDR5
-- 存储：512GB NVMe SSD
-- 重量：1.8kg
-- 电池续航：12 小时
+## 命名与类型
+函数和变量用 snake_case，类用 PascalCase，常量用 UPPER_SNAKE_CASE。
+所有公开函数必须写完整的类型注解，优先使用 list、dict 等内置泛型。
 
-## ProCoder X1 Pro 型号
-- CPU：12 核处理器
-- 内存：32GB DDR5
-- 存储：1TB NVMe SSD
-- 重量：2.1kg
-- 电池续航：10 小时
+## 异步规范
+IO 操作一律使用 async await，禁止在协程里做阻塞调用。
+并发多个协程用 asyncio.gather，不要创建不受管理的裸 Task。
 
-## 保修说明
-所有型号提供 3 年整机保修和 1 年意外险。
+## 错误码约定
+参数校验失败返回错误码 1001，未认证返回 1002，资源不存在返回 2001，
+服务内部错误返回 5001，上游服务超时返回 5002。
 ```
 
 ### pytest 配置文件 `tests/conftest.py`
@@ -13721,7 +13781,7 @@ async def loaded_kb(test_kb_dir):
 
     用法（在测试函数里声明参数名即可）：
         async def test_something(loaded_kb):
-            result = await loaded_kb.execute({"query": "退货"})
+            result = await loaded_kb.execute({"query": "怎么发 HTTP 请求"})
 
     这里用 qdrant_url=":memory:" 走纯内存向量库，测试不依赖 Docker 起的 Qdrant 服务，
     且每个测试实例互相隔离、退出即清空。
@@ -13990,58 +14050,59 @@ async def test_kb_documents_have_correct_source(loaded_kb):
     """文档的 source 字段应该包含文件路径。"""
     sources = [doc.source for doc in loaded_kb._docs]
     # 验证两个测试文档都被加载了
-    has_policy = any("test_policy" in s for s in sources)
-    has_products = any("test_products" in s for s in sources)
-    assert has_policy, "test_policy.md 没有被加载"
-    assert has_products, "test_products.md 没有被加载"
+    has_api_spec = any("test_api_spec" in s for s in sources)
+    has_coding_style = any("test_coding_style" in s for s in sources)
+    assert has_api_spec, "test_api_spec.md 没有被加载"
+    assert has_coding_style, "test_coding_style.md 没有被加载"
 
 
 # ── 检索准确率测试 ────────────────────────────────────────────────────────────
 
 
-async def test_retrieve_policy_by_refund_query(loaded_kb):
-    """查询退货相关问题，应该返回政策文档（而不是产品文档）。"""
-    result = await loaded_kb.execute({"query": "退货需要几天？", "top_k": 1})
+async def test_retrieve_api_spec_by_http_query(loaded_kb):
+    """查询发请求相关问题，应该返回 API 规范文档（而不是编码规范文档）。"""
+    # 用"发 HTTP 请求"这种说法，原文写的是"对外请求 / HttpClient"，验证语义匹配
+    result = await loaded_kb.execute({"query": "怎么发 HTTP 请求？", "top_k": 1})
     data = json.loads(result)
 
     assert data["found"] is True, "应该找到相关文档"
     top_source = data["results"][0]["source"]
-    assert "test_policy" in top_source, (
-        f"退货问题应该返回政策文档，实际返回：{top_source}"
+    assert "test_api_spec" in top_source, (
+        f"请求封装问题应该返回 API 规范文档，实际返回：{top_source}"
     )
 
 
-async def test_retrieve_products_by_cpu_query(loaded_kb):
-    """查询 CPU 规格，应该返回产品文档。"""
-    result = await loaded_kb.execute({"query": "CPU 处理器核心数", "top_k": 1})
+async def test_retrieve_coding_style_by_naming_query(loaded_kb):
+    """查询命名规范，应该返回编码规范文档。"""
+    result = await loaded_kb.execute({"query": "变量和类应该怎么命名", "top_k": 1})
     data = json.loads(result)
 
     assert data["found"] is True
     top_source = data["results"][0]["source"]
-    assert "test_products" in top_source, (
-        f"CPU 问题应该返回产品文档，实际返回：{top_source}"
+    assert "test_coding_style" in top_source, (
+        f"命名规范问题应该返回编码规范文档，实际返回：{top_source}"
     )
 
 
-async def test_retrieve_warranty_info(loaded_kb):
-    """查询保修信息，应该返回产品文档。"""
-    result = await loaded_kb.execute({"query": "保修期多久？", "top_k": 1})
+async def test_retrieve_async_convention(loaded_kb):
+    """查询异步/并发规范，应该返回编码规范文档。"""
+    result = await loaded_kb.execute({"query": "并发执行多个协程的正确姿势", "top_k": 1})
     data = json.loads(result)
 
     assert data["found"] is True
-    assert "test_products" in data["results"][0]["source"]
+    assert "test_coding_style" in data["results"][0]["source"]
 
 
-async def test_refund_policy_content_mentions_days(loaded_kb):
-    """退款政策的检索结果应该包含具体的天数信息。"""
-    result = await loaded_kb.execute({"query": "退款多少天内处理", "top_k": 1})
+async def test_response_structure_content_mentions_code_field(loaded_kb):
+    """查询统一响应结构，检索结果应该包含 code/data 等约定信息。"""
+    result = await loaded_kb.execute({"query": "接口返回的数据结构是什么样的", "top_k": 1})
     data = json.loads(result)
 
     assert data["found"] is True
     content = data["results"][0]["content"]
-    # test_policy.md 里写了"48 小时"
-    assert "48" in content or "小时" in content or "天" in content, (
-        f"退款政策应该包含时间信息，实际内容：{content[:100]}"
+    # test_api_spec.md 里写了 code / data 字段约定
+    assert "code" in content or "data" in content or "JSON" in content, (
+        f"响应结构应该包含字段约定信息，实际内容：{content[:100]}"
     )
 
 
@@ -14050,7 +14111,7 @@ async def test_refund_policy_content_mentions_days(loaded_kb):
 
 async def test_unrelated_query_returns_not_found_or_low_score(loaded_kb):
     """与知识库内容完全无关的查询，不应该返回高相关度结果。"""
-    # 这个问题与退货/产品规格完全无关
+    # 这个问题与 API 规范/编码规范完全无关
     result = await loaded_kb.execute({"query": "量子力学薛定谔方程", "top_k": 1})
     data = json.loads(result)
 
@@ -14063,7 +14124,7 @@ async def test_unrelated_query_returns_not_found_or_low_score(loaded_kb):
 
 async def test_top_k_respected(loaded_kb):
     """top_k 参数应该限制返回结果的数量。"""
-    result = await loaded_kb.execute({"query": "产品", "top_k": 1})
+    result = await loaded_kb.execute({"query": "规范", "top_k": 1})
     data = json.loads(result)
 
     if data.get("found"):
@@ -14114,29 +14175,29 @@ def _patch_knowledge_agent(monkeypatch, test_kb_dir):
     monkeypatch.setattr(dispatcher_module, "_agents", agents)
 
 
-async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
-    """问退货政策时，规划器应该把任务分给 knowledge_agent，并触发 search_knowledge_base 工具。"""
+async def test_coding_task_with_spec_triggers_kb_tool(test_kb_dir, monkeypatch):
+    """要求"按内部规范"写代码时，规划器应该先派 knowledge_agent 查规范，触发 search_knowledge_base 工具。"""
     _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
     coordinator = CoordinatorAgent()
-    result = await coordinator.run("我们公司的退货政策是什么？退货有什么条件？")
+    result = await coordinator.run("请按我们团队的内部 API 规范，写一个调用用户服务的函数。")
 
     assert result.metrics is not None, "metrics 不应该为 None"
     assert "search_knowledge_base" in result.metrics.tool_names_called, (
-        f"退货问题应该触发知识库工具，实际工具调用：{result.metrics.tool_names_called}"
+        f"涉及内部规范的编码任务应该触发知识库工具，实际工具调用：{result.metrics.tool_names_called}"
     )
 
 
-async def test_product_spec_question_triggers_kb_tool(test_kb_dir, monkeypatch):
-    """问产品规格时，同样应该路由到 knowledge_agent 并触发工具调用。"""
+async def test_coding_style_question_triggers_kb_tool(test_kb_dir, monkeypatch):
+    """问团队编码规范时，同样应该路由到 knowledge_agent 并触发工具调用。"""
     _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
     coordinator = CoordinatorAgent()
-    result = await coordinator.run("ProCoder X1 的内存是多少？")
+    result = await coordinator.run("我们团队的命名和类型注解规范是怎么要求的？")
 
     assert result.metrics is not None
     assert "search_knowledge_base" in result.metrics.tool_names_called, (
-        f"产品规格问题应该触发知识库工具，实际：{result.metrics.tool_names_called}"
+        f"编码规范问题应该触发知识库工具，实际：{result.metrics.tool_names_called}"
     )
 
 
@@ -14258,19 +14319,19 @@ async def test_kb_query_triggers_tool_call(test_kb_dir, monkeypatch):
     且回答基于知识库内容。
 
     这是最重要的集成测试：验证 RAG 完整链路：
-    提问 → 规划器识别为知识库问题 → 分发给 knowledge_agent → 检索到相关文档 → 基于文档回答
+    提问 → 规划器识别为需查内部规范 → 分发给 knowledge_agent → 检索到相关规范 → 基于规范回答
     """
     _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
     coordinator = CoordinatorAgent()
-    result = await coordinator.run("请介绍一下退货政策，退货有什么条件？")
+    result = await coordinator.run("我们团队内部规定对外请求要怎么发？有什么封装要求？")
 
     assert result.metrics is not None
     # 验证工具被调用了
     assert result.metrics.total_tool_calls >= 1, "应该调用了至少一次工具"
     assert "search_knowledge_base" in result.metrics.tool_names_called
 
-    # 验证回答包含知识库里的信息（test_policy.md 里写了"30 天"）
+    # 验证回答基于知识库内容（test_api_spec.md 里写了 HttpClient 封装）
     assert len(result.text) > 20, "回答不应该太短"
 
 
@@ -14281,12 +14342,12 @@ async def test_kb_answer_contains_relevant_info(test_kb_dir, monkeypatch):
     _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
     coordinator = CoordinatorAgent()
-    result = await coordinator.run("ProCoder X1 的 CPU 规格是什么？")
+    result = await coordinator.run("内部接口统一的响应结构是什么样的？")
 
     assert result.metrics is not None
-    # test_products.md 里写了"8 核"
-    assert "8" in result.text or "核" in result.text or "CPU" in result.text.upper(), (
-        f"关于 CPU 的回答应该包含具体规格，实际：{result.text[:200]}"
+    # test_api_spec.md 里写了 code / message / data 三个字段约定
+    assert "code" in result.text or "data" in result.text or "message" in result.text, (
+        f"关于响应结构的回答应该包含字段约定，实际：{result.text[:200]}"
     )
 
 
@@ -14305,7 +14366,7 @@ async def test_multi_turn_when_tool_used(test_kb_dir, monkeypatch):
     _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
     coordinator = CoordinatorAgent()
-    result = await coordinator.run("保修期多久？")
+    result = await coordinator.run("内部接口的分页参数是怎么约定的？")
 
     if result.metrics.total_tool_calls > 0:
         assert len(result.metrics.turns) >= 2, (
@@ -14346,10 +14407,10 @@ tests/test_metrics.py::test_avg_llm_latency PASSED
 tests/test_metrics.py::test_cache_hit_rate_no_cache PASSED
 ...
 tests/test_rag.py::test_kb_loads_test_documents PASSED
-tests/test_rag.py::test_retrieve_policy_by_refund_query PASSED
-tests/test_rag.py::test_retrieve_products_by_cpu_query PASSED
+tests/test_rag.py::test_retrieve_api_spec_by_http_query PASSED
+tests/test_rag.py::test_retrieve_coding_style_by_naming_query PASSED
 ...
-==================== 20 passed in 2.31s ====================
+==================== 20 passed in 4.60s ====================
 ```
 
 ### 运行第二层测试（需要 LLM，较慢）
@@ -14379,12 +14440,12 @@ pytest tests/ -v
 如果某个测试失败，pytest 会打印详细原因，例如：
 
 ```
-FAILED tests/test_rag.py::test_retrieve_policy_by_refund_query
-AssertionError: 退货问题应该返回政策文档，实际返回：test_products.md
+FAILED tests/test_rag.py::test_retrieve_api_spec_by_http_query
+AssertionError: 请求封装问题应该返回 API 规范文档，实际返回：test_coding_style.md
 
 解读：向量检索返回了错误的文档。
-可能原因：test_policy.md 的语义与「退货」查询不够贴近，或两篇测试文档语义太接近难以区分。
-修复方向：检查 test_policy.md 的内容，让退货政策描述更完整具体；必要时调低 _SCORE_THRESHOLD 或换更强的 embedding 模型（如 bge-base-zh-v1.5）。
+可能原因：test_api_spec.md 的语义与「怎么发 HTTP 请求」查询不够贴近，或两篇测试文档语义太接近难以区分。
+修复方向：检查 test_api_spec.md 的内容，让请求封装规范描述更完整具体；必要时调低 _SCORE_THRESHOLD 或换更强的 embedding 模型（如 bge-base-zh-v1.5）。
 ```
 
 ### 在 cli.py 里打印指标报告
@@ -14406,7 +14467,7 @@ if result.metrics:
 ────────────────────────────────────────────────────
   会话统计报告
 ────────────────────────────────────────────────────
-  问题：我们公司的退货政策是什么？
+  问题：按我们内部 API 规范写一个调用用户服务的函数
   会话 ID：a3f1b2c4
 ────────────────────────────────────────────────────
   LLM 调用轮次   : 2 轮
