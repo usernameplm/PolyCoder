@@ -12825,6 +12825,90 @@ class KnowledgeBaseTool(BaseTool):
         }, ensure_ascii=False, indent=2)
 ```
 
+### 独立运行 demo（不接 Agent，直接验证检索）
+
+写完工具后，别急着接进 Coordinator。先单独跑一遍，确认"加载 → 编码 → 建索引 → 检索"这条链路是通的。
+在文件末尾加一段 `__main__`，或另存为 `demo_kb.py`：
+
+```python
+# demo_kb.py —— 独立验证知识库向量检索（不调用对话 LLM）
+import asyncio
+import json
+
+from tools.knowledge_base import KnowledgeBaseTool
+
+
+async def main():
+    # 用 :memory: 内存向量库，不依赖 Docker 起的 Qdrant，跑完即清空
+    # 想连真实 Qdrant 就删掉 qdrant_url 参数（默认 http://localhost:6333）
+    kb = KnowledgeBaseTool(kb_dir="knowledge_base", qdrant_url=":memory:")
+
+    # 首次调用会：加载文档 → 下载/加载 bge-small-zh-v1.5 → 编码 → 写入向量库
+    print("首次加载（含模型下载 + 建索引，可能要几秒到几十秒）...")
+    await kb.ensure_loaded()
+
+    # 故意用和原文不同的说法，验证"语义匹配"而非"字面匹配"
+    queries = [
+        "买了东西不想要了怎么办",   # 语义 ≈ 退货政策（原文没有"不想要"这几个字）
+        "支持苹果手机吗",           # 语义 ≈ 支持哪些平台
+        "怎么充钱变成会员",         # 语义 ≈ 如何升级付费版
+        "今天天气怎么样",           # 无关：应命中不到或分数很低
+    ]
+
+    for q in queries:
+        print(f"\n{'=' * 60}\n查询：{q}")
+        raw = await kb.execute({"query": q, "top_k": 2})
+        data = json.loads(raw)
+        if not data.get("found"):
+            print("  → 未命中（符合无关查询的预期）")
+            continue
+        for i, r in enumerate(data["results"], 1):
+            print(f"  {i}. [{r['relevance']}] {r['title']}（{r['source']}）")
+            print(f"     {r['content'][:60]}...")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+运行：
+
+```bash
+python demo_kb.py
+```
+
+预期输出（相似度分数、命中文档因模型/文档而异，重点看**语义匹配是否正确**）：
+
+```
+首次加载（含模型下载 + 建索引，可能要几秒到几十秒）...
+  [KnowledgeBase] 发现 2 个文件（文本 2，PDF 0，图片 0）
+  [KnowledgeBase] 加载完成，共 2 个文档块
+  [KnowledgeBase] 向量索引完成，共 2 个向量（模型 BAAI/bge-small-zh-v1.5，维度 512）
+
+============================================================
+查询：买了东西不想要了怎么办
+  1. [0.61] company_policy（knowledge_base/company_policy.md）
+     # 公司退换货政策 ## 退货条件 - 购买后 7 天内可无理由退货...
+
+============================================================
+查询：支持苹果手机吗
+  1. [0.58] product_faq（knowledge_base/product_faq.md）
+     # 产品常见问题 ## Q：支持哪些平台？...
+
+============================================================
+查询：怎么充钱变成会员
+  1. [0.55] product_faq（knowledge_base/product_faq.md）
+     ...如何升级到付费版...
+
+============================================================
+查询：今天天气怎么样
+  → 未命中（符合无关查询的预期）
+```
+
+> **看点**：前三个查询用的词和原文几乎不重合（"不想要"→"退货"、"苹果手机"→"平台"、"充钱变会员"→"升级付费"），
+> 但都命中了正确文档——这正是 TF-IDF 做不到、向量检索能做到的**语义匹配**。最后一个无关查询被
+> `_SCORE_THRESHOLD` 过滤掉，返回"未命中"。如果这里也返回了文档，说明阈值偏低，可上调 `_SCORE_THRESHOLD`。
+
 ---
 
 ## 15.10 准备知识库测试文档
