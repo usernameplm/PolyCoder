@@ -120,7 +120,8 @@ class MessageHandler:
         # 调用 Agent
         try:
             result = await self._coordinator.run(text, session_id=session_key)
-            await self.client.send_text(receive_id, result.text, id_type=receive_id_type)
+            # Agent 回复常含 Markdown（代码块、加粗、列表），用卡片发送才能正确渲染
+            await self.client.send_markdown(receive_id, result.text, id_type=receive_id_type)
         except Exception as e:
             await self.client.send_text(receive_id, f"处理时遇到错误，请稍后重试。", id_type=receive_id_type)
             print(f"[Handler] 错误：{e}")

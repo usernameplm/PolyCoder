@@ -66,6 +66,34 @@ class FeishuClient:
                 },
             )
 
+    async def send_markdown(self, receive_id: str, markdown: str, id_type: str = "open_id"):
+        """
+        以交互式卡片（interactive）发送 Markdown 内容——飞书的 text 类型不渲染 Markdown，
+        必须用卡片里的 markdown 元素，才能显示加粗、代码块、列表、链接等格式。
+
+        receive_id / id_type：同 send_text。
+        """
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {"tag": "markdown", "content": markdown},
+            ],
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={id_type}",
+                headers=await self._headers(),
+                json={
+                    "receive_id": receive_id,
+                    "msg_type": "interactive",
+                    "content": json.dumps(card, ensure_ascii=False),
+                },
+            )
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"send_markdown 失败：code={data.get('code')} msg={data.get('msg')}")
+        return data.get("data", {})
+
     async def add_reaction(self, message_id: str, emoji: str = "OnIt") -> dict:
         """
         添加 Emoji 反应（显示"处理中"效果），返回响应里的 data（含 reaction_id）。

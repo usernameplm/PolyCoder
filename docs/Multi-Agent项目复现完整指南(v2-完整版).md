@@ -8459,6 +8459,34 @@ class FeishuClient:
                 },
             )
 
+    async def send_markdown(self, receive_id: str, markdown: str, id_type: str = "open_id"):
+        """
+        以交互式卡片（interactive）发送 Markdown 内容——飞书的 text 类型不渲染 Markdown，
+        必须用卡片里的 markdown 元素，才能显示加粗、代码块、列表、链接等格式。
+
+        receive_id / id_type：同 send_text。
+        """
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {"tag": "markdown", "content": markdown},
+            ],
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={id_type}",
+                headers=await self._headers(),
+                json={
+                    "receive_id": receive_id,
+                    "msg_type": "interactive",
+                    "content": json.dumps(card, ensure_ascii=False),
+                },
+            )
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"send_markdown 失败：code={data.get('code')} msg={data.get('msg')}")
+        return data.get("data", {})
+
     async def add_reaction(self, message_id: str, emoji: str = "OnIt") -> dict:
         """
         添加 Emoji 反应（显示"处理中"效果），返回响应里的 data（含 reaction_id）。
@@ -8497,6 +8525,8 @@ class FeishuClient:
 ```
 
 > **⚠️ emoji_type 是大小写敏感的固定枚举，别自己编。** 直觉上会写 `"Thinking"` 表示"思考中"，但它**不是**飞书的合法值，会返回 `code=231001 reaction type is invalid`——而且如果 `add_reaction` 不检查 `code`、不 `return data`（早期写法就是发完请求什么都不返回），这个错误会被上层的 `except` 静默吞掉，表现成「能回答但没有表情」，极难排查。本项目用 `OnIt`（👌 处理中），实测有效。
+
+> **⚠️ 为什么 Agent 回复要用 `send_markdown` 而不是 `send_text`？** 飞书的 `msg_type: "text"` 是**纯文本**，`**加粗**`、代码块、`# 标题`、列表会原样显示成字面量，不渲染。Agent 的回复几乎都含 Markdown，所以要用 `interactive` 交互式卡片 + `markdown` 元素发送（`send_markdown`）才能正确渲染。注意飞书支持的是 Markdown 的**子集**（加粗/斜体/代码/链接/列表可用，复杂表格、多级嵌套可能不支持）。纯文本的命令回复（`/help`、`/clear`）继续用 `send_text` 即可，没必要包卡片。
 
 ---
 
@@ -8629,7 +8659,8 @@ class MessageHandler:
         # 调用 Agent
         try:
             result = await self._coordinator.run(text, session_id=session_key)
-            await self.client.send_text(receive_id, result.text, id_type=receive_id_type)
+            # Agent 回复常含 Markdown（代码块、加粗、列表），用卡片发送才能正确渲染
+            await self.client.send_markdown(receive_id, result.text, id_type=receive_id_type)
         except Exception as e:
             await self.client.send_text(receive_id, f"处理时遇到错误，请稍后重试。", id_type=receive_id_type)
             print(f"[Handler] 错误：{e}")
@@ -8848,6 +8879,9 @@ async def lifespan(app: FastAPI):
 □ 发消息时出现"处理中"👌 Emoji（OnIt），回复后消失
   （如果没出现：看日志有没有 231001 reaction type is invalid——emoji_type 用错了；
    emoji_type 是大小写敏感的固定枚举，见 12.3 的合法值说明）
+
+□ Agent 回复的 Markdown 正确渲染（加粗、代码块、列表显示为格式，而非字面量）
+  （用 send_markdown 走 interactive 卡片；若显示成 **加粗** 字面量，说明还在用 send_text）
 
 □ /help 命令返回帮助文字
 
