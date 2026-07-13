@@ -8060,17 +8060,20 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
 
 ---
 
-### 11.3.1 预拉取 Prometheus 和 Grafana 镜像
+### 11.3.1 预拉取 Prometheus、Grafana 和 Tempo 镜像
 
-Prometheus 和 Grafana 需要独立部署。本章先拉取镜像（确保网络通畅、镜像可下载），具体 Docker 部署脚本统一放到第 13 章。
+Prometheus（指标）、Grafana（可视化）和 Tempo（链路追踪存储）需要独立部署。本章先拉取镜像（确保网络通畅、镜像可下载），具体 Docker 部署脚本统一放到第 13 章。
 
 ```bash
-# 预拉取镜像（约 500MB，首次下载需要几分钟）
+# 预拉取镜像（约 600MB，首次下载需要几分钟）
 docker pull prom/prometheus:latest
 docker pull grafana/grafana:latest
+docker pull grafana/tempo:latest
 ```
 
-> 这两个镜像在第 13 章的 `docker-compose.yml` 里会和 PolyCoder 服务一起编排启动，这里先不写部署脚本，避免分散注意力。
+> **为什么用 Tempo 而不是 Jaeger？** 两者都能接收 OpenTelemetry（OTLP）链路数据，但 Tempo 是 Grafana 官方的链路存储后端，**不需要单独的 UI**——它直接作为 Grafana 的一个数据源，链路和指标（Prometheus）在同一个 Grafana 界面里查看，运维一套即可。Jaeger 则自带独立 UI（16686 端口），需要额外开一个页面。本指南统一到 Grafana，所以选 Tempo。
+>
+> 这三个镜像在第 13 章的 `docker-compose.yml` 里会和 PolyCoder 服务一起编排启动，这里先不写部署脚本，避免分散注意力。
 
 ---
 
@@ -8085,7 +8088,7 @@ OpenTelemetry 链路追踪。
   "用户的这个请求，经过了哪些 Agent？每个 Agent 耗时多少？哪里最慢？"
 
 每个操作（一次 Agent 调用、一次工具调用）创建一个 Span（跨度）。
-多个 Span 串成一条链路（Trace），在 Jaeger 或 Tempo 中可视化展示。
+多个 Span 串成一条链路（Trace），推送到 Tempo 存储，在 Grafana 的 Explore 页面里可视化展示。
 """
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -8097,7 +8100,7 @@ def setup_tracing(service_name: str = "my-agent", otlp_endpoint: str | None = No
     """
     初始化链路追踪，在服务启动时调用一次。
 
-    otlp_endpoint：OTLP 导出地址（Jaeger、Tempo 等）
+    otlp_endpoint：OTLP 导出地址（Tempo、Jaeger 等），例如 http://tempo:4317
     如果不传，链路数据不导出（但代码里的 tracer 调用不报错）。
     """
     resource = Resource.create({"service.name": service_name})
@@ -8247,7 +8250,8 @@ with TestClient(main.app) as c:
 
 □ 工具 Span（tool_{name}）建在 ToolExecutor._execute_one 里，不要改成串行 for 循环
 
-□ （可选）配置 OTEL_EXPORTER_OTLP_ENDPOINT 后，Jaeger 中能看到一条完整的链路（agent_loop → turn_N → tool_xxx）
+□ （可选）配置 OTEL_EXPORTER_OTLP_ENDPOINT 后，链路推送到 Tempo，在 Grafana → Explore →
+  选择 Tempo 数据源里能看到一条完整的链路（agent_loop → turn_N → tool_xxx）
 ```
 
 ---
@@ -8640,6 +8644,11 @@ my-agent/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── prometheus.yml       ← Prometheus 抓取配置
+├── tempo.yaml           ← Tempo 链路存储配置
+├── grafana/
+│   └── provisioning/
+│       └── datasources/
+│           └── datasources.yaml   ← Grafana 数据源自动配置（Prometheus + Tempo）
 ├── entrypoint.sh
 ├── .env.shared          ← 所有环境共用的配置
 ├── .env.dev             ← 开发环境配置（热重载）
@@ -8801,7 +8810,7 @@ services:
       - "--storage.tsdb.path=/prometheus"
     restart: unless-stopped
 
-  # ── Grafana 可视化 ───────────────────────────────────────────────
+  # ── Grafana 可视化（同时看指标 Prometheus + 链路 Tempo）───────────
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
@@ -8810,30 +8819,40 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      # 开启 Tempo 相关特性（trace 到 metrics 的跳转）
+      - GF_FEATURE_TOGGLES_ENABLE=traceToMetrics
     volumes:
       - grafana_data:/var/lib/grafana
+      # 数据源自动配置：容器启动时自动连好 Prometheus 和 Tempo，无需手动点界面
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
     restart: unless-stopped
     depends_on:
       - prometheus
+      - tempo
 
-  # ── Jaeger 链路追踪 ──────────────────────────────────────────────
-  jaeger:
-    image: jaegertracing/all-in-one:latest
-    container_name: jaeger
+  # ── Tempo 链路追踪（存储后端，UI 走 Grafana）─────────────────────
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    command: ["-config.file=/etc/tempo.yaml"]
     ports:
-      - "16686:16686"                # Jaeger UI（查询页面）
       - "4317:4317"                  # OTLP gRPC 接收端口（你的服务 push span 到这里）
-    environment:
-      - COLLECTOR_OTLP_ENABLED=true  # 开启 OTLP 协议接收
+      - "3200:3200"                  # Tempo HTTP API（Grafana 数据源查询用）
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml
+      - tempo_data:/var/tempo
     restart: unless-stopped
 
 volumes:
   redis_data:
   prometheus_data:
   grafana_data:
+  tempo_data:
 ```
 
-> **镜像清单**（共 5 个）：`python:3.11-slim`（Dockerfile FROM） + `redis:7-alpine`（会话缓存） + `prom/prometheus:latest`（指标抓取） + `grafana/grafana:latest`（指标可视化） + `jaegertracing/all-in-one:latest`（链路追踪 UI）。其中 `my-agent:latest` 是通过 Dockerfile `build` 生成的，不是外部镜像。
+> **镜像清单**（共 5 个）：`python:3.11-slim`（Dockerfile FROM） + `redis:7-alpine`（会话缓存） + `prom/prometheus:latest`（指标抓取） + `grafana/grafana:latest`（指标 + 链路可视化） + `grafana/tempo:latest`（链路追踪存储）。其中 `my-agent:latest` 是通过 Dockerfile `build` 生成的，不是外部镜像。
+>
+> **Tempo 没有独立 UI**：它只负责接收（4317）和存储（3200 供查询）链路数据，查看链路统一走 Grafana。所以对比第 11 章的 Jaeger 方案，这里少了一个 `16686` UI 端口，多了一个 `3200` 查询端口和 Grafana 数据源。
 
 **项目根目录下创建 `prometheus.yml`**（与 `docker-compose.yml` 同级）：
 
@@ -8856,6 +8875,89 @@ scrape_configs:
 
 ---
 
+### 13.5.1 `tempo.yaml`（Tempo 配置，与 `docker-compose.yml` 同级）
+
+Tempo 需要一个配置文件告诉它「从哪个端口收链路」「存到哪里」。下面是一份最小可用的单机配置（本地文件存储，不接对象存储）：
+
+```yaml
+# tempo.yaml
+server:
+  http_listen_port: 3200          # Grafana 数据源查询走这个端口
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"   # 接收你的服务 push 过来的 OTLP gRPC 链路
+
+ingester:
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 24h          # 链路数据保留 24 小时（本地开发够用）
+
+storage:
+  trace:
+    backend: local                # 本地磁盘存储（生产可换成 s3/gcs）
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+```
+
+> **端口对应关系**：你的服务把 Span 推到 `tempo:4317`（OTLP gRPC，见 `.env.shared` 里的 `OTEL_EXPORTER_OTLP_ENDPOINT`），Grafana 查询链路时连的是 `tempo:3200`（HTTP API）。两个端口各司其职，别搞混。
+
+---
+
+### 13.5.2 Grafana 数据源自动配置（免手动点界面）
+
+第 11 章检查清单里「打开 Grafana 手动添加 Prometheus 数据源」这一步，可以用 Grafana 的 **provisioning** 机制自动完成——把数据源写进一个 YAML 文件，Grafana 启动时自动加载。这样 `docker compose up` 之后，Prometheus 和 Tempo 两个数据源就已经连好了。
+
+**创建 `grafana/provisioning/datasources/datasources.yaml`**（注意目录层级，`docker-compose.yml` 里挂载的就是这个路径）：
+
+```yaml
+# grafana/provisioning/datasources/datasources.yaml
+apiVersion: 1
+
+datasources:
+  # ── 指标：Prometheus ──────────────────────────────────────────
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090      # Docker 网络内用服务名
+    isDefault: true
+
+  # ── 链路：Tempo ───────────────────────────────────────────────
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200           # 连 Tempo 的 HTTP 查询端口
+    jsonData:
+      # 从链路 Span 跳到对应指标（可选，增强联动）
+      tracesToMetrics:
+        datasourceUid: prometheus
+      # 服务依赖图需要的节点/边指标
+      serviceMap:
+        datasourceUid: prometheus
+```
+
+> **目录结构**：完成后项目根目录多出这样一个文件夹：
+> ```
+> my-agent/
+> ├── docker-compose.yml
+> ├── prometheus.yml
+> ├── tempo.yaml
+> └── grafana/
+>     └── provisioning/
+>         └── datasources/
+>             └── datasources.yaml
+> ```
+> Grafana 官方约定 `provisioning/datasources/` 下的所有 YAML 都会在启动时被读取，无需在文件名上做特殊约定。
+
+---
+
 ## 13.6 拆分环境变量文件
 
 **`.env.shared`（所有环境共用）：**
@@ -8868,8 +8970,8 @@ LLM_PROVIDER=anthropic
 LLM_MODEL=claude-sonnet-4-6
 APP_PORT=8002
 
-# OpenTelemetry 链路追踪导出地址（第 11 章）
-OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+# OpenTelemetry 链路追踪导出地址（第 11 章）——推送到 Tempo 的 OTLP gRPC 端口
+OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
 ```
 
 **`.env.dev`（开发环境）：**
@@ -8942,6 +9044,40 @@ curl -X POST http://localhost:8002/ask \
 
 ---
 
+## 13.7.1 在 Grafana 里查看指标和链路
+
+启动后所有可观测性数据都在一个 Grafana 界面查看，登录信息：`http://localhost:3000`，账号密码都是 `admin`（首次登录会要求改密码，本地可跳过）。
+
+**① 确认数据源已自动连好**
+
+`Connections → Data Sources`，应该看到 provisioning 自动创建的两个数据源：
+- **Prometheus**（`http://prometheus:9090`）——指标
+- **Tempo**（`http://tempo:3200`）——链路
+
+各自点进去拉到底 `Save & test`，看到绿色 "successfully" 即连接正常。如果这里是空的，说明 `grafana/provisioning/datasources/datasources.yaml` 没挂载进去，检查 `docker-compose.yml` 的 volumes 路径和文件是否存在，然后 `docker compose restart grafana`。
+
+**② 查看链路（Tempo）**
+
+先发几次 `/ask` 请求产生链路数据，然后：
+
+1. 左侧菜单 `Explore`
+2. 顶部数据源下拉选 **Tempo**
+3. 查询模式选 `Search`，Service Name 选 `my-agent`（对应 `tracing.py` 里的 `service.name`），点 `Run query`
+4. 结果列表里点任意一条 trace，右侧展开火焰图，能看到完整链路：`agent_loop → turn_0 → tool_xxx → turn_1 → ...`，每段的耗时一目了然
+
+> 如果 Search 标签页是灰的/不可用，用 `TraceQL` 模式输入 `{}` 也能列出最近的全部链路。
+
+**③ 查看指标（Prometheus）**
+
+同样在 `Explore`，数据源切到 **Prometheus**，输入指标名验证打点是否生效，例如：
+- `agent_requests_total` —— 请求总数（按 provider/model/status 分类）
+- `rate(agent_latency_seconds_sum[5m]) / rate(agent_latency_seconds_count[5m])` —— 平均延迟
+- `active_requests` —— 当前活跃请求数
+
+需要长期看板可以在 `Dashboards → New` 里把这些指标做成图表面板。
+
+---
+
 ## 13.8 常见部署问题
 
 **Q：docker compose up 时报 "Permission denied" 关于 entrypoint.sh？**
@@ -8961,6 +9097,20 @@ A：Redis 还没有就绪。检查：
 
 A：检查 `.env.shared` 文件是否在 docker compose 的 `env_file` 里，以及 Key 格式是否正确（没有额外空格）。
 
+**Q：Grafana 里 Tempo 数据源没有自动出现 / 测试连接失败？**
+
+A：分两种情况：
+1. **数据源根本没出现**：provisioning 文件没挂载进去。确认 `grafana/provisioning/datasources/datasources.yaml` 存在，且 `docker-compose.yml` 里 grafana 的 volumes 有 `./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources`，然后 `docker compose restart grafana`。
+2. **出现了但测试失败**：URL 要填 `http://tempo:3200`（HTTP 查询端口），不是 `4317`（那是 OTLP 接收端口，Grafana 连它会失败）。
+
+**Q：发了请求但 Grafana Explore 里搜不到链路？**
+
+A：按顺序排查：
+1. `.env.shared` 里 `OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317` 是否配置（不配就不导出，见第 11 章）。
+2. 依赖 `opentelemetry-exporter-otlp-proto-grpc` 是否装了（没装的话 `tracing.py` 会打印 "未安装...链路数据不导出"）。
+3. `docker compose logs tempo` 看 Tempo 是否正常启动、有没有报 `tempo.yaml` 配置错误。
+4. Tempo 有几秒的 ingester 缓冲，发完请求稍等几秒再刷新查询。
+
 ---
 
 ## 13.9 本章检查清单
@@ -8968,7 +9118,7 @@ A：检查 `.env.shared` 文件是否在 docker compose 的 `env_file` 里，以
 ```
 □ Dockerfile 构建成功（docker build -t my-agent . 无报错）
 
-□ docker compose up 能正常启动（5 个服务都变成 running：agent + redis + prometheus + grafana + jaeger）
+□ docker compose up 能正常启动（5 个服务都变成 running：agent + redis + prometheus + grafana + tempo）
 
 □ redis 服务健康检查通过（docker compose ps 显示 healthy）
 
@@ -8978,9 +9128,11 @@ A：检查 `.env.shared` 文件是否在 docker compose 的 `env_file` 里，以
 
 □ 打开 http://localhost:9090 → Status → Targets，polycoder 状态为 UP
 
-□ 打开 http://localhost:3000 → Data Sources → 添加 Prometheus（URL: http://prometheus:9090），测试通过
+□ 打开 http://localhost:3000 → Connections → Data Sources，Prometheus 和 Tempo 两个数据源
+  已自动出现（provisioning 生效），各自点 "Test" 均通过
 
-□ 打开 http://localhost:16686（Jaeger UI），能搜到链路数据（需先发几次 /ask 请求）
+□ 打开 http://localhost:3000 → Explore → 选择 Tempo 数据源 → Search，能搜到链路数据
+  （需先发几次 /ask 请求；Tempo 没有独立 UI，链路只在 Grafana 里看）
 
 □ 发送问题能得到回答（end-to-end 验证）
 
@@ -9605,7 +9757,7 @@ Commit 命名规范：
 ### 亮点 5：生产级可观测性三件套
 
 - **结构化日志（structlog）**：JSON 格式，每条日志携带 session_id / turn / token 信息，便于 ELK / Loki 检索
-- **链路追踪（OpenTelemetry）**：每次 LLM 调用、工具执行均生成 Span，可在 Jaeger / Zipkin 中追踪完整链路
+- **链路追踪（OpenTelemetry）**：每次 LLM 调用、工具执行均生成 Span，推送到 Grafana Tempo，在 Grafana Explore 里追踪完整链路
 - **Prometheus 指标**：暴露请求数、P99 延迟、Token 消耗速率，接入 Grafana 大盘
 
 ### 亮点 6：飞书机器人全链路集成
