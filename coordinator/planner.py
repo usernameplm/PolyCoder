@@ -5,7 +5,7 @@
 import json
 import re
 from providers.router import get_provider
-from providers.types import Message, TextBlock
+from providers.types import Message, TextBlock, Usage
 from dataclasses import dataclass, field
 from observability.logging import logger
 
@@ -54,20 +54,30 @@ _COORDINATOR_SYSTEM = """
 """
 
 
-async def make_plan(user_request: str, session_id: str | None = None) -> tuple[list[TaskSpec], str | None]:
+async def make_plan(
+    user_request: str,
+    session_id: str | None = None,
+    history: list[Message] | None = None,
+) -> tuple[list[TaskSpec], str | None, Usage]:
     """
     调用 LLM 生成任务计划。
 
+    history 是之前轮次的对话（第 10 章会话记忆），用于让规划器理解上下文中的
+    代词/指代（比如"再看看那个文件"），不传则视为无记忆的单轮请求。
+
     返回：
-        (TaskSpec 列表, 直接回复文字 or None)
-        - 如果有任务：(tasks, None)
-        - 如果不需要子 Agent：([], 直接回复文字)
+        (TaskSpec 列表, 直接回复文字 or None, 本次调用的 Token 用量)
+        - 如果有任务：(tasks, None, usage)
+        - 如果不需要子 Agent：([], 直接回复文字, usage)
     """
     log = logger.bind(session_id=session_id) if session_id else logger
     provider = get_provider()
 
+    messages = list(history) if history else []
+    messages.append(Message(role="user", content=[TextBlock(text=user_request)]))
+
     response = await provider.chat(
-        messages=[Message(role="user", content=[TextBlock(text=user_request)])],
+        messages=messages,
         system=_COORDINATOR_SYSTEM,
         max_tokens=2048,
     )
@@ -77,7 +87,8 @@ async def make_plan(user_request: str, session_id: str | None = None) -> tuple[l
         if isinstance(block, TextBlock):
             raw_text += block.text
 
-    return _parse_plan(raw_text, log)
+    tasks, direct_reply = _parse_plan(raw_text, log)
+    return tasks, direct_reply, response.usage
 
 
 def _parse_plan(text: str, log=None) -> tuple[list[TaskSpec], str | None]:

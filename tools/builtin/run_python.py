@@ -16,6 +16,7 @@ import asyncio
 import sys
 import textwrap
 from tools.base import BaseTool
+from core.workspace import get_workspace
 
 # 危险模块黑名单（在代码字符串层面做简单检查）
 _BLOCKED_IMPORTS = [
@@ -71,10 +72,12 @@ class RunPythonTool(BaseTool):
                 return f"错误：代码包含被禁止的操作（{blocked}），出于安全考虑无法执行"
 
         # 用 asyncio.create_subprocess_exec 在子进程运行，隔离环境
+        # cwd 设为统一工作目录：代码里的相对路径都相对工作目录，和其他工具一致
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-c", textwrap.dedent(code),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=str(get_workspace()),
         )
 
         try:

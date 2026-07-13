@@ -212,6 +212,7 @@ aiofiles>=24.0.0            # 异步文件读写（会话持久化用）
 structlog>=24.0.0           # 结构化日志（JSON 格式，便于日志聚合）
 opentelemetry-sdk>=1.25.0   # OpenTelemetry 链路追踪
 prometheus-client>=0.21.0   # Prometheus 指标暴露
+opentelemetry-exporter-otlp-proto-grpc>=1.25.0   # 可选：不装也能跑，只是 Span 不会导出到 Jaeger/Tempo（tracing.py 里 ImportError 会被吞掉，打印一行提示）
 
 # ── 存储 ──────────────────────────────────────────────────────────
 redis>=5.0.0                # Redis 客户端（5.x 起自带 redis.asyncio 异步支持，aioredis 已停止维护，不需要再装）
@@ -276,7 +277,12 @@ GEMINI_MODEL=gemini-2.0-flash
 # ── 通用配置 ──────────────────────────────────────────────────────
 LLM_MODEL=claude-sonnet-4-6  # Anthropic Provider 使用的默认模型
 APP_PORT=8002                 # 服务监听端口
+
+# ── 工作目录（所有工具和子 Agent 的文件操作都限定在此目录内）──────────
+WORKSPACE=.                   # 默认当前目录；生产建议指向一个专门的工作区，如 /data/workspace
 ```
+
+> **为什么要有统一工作目录？** Agent 的工具会读写文件、执行代码。如果每个工具各自决定在哪读写，行为就不可控——尤其飞书/HTTP 是外部入口，用户可能诱导模型写到 `/etc` 这类系统路径。本项目把「工作目录」作为**唯一真相来源**（`WORKSPACE` 环境变量）：所有工具（`read_file`/`write_file`/`search_code`/`list_dir`/`run_python`）和所有子 Agent 的文件操作都限定在这个目录内，且禁止用 `../` 或绝对路径穿越到目录外。详见 0.4 的 `core/workspace.py` 和第 6 章工具实现。
 
 **关于 `.gitignore`**：
 
@@ -331,6 +337,10 @@ class Settings(BaseSettings):
     llm_model: str = "claude-sonnet-4-6"
     app_port: int = 8002
 
+    # 工作目录：所有工具（读/写/搜索/执行）和子 Agent 的文件操作都限定在此目录内，
+    # 且禁止路径穿越到目录外。启动时用环境变量 WORKSPACE 覆盖，默认当前目录。
+    workspace: str = "."
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
@@ -339,11 +349,68 @@ class Settings(BaseSettings):
 settings = Settings()
 ```
 
+**创建 `core/workspace.py`（统一工作目录 + 路径沙箱）：**
+
+这是「工作目录」这一概念的落地实现。它从 `settings.workspace` 读出唯一的工作目录，并提供带**路径穿越校验**的安全写入函数——所有工具都调它，而不是各自 `Path(...)` 直接读写：
+
+```python
+# core/workspace.py
+"""
+全项目统一的工作目录（工作区）。
+
+设计目标：所有工具（read_file / write_file / search_code / list_dir / run_python）
+和所有子 Agent 的文件操作，都限定在同一个工作目录内，且禁止路径穿越到目录外。
+
+工作目录的唯一来源是 core.config.settings.workspace（环境变量 WORKSPACE，默认当前目录）。
+启动服务时用 WORKSPACE=/path uvicorn main:app 指定，一处设置，全局生效。
+"""
+from pathlib import Path
+from core.config import settings
+
+
+class PathTraversalError(ValueError):
+    """请求路径解析后跑出了工作目录范围。"""
+
+
+def get_workspace() -> Path:
+    """返回工作目录的绝对路径（唯一来源：settings.workspace）。"""
+    return Path(settings.workspace).resolve()
+
+
+def resolve_safe_path(raw_path: str, workspace: Path | None = None) -> Path:
+    """把相对路径解析为工作目录内的绝对路径；跑出工作目录则抛 PathTraversalError。"""
+    workspace = (workspace or get_workspace()).resolve()
+    target = (workspace / raw_path).resolve()
+    if target != workspace and workspace not in target.parents:
+        raise PathTraversalError(f"路径 '{raw_path}' 解析后跑出了工作目录范围，拒绝访问")
+    return target
+
+
+def write_text_sandboxed(raw_path: str, content: str, workspace: Path | None = None) -> Path:
+    """在沙箱校验通过后写盘，自动创建缺失的父目录。返回写入的绝对路径。"""
+    target = resolve_safe_path(raw_path, workspace)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return target
+```
+
+> **为什么用 `workspace not in target.parents` 而不是字符串 `startswith`？** 字符串前缀判断会把 `/data/workspace-evil` 误判为在 `/data/workspace` 内（前缀相同但不是子目录）。`Path.parents` 是基于路径层级的判断，`.resolve()` 又会先把 `../` 展开成真实路径，两者配合才能严丝合缝地拦住穿越。
+
 **验证配置加载正常：**
 
 ```bash
 python -c "from core.config import settings; print('Provider:', settings.llm_provider)"
 # 应该输出：Provider: anthropic
+
+# 验证工作目录沙箱（穿越应被拦截）
+WORKSPACE=/tmp/ws python -c "
+from core.workspace import resolve_safe_path, PathTraversalError
+print('正常路径:', resolve_safe_path('a/b.py'))
+try:
+    resolve_safe_path('../evil.py')
+except PathTraversalError as e:
+    print('穿越已拦截:', e)
+"
 ```
 
 ---
@@ -2681,6 +2748,24 @@ from .api import ask, ask_stream, AskResult
 
 这样 `from agent import ask` 依然正常工作，`__init__.py` 保持干净。
 
+> **后续更新**：`agent/agent.py` 这套"单 Agent 直接对话"接口在第 10 章引入
+> Coordinator 架构后被逐步架空——`ask_stream()`/`clear_session()` 先搬到
+> `coordinator/agent.py`（10.4b），最终 `ask()` 本身也统一改成调用
+> `CoordinatorAgent.run()`（10.5），`agent/agent.py` 整个文件被删除。
+> `agent/loop.py`、`agent/executor.py` 这些底层组件保留，继续被
+> `sub_agents/base.py` 复用；只是不再有 `agent/agent.py` 这层"对外接口"，
+> CLI 和 Web 接口统一走 `coordinator/agent.py`。
+>
+> **再后续更新**：`agent/agent.py` 删除之后，`agent/` 这个包名本身也不太
+> 准确了——里面已经没有任何"Agent"（没有 system prompt、没有对话入口），
+> 纯粹是被 `sub_agents/base.py` 复用的底层执行引擎。于是整个目录改名为
+> `agent_core/`：`agent/loop.py`→`agent_core/loop.py`，
+> `agent/executor.py`→`agent_core/executor.py`，
+> `agent/state.py`→`agent_core/state.py`，
+> `agent/context.py`→`agent_core/context.py`。`sub_agents/base.py` 里
+> `from agent.loop import run_agent_loop` 等导入相应改成
+> `from agent_core.loop import run_agent_loop`。
+
 ---
 
 ## 4.7 Agentic Loop 的工作流程图
@@ -2990,12 +3075,15 @@ Coding Agent 最常用的工具——让 Agent 能看到用户的代码文件。
 """
 from pathlib import Path
 from tools.base import BaseTool
+from core.workspace import get_workspace
 
 
 class ReadFileTool(BaseTool):
 
-    def __init__(self, workspace: str = "."):
-        self.workspace = Path(workspace).resolve()
+    def __init__(self, workspace: str | Path | None = None):
+        # 默认使用全局统一工作目录（环境变量 WORKSPACE）；传参仅用于测试/临时覆盖。
+        # 这样 sub_agents 里 ReadFileTool() 无参实例化就自动跟其他工具用同一个目录。
+        self.workspace = Path(workspace).resolve() if workspace is not None else get_workspace()
 
     @property
     def name(self) -> str:
@@ -3080,6 +3168,7 @@ import asyncio
 import sys
 import textwrap
 from tools.base import BaseTool
+from core.workspace import get_workspace
 
 # 危险模块黑名单（在代码字符串层面做简单检查）
 _BLOCKED_IMPORTS = [
@@ -3135,10 +3224,12 @@ class RunPythonTool(BaseTool):
                 return f"错误：代码包含被禁止的操作（{blocked}），出于安全考虑无法执行"
 
         # 用 asyncio.create_subprocess_exec 在子进程运行，隔离环境
+        # cwd 设为统一工作目录：代码里的相对路径都相对工作目录，和其他工具一致
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-c", textwrap.dedent(code),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=str(get_workspace()),
         )
 
         try:
@@ -3173,14 +3264,16 @@ class RunPythonTool(BaseTool):
 import re
 from pathlib import Path
 from tools.base import BaseTool
+from core.workspace import get_workspace
 
 _CODE_EXTENSIONS = {".py", ".js", ".ts", ".go", ".java", ".cpp", ".c", ".rs", ".md"}
 
 
 class SearchCodeTool(BaseTool):
 
-    def __init__(self, workspace: str = "."):
-        self.workspace = Path(workspace).resolve()
+    def __init__(self, workspace: str | Path | None = None):
+        # 默认使用全局统一工作目录（环境变量 WORKSPACE）；传参仅用于测试/临时覆盖。
+        self.workspace = Path(workspace).resolve() if workspace is not None else get_workspace()
 
     @property
     def name(self) -> str:
@@ -3363,32 +3456,48 @@ curl -X POST http://localhost:8002/ask \
 
 **写入文件工具 `tools/builtin/write_file.py`（让 Agent 能生成并保存代码）：**
 
+写入必须走 `core/workspace.py` 的 `write_text_sandboxed()`——它会把路径限定在工作目录内，
+拦截 `../` 穿越和绝对路径。**绝不要直接 `Path(inputs["path"]).write_text(...)`**，那样
+模型可以写到任意系统路径（尤其飞书/HTTP 是外部入口）：
+
 ```python
+from tools.base import BaseTool
+from core.workspace import write_text_sandboxed, PathTraversalError
+
+
 class WriteFileTool(BaseTool):
     @property
     def name(self): return "write_file"
     @property
-    def description(self): return "把生成的代码写入指定路径的文件。仅在用户明确要求保存时使用。"
+    def description(self): return "把生成的代码写入指定路径的文件（限定在工作目录内）。仅在用户明确要求保存时使用。"
     @property
     def input_schema(self):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "目标文件路径"},
+                "path": {"type": "string", "description": "目标文件路径，相对工作目录，如 'out/auth.py'"},
                 "content": {"type": "string", "description": "写入的文件内容"},
             },
             "required": ["path", "content"],
         }
     async def execute(self, inputs: dict) -> str:
-        path = Path(inputs["path"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(inputs["content"], encoding="utf-8")
-        return f"已写入 {path}（{len(inputs['content'])} 字符）"
+        # 限定在工作目录内，禁止写到工作目录之外（含绝对路径 / 路径穿越）
+        try:
+            target = write_text_sandboxed(inputs["path"], inputs["content"])
+        except PathTraversalError as e:
+            return f"错误：{e}"
+        return f"已写入 {target}（{len(inputs['content'])} 字符）"
 ```
 
 **列出目录工具 `tools/builtin/list_dir.py`（让 Agent 了解项目结构）：**
 
+同样限定在工作目录内，`path` 相对工作目录解析：
+
 ```python
+from tools.base import BaseTool
+from core.workspace import get_workspace, resolve_safe_path, PathTraversalError
+
+
 class ListDirTool(BaseTool):
     @property
     def name(self): return "list_dir"
@@ -3399,14 +3508,20 @@ class ListDirTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "目录路径，默认为当前目录", "default": "."},
+                "path": {"type": "string", "description": "目录路径，相对工作目录，默认为工作目录根", "default": "."},
                 "depth": {"type": "integer", "description": "显示深度（1=仅当前层，默认 2）", "default": 2},
             },
         }
     async def execute(self, inputs: dict) -> str:
-        base = Path(inputs.get("path", "."))
+        # 限定在工作目录内，禁止路径穿越
+        try:
+            base = resolve_safe_path(inputs.get("path", "."))
+        except PathTraversalError as e:
+            return f"错误：{e}"
+        if not base.exists():
+            return f"错误：目录不存在：{inputs.get('path', '.')}"
         depth = min(int(inputs.get("depth", 2)), 4)
-        lines = [str(base)]
+        lines = [str(base.relative_to(get_workspace())) or "."]
         for p in sorted(base.rglob("*")):
             rel = p.relative_to(base)
             if len(rel.parts) > depth: continue
@@ -3713,6 +3828,11 @@ class SubAgent(ABC):
 
         return result.text
 ```
+
+> **后续更新**：`agent/` 包在第 10 章之后改名为 `agent_core/`（见 4.6 更新说明），
+> 上面 `from agent.loop import run_agent_loop`、`from agent.executor import
+> ToolExecutor` 两行导入相应变成 `from agent_core.loop import run_agent_loop`、
+> `from agent_core.executor import ToolExecutor`，其余逻辑不变。
 
 ---
 
@@ -5643,23 +5763,17 @@ curl -s http://127.0.0.1:8002/swarm/tasks/i9j0k1l2
 要么这段修复干脆就只停留在一次 HTTP 响应里，改完了等于没改。这一节补上"显式落地"
 这最后一步：新增一个接口，从任务结果里抽代码、写到调用方指定的路径。
 
-**为什么不复用 `tools/builtin/write_file.py`？** 看一眼它的 `execute()`：
+**apply 接口和 `write_file` 工具的关系？** 两者写盘时**共用同一套校验**——都调
+`core/workspace.py` 的 `write_text_sandboxed()`，都限定在统一工作目录（`WORKSPACE`）内、
+都拦截 `../` 穿越和绝对路径。`write_file` 是给 Agentic Loop 里的 LLM 主动调用的工具
+（第 5 章），apply 是给 HTTP 调用方用的接口，但只要涉及"把字符串路径写盘"，就绝不能
+不校验——否则调用方（或被诱导的 LLM）传一个 `"../../../etc/bad"` 就能往工作目录之外
+写文件，这是真实的路径穿越漏洞。
 
-```python
-# tools/builtin/write_file.py（现状）
-async def execute(self, inputs: dict) -> str:
-    path = Path(inputs["path"])          # 直接拿路径，没有任何校验
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(inputs["content"], encoding="utf-8")
-    return f"已写入 {path}（{len(inputs['content'])} 字符）"
-```
-
-这个工具的设计前提是"给 Agentic Loop 里的 LLM 主动调用"（第 5 章），路径由 LLM
-自己在推理过程中决定，风险模型是"LLM 会不会自己作妖写坑自己的代码"，本来就不是
-给"HTTP 请求体里任何人传来的字符串路径"设计的——`path` 不做任何校验，直接拼绝对
-路径就写，如果原样接到 `POST /swarm/tasks/{id}/apply` 上，调用方传一个
-`"../../../etc/bad"` 就能往工作目录之外的任意位置写文件，这是一个真实的路径穿越
-漏洞，不能图省事直接复用。新写一个 `swarm/sandbox.py` 专门做这一层校验。
+apply 之所以还单独存在、不是直接调 `write_file`，是因为它比"写盘"多了**前置一步**：
+Agent 的任务结果是"说明文字 + \`\`\`python 代码块"混在一起的自由文本，得先把代码块
+抽出来（下面的 `code_extractor.py`），再把**纯代码**交给 `write_text_sandboxed()` 落地。
+写盘这一层，apply 和 `write_file` 走的是同一个函数。
 
 ### 7.10.1 `swarm/code_extractor.py`：从任务结果里抽代码块
 
@@ -5706,75 +5820,37 @@ def extract_python_code(text: str) -> tuple[str | None, str]:
 取第一个通常就是我们要的那段；真要支持"抽取所有代码块"，教学上先不做，等真的
 遇到这种输出再加。
 
-### 7.10.2 `swarm/sandbox.py`：工作目录沙箱校验
+### 7.10.2 apply 接口的写盘校验：复用 `core/workspace.py`
 
-写法直接抄 `tools/builtin/read_file.py`（5.x 节）里现成的路径穿越检测，读文件和
-写文件的沙箱逻辑本质是同一件事——都是"确保解析后的绝对路径没有跑出工作目录"：
+apply 接口写文件同样要做路径穿越校验。这套逻辑已经在第 0 章的 `core/workspace.py`
+里实现（`resolve_safe_path` / `write_text_sandboxed`），并被所有工具共用——apply
+接口不单独维护一套，直接 `from core.workspace import ...` 复用同一个工作目录
+（环境变量 `WORKSPACE`），保证"read_file 读的目录"和"apply 写的目录"完全一致：
 
 ```python
-# swarm/sandbox.py
-"""
-apply 接口专用的工作目录沙箱：把调用方传来的相对路径解析成绝对路径，
-拒绝任何跑出工作目录范围的写入（路径穿越，如 "../../../etc/passwd"）。
-
-跟 tools/builtin/read_file.py 的穿越检测是同一套思路，这里单独抽出来，
-是因为"写文件"比"读文件"多一层需要独立配置的东西——写盘目标可能需要跟
-Agentic Loop 的工作目录（read_file 用的那个）不是同一个，所以用专门的
-SWARM_WORKSPACE 环境变量，不跟 read_file/write_file 工具共用配置。
-"""
-import os
-from pathlib import Path
-
-
-class PathTraversalError(ValueError):
-    """请求路径解析后跑出了工作目录范围。"""
-
-
-def get_workspace() -> Path:
-    return Path(os.environ.get("SWARM_WORKSPACE", ".")).resolve()
-
-
-def resolve_safe_path(raw_path: str, workspace: Path | None = None) -> Path:
-    """
-    把相对路径解析为工作目录内的绝对路径，穿越则抛 PathTraversalError。
-
-    典型攻击输入：raw_path = "../../../etc/bad" —— (workspace / raw_path).resolve()
-    会算出一个不以 workspace 为前缀的绝对路径，被下面的 startswith 检测拦下。
-    """
-    workspace = workspace or get_workspace()
-    target = (workspace / raw_path).resolve()
-    if not str(target).startswith(str(workspace)):
-        raise PathTraversalError(f"路径 '{raw_path}' 解析后跑出了工作目录范围，拒绝写入")
-    return target
-
-
-def write_text_sandboxed(raw_path: str, content: str, workspace: Path | None = None) -> Path:
-    """
-    在沙箱校验通过后写盘，自动创建缺失的父目录。返回写入的绝对路径。
-    """
-    target = resolve_safe_path(raw_path, workspace)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    return target
+# main.py 里 apply 接口直接从 core.workspace 引入
+from core.workspace import resolve_safe_path, PathTraversalError
 ```
 
-`str(target).startswith(str(workspace))` 这个检测跟 `read_file.py` 完全一样的写法，
-`resolve()` 是关键——它会把 `..` 这种相对片段真正计算掉，拿到的是操作系统层面
-"最终落到哪" 的绝对路径，再拿这个绝对路径去跟 `workspace` 比前缀，而不是直接
-对字符串里有没有出现 `".."` 做黑名单匹配（黑名单方式容易被 `....//` 之类的变形
-绕过，`resolve()` 从根上避免了这个问题）。
+> **一套沙箱，全项目共用。** 早期设计曾让 swarm 用独立的 `swarm/sandbox.py` + `SWARM_WORKSPACE` 环境变量，想着"写盘目录可能和读文件目录不同"。但实践下来，一个 Agent 读的、搜的、写的、执行的应该是**同一个工作区**才符合直觉——尤其飞书/HTTP 是外部入口，多套目录配置反而是隐患。所以工作目录统一收敛到 `core/workspace.py` 的单一来源（`WORKSPACE`），apply 接口、5 个工具都调它，不再有第二份实现。
+
+`core/workspace.py` 里的穿越检测（`workspace not in target.parents`）配合 `resolve()`
+是关键——`resolve()` 会把 `..` 这种相对片段真正计算掉，拿到操作系统层面"最终落到哪"
+的绝对路径，再用 `Path.parents` 做层级判断（比字符串 `startswith` 更严谨，不会把
+`/data/ws-evil` 误判成在 `/data/ws` 内），而不是对字符串里有没有 `".."` 做黑名单匹配
+（黑名单容易被 `....//` 之类变形绕过）。
 
 ### 7.10.3 `main.py`：`ApplyRequest`/`ApplyResponse` + 接口实现
 
 ```python
 # main.py 新增 import
 from swarm.code_extractor import extract_python_code
-from swarm.sandbox import resolve_safe_path, PathTraversalError
+from core.workspace import resolve_safe_path, PathTraversalError
 
 
 class ApplyRequest(BaseModel):
     """POST /swarm/tasks/{task_id}/apply 的请求体格式"""
-    path: str = Field(..., min_length=1, description="写入的目标路径，相对工作目录（SWARM_WORKSPACE），如 'out/auth.fixed.py'")
+    path: str = Field(..., min_length=1, description="写入的目标路径，相对工作目录（WORKSPACE），如 'out/auth.fixed.py'")
 
 
 class ApplyResponse(BaseModel):
@@ -5928,8 +6004,8 @@ curl -s http://127.0.0.1:8002/swarm/tasks
   1. swarm/code_extractor.py 的 extract_python_code() 对 ```python 代码块、无语言
      标记的裸代码块、纯审查意见（无代码块）三种输入分别返回预期的 (代码, 来源) /
      (None, "none")
-  2. swarm/sandbox.py 的 resolve_safe_path() 对 "../../../etc/bad" 这类穿越路径
-     抛 PathTraversalError，对正常相对路径能正确解析到 SWARM_WORKSPACE 内
+  2. core/workspace.py 的 resolve_safe_path() 对 "../../../etc/bad" 这类穿越路径
+     抛 PathTraversalError，对正常相对路径能正确解析到统一工作目录（WORKSPACE）内
   3. POST /swarm/tasks/{task_id}/apply 四种失败分支状态码分别正确：
      任务不存在 → 404；任务未完成（pending/claimed/failed）→ 409；
      无代码块可抽取（如拿 code_review 任务去调）→ 400；路径穿越 → 400
@@ -7401,93 +7477,207 @@ async def ask(question: str, session_id: str | None = None) -> AskResult:
     )
 ```
 
-`ask_stream()`（流式接口）原来完全没有记忆能力，跟 `ask()` 相比是个明显的功能缺口——
-同样加一个可选的 `session_id`，逻辑跟 `ask()` 一致（加载历史 → 拼新问题 → 跑 Loop →
-存回历史），区别只是回复文字要靠回调边生成边收集，跑完才知道完整内容、才能写回
-`SessionStore`：
+> **`ask_stream()` / `clear_session()` 不在这里**：早期版本曾经把这两个函数也放在
+> `agent/agent.py`，跟 `ask()` 抄同一套"加载历史 → 拼新问题 → 跑 Loop → 存回历史"逻辑。
+> 后来发现这样会导致 `/ask`（走 Coordinator）和 `/ask/stream`/`/session/clear`
+> （走单 Agent 直接对话）用的是两套不同的会话读写实现，行为容易走偏（比如流式接口
+> 里"审查+修复+写测试"这类复合请求不会被拆成子任务）。所以 `ask_stream()` 和
+> `clear_session()` 挪到了 10.4b 节，跟 `/ask` 用的是同一个 `CoordinatorAgent`。
+> `agent/agent.py` 里只保留 `ask()`（无 Coordinator 规划能力的单 Agent 直接对话，
+> 供 `cli.py` 和基础测试用）。
+
+---
+
+## 10.4b 在 Coordinator 中实现流式与清除会话 `coordinator/agent.py`
+
+`/ask` 走的是 `CoordinatorAgent`（第 6 章），`/ask/stream` 和 `/session/clear` 也应该
+落在同一套架构上，而不是像早期版本那样绕回 `agent/agent.py` 的单 Agent 实现——否则
+"帮我审查这段代码顺便把测试也写一下"这种应该拆成 `code_reviewer → debugger →
+test_writer` 三个任务的请求，走流式接口时会退化成单 Agent 自己硬扛，跟 `/ask` 的
+行为不一致。
+
+**流式的粒度**：Coordinator 内部是"规划一次 LLM 调用 + N 个子 Agent 各一次 LLM 调用"，
+不是像 `agent/agent.py` 那样单次 `run_agent_loop` 天然支持逐 token 回调。规划阶段
+必须拿到完整 JSON 才能解析出任务列表，没法边生成边流式；所以粒度选在**子任务完成
+即推送**，而不是逐 token：
+- 不需要子 Agent（`direct_reply`）：只有一次完整回复，作为一个整块推送
+- 需要拆解成多个子任务：每个子 Agent 跑完就立刻推送它的结果，不用等其他并行任务
+  也跑完（比 `/ask` 等全部任务聚合完才返回更快看到进展）
+
+先给 `dispatch()`（`coordinator/dispatcher.py`）加一个可选的 `on_task_done` 回调，
+在 `_run_one` 里子任务算完就立刻调用——因为多个任务在同一波次里用
+`asyncio.gather` 并发执行，`_run_one` 内部调用回调的时机是"这一个任务完成"，不是
+"整个波次/整个 gather 完成"，所以先跑完的子 Agent 能先被推送出去：
 
 ```python
-# agent/agent.py
+# coordinator/dispatcher.py
+
+async def dispatch(
+    tasks: list[TaskSpec],
+    session_id: str | None = None,
+    on_task_done: Callable[[TaskSpec, str], None] | None = None,
+) -> tuple[dict[str, str], Usage]:
+    ...
+    if runnable:
+        coros = [_run_one(spec, results, log, on_task_done) for spec in runnable]
+        done = await asyncio.gather(*coros, return_exceptions=True)
+    ...
+
+
+async def _run_one(spec, prior_results, log=None, on_task_done=None) -> tuple[str, Usage]:
+    ...
+    text, usage = await agent.run(task=spec.input, context=context or None)
+    if on_task_done:
+        on_task_done(spec, text)
+    return text, usage
+```
+
+`CoordinatorAgent` 新增 `ask_stream()`，用跟 `agent/agent.py` 原来一样的
+"Queue + 回调 + 后台 Task"模式桥接同步回调和异步生成器；`clear_session()` 也搬过来，
+直接复用 `CoordinatorAgent.run()` 已经用的 `_store`：
+
+```python
+# coordinator/agent.py
 
 async def clear_session(session_id: str):
     """清除一个会话的历史（文件 + Redis 缓存），供 FastAPI /session/clear 调用。"""
     await _store.clear(session_id)
 
 
-async def ask_stream(question: str, session_id: str | None = None) -> AsyncGenerator[str, None]:
-    """
-    流式调用，通过 on_text_delta 回调实时传出文本。
+class CoordinatorAgent:
+    ...
 
-    session_id 用法跟 ask() 一致：不传就是无记忆的一次性调用；
-    传入则加载/追加历史，效果与 ask() 相同，只是文本以流式方式返回。
-    """
-    queue: Queue[str | None] = Queue()
-
-    def on_delta(text: str):
-        queue.put_nowait(text)
-
-    async def run_loop():
-        provider = get_provider()
-
-        initial_messages = None
+    async def ask_stream(self, user_request: str, session_id: str | None = None) -> AsyncGenerator[str, None]:
+        """
+        流式版本的 run()：不需要子 Agent 时整块推送回复；需要子 Agent 时按任务完成
+        顺序逐个推送，不等全部任务聚合完。session_id 用法跟 run() 一致。
+        """
+        history = None
         if session_id is not None:
-            history = await _store.load_messages(session_id, max_turns=10)
-            new_user_message = Message(role="user", content=[TextBlock(text=question)])
-            initial_messages = history + [new_user_message]
-            await _store.append_message(session_id, "user", question)
+            history = await self._store.load_messages(session_id, max_turns=10)
+            await self._store.append_message(session_id, "user", user_request)
 
-        text_chunks: list[str] = []
+        tasks, direct_reply, _ = await make_plan(user_request, session_id=session_id, history=history)
 
-        def on_delta_and_collect(text: str):
-            text_chunks.append(text)
-            on_delta(text)
+        queue: Queue[str | None] = Queue()
+        collected: list[str] = []
 
-        await run_agent_loop(
-            prompt=question,
-            provider=provider,
-            system=SYSTEM_PROMPT,
-            tools=_registry.get_all_definitions(),
-            executor=_executor,
-            max_turns=10,
-            on_text_delta=on_delta_and_collect,
-            initial_messages=initial_messages,
-        )
+        def emit(text: str):
+            collected.append(text)
+            queue.put_nowait(text)
 
-        if session_id is not None:
-            await _store.append_message(session_id, "assistant", "".join(text_chunks))
+        async def run_loop():
+            if direct_reply is not None:
+                emit(direct_reply)
+            elif tasks:
+                def on_task_done(spec, text):
+                    emit(f"**[{spec.agent}]**\n{text}\n\n---\n\n")
+                await dispatch(tasks, session_id=session_id, on_task_done=on_task_done)
+            else:
+                emit("无法理解请求，请提供更多信息。")
 
-        queue.put_nowait(None)
+            if session_id is not None:
+                await self._store.append_message(session_id, "assistant", "".join(collected))
+            queue.put_nowait(None)
 
-    loop_task = asyncio.create_task(run_loop())
+        loop_task = asyncio.create_task(run_loop())
 
-    while True:
-        chunk = await queue.get()
-        if chunk is None:
-            break
-        yield chunk
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            yield chunk
 
-    await loop_task
+        await loop_task
 ```
 
-`agent/__init__.py` 补上新增的 `clear_session` 导出：
-
-```python
-# agent/__init__.py
-from .agent import ask, ask_stream, clear_session, AskResult
-```
+> **为什么用 `Queue` 桥接，不直接 `async for` 子 Agent 的结果？** `dispatch()` 内部
+> 是并发跑多个任务（`asyncio.gather`），跑完的顺序和 `tasks` 列表顺序不一定一致，
+> 也没有现成的"边跑边产出"的异步迭代器接口。用 `Queue` 是第 2 章 `ask_stream()` 就用
+> 过的模式——启动一个后台 `Task` 去跑真正的逻辑，通过回调把结果 `put` 进队列，
+> 主协程只管 `await queue.get()` 消费，两边通过队列解耦，不用改 `dispatch()` 的
+> 并发结构。
 
 ---
 
 ## 10.5 在 FastAPI 接口中传入 session_id
 
-`main.py` 里的 `/ask` 目前还是走第 4 章留下的 `CoordinatorAgent`（规划 → 分发 → 聚合），
-跟这一章的 `ask()`/`SessionStore` 是两条不相关的链路，加 `session_id` 也不会有记忆效果。
-这里把 `/ask` 切回直接调用 `ask()`，`_coordinator` 也一并删掉（没有其它地方在用）：
+`main.py` 里的 `/ask` 按 7.1.1 节定下的分工继续走 `CoordinatorAgent`（规划 → 分发 →
+聚合），不切回单 Agent 直接调用——`/swarm/ask` 才是"提交任务、内部另一套编排"的入口，
+两者的分界是"编排方式不同"，不是"要不要记忆"。要让 `/ask` 也有记忆，正确做法是给
+`CoordinatorAgent` 本身加上 `session_id`，而不是绕开它退回没有规划/分发能力的
+`ask()`。
+
+> **踩过的坑**：早期一版实现图省事，直接把 `/ask` 改成调用 `agent/agent.py` 的
+> `ask()`（第 4/5 章留下的单 Agent 直接对话实现），因为 `SessionStore` 先接在了那里、
+> 改起来最快。这样虽然让 `/ask` 有了记忆，但代价是丢掉了规划/分发能力——原本一句
+> "审查这段代码顺便把测试也写一下"会被 Coordinator 拆成
+> `code_reviewer → debugger → test_writer` 三个任务串行执行，改完之后就变成单个
+> Agent 自己硬扛，行为和文档描述的不一致。教训是：**给一条链路加新能力时，加到它
+> 该在的那一层（这里是 Coordinator），不要因为另一层实现起来更省事就把调用方悄悄
+> 切过去**。
+
+`CoordinatorAgent.run()` 加一个可选的 `session_id` 参数，内部直接复用 10.3 节的
+`SessionStore`——调用前加载历史（喂给 `make_plan`，让规划器理解"这个""那个文件"这类
+指代），调用后把最终聚合结果写回历史：
+
+```python
+# coordinator/agent.py
+
+from persistence.session_store import SessionStore
+from persistence.redis_client import create_redis_client
+
+_store = SessionStore(base_dir="sessions/", redis_client=create_redis_client())
+
+
+class CoordinatorAgent:
+    async def run(self, user_request: str, session_id: str | None = None) -> AskResult:
+        history = None
+        if session_id is not None:
+            history = await _store.load_messages(session_id, max_turns=10)
+            await _store.append_message(session_id, "user", user_request)
+
+        # 把历史传给规划器，理解上下文里的指代
+        tasks, direct_reply, plan_usage = await make_plan(
+            user_request, session_id=session_id, history=history,
+        )
+        ...
+        # 聚合出 text 之后
+        if session_id is not None:
+            await _store.append_message(session_id, "assistant", text)
+
+        return AskResult(text=text, input_tokens=..., output_tokens=...)
+```
+
+`make_plan()` 也要能接收历史（`coordinator/planner.py`），把历史消息拼进发给 LLM 的
+`messages` 列表里：
+
+```python
+# coordinator/planner.py
+
+async def make_plan(user_request, session_id=None, history=None):
+    messages = list(history) if history else []
+    messages.append(Message(role="user", content=[TextBlock(text=user_request)]))
+    response = await provider.chat(messages=messages, system=_COORDINATOR_SYSTEM, max_tokens=2048)
+    ...
+    return tasks, direct_reply, response.usage   # usage 一起带出来，给 /ask 算 Token 用量
+```
+
+> **usage 从哪来？** Coordinator 一次 `/ask` 背后可能是多次 LLM 调用（规划一次 + 每个
+> 子 Agent 各一次），跟 `agent/agent.py` 里单 Agent 一次调用就有 `total_usage` 不一样，
+> 需要 `coordinator/dispatcher.py` 的 `dispatch()` 把各子 Agent（`sub_agents/base.py`
+> 的 `run()` 现在返回 `(文字, usage)` 而不是纯文字）的用量也汇总一遍，连同规划阶段的
+> 用量一起加总，才能给 `/ask` 返回完整的 `usage.input_tokens` / `output_tokens`。
+
+`main.py` 里 `/ask` 的写法不变，还是调用一个全局单例，只是这个单例现在是
+`CoordinatorAgent`：
 
 ```python
 # main.py
 
-from agent import ask, ask_stream   # 不再需要 CoordinatorAgent
+from coordinator.agent import CoordinatorAgent
+
+_coordinator = CoordinatorAgent()   # 全局单例，启动时初始化一次
 
 
 class AskRequest(BaseModel):
@@ -7510,19 +7700,31 @@ class AskResponse(BaseModel):
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(req: AskRequest) -> AskResponse:
     try:
-        result = await ask(req.question, session_id=req.session_id)
+        result = await _coordinator.run(req.question, session_id=req.session_id)
         return AskResponse(
             text=result.text,
             session_id=req.session_id,
             usage={
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
-                "turn_count": result.turn_count,
             },
         )
     except Exception as e:
         return AskResponse(session_id=req.session_id, error=str(e))
 ```
+
+> **更新**：`agent/agent.py` 后来被彻底删除了。最初的想法是留着它给 `cli.py` 和
+> `/ask/stream` 用，`/ask` 单独走 Coordinator——但这样一来"要不要走 Coordinator
+> 规划"就取决于用户走了哪个入口，而不是任务本身的复杂度：同样一句"帮我审查这段代码
+> 顺便把测试也写一下"，走 `/ask` 会被拆成 `code_reviewer` + `test_writer` 两个子任务，
+> 走 `/ask/stream` 或 `cli.py` 却只有单 Agent 硬扛，行为不一致，用户体验也不统一。
+>
+> 所以后来把 `cli.py`、`/ask/stream`、`/session/clear` 全部改成调用
+> `coordinator/agent.py` 里的 `CoordinatorAgent`（`run()`/`ask_stream()`），
+> `agent/agent.py` 整个文件删掉，只留 `agent/loop.py`、`agent/executor.py`
+> 这些底层组件继续被 `sub_agents/base.py` 复用（这个包后来又改名为
+> `agent_core/`，见 4.6 更新说明）。现在无论从哪个入口进来，
+> 都是同一套"规划 → 分发 → 聚合"逻辑，行为完全一致。
 
 客户端调用时保持相同的 `session_id`，Agent 就会记住上下文：
 
@@ -7540,12 +7742,15 @@ curl -X POST http://localhost:8002/ask \
 
 ```python
 # main.py
+from coordinator.agent import CoordinatorAgent, clear_session
+
+_coordinator = CoordinatorAgent()
 
 @app.get("/ask/stream")
 async def ask_stream_endpoint(question: str, session_id: str | None = None):
     async def event_generator():
         try:
-            async for chunk in ask_stream(question, session_id=session_id):
+            async for chunk in _coordinator.ask_stream(question, session_id=session_id):
                 data = json.dumps({"type": "text_delta", "text": chunk}, ensure_ascii=False)
                 yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
@@ -7555,6 +7760,9 @@ async def ask_stream_endpoint(question: str, session_id: str | None = None):
 
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers={...})
 ```
+
+`CoordinatorAgent.ask_stream()` 的实现和推送粒度见 10.4b：不需要子 Agent 时整块推送
+回复，需要多个子 Agent 时哪个先跑完就先推送哪个，不是逐 token。
 
 再补一个清除会话的接口——10.3 的 `SessionStore.clear()` 之前只是个方法，没有任何路由
 接到它，前端的"清空"按钮点了也只是清空页面上的气泡，服务端历史其实还在：
@@ -7701,8 +7909,6 @@ def setup_logging(log_level: str = "INFO"):
 
     structlog.configure(
         processors=[
-            structlog.stdlib.filter_by_level,
-            structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
@@ -7718,6 +7924,19 @@ def setup_logging(log_level: str = "INFO"):
 # 全局 logger（各模块 from observability.logging import logger）
 logger = structlog.get_logger()
 ```
+
+> **⚠️ 踩坑记录：`structlog.stdlib.filter_by_level` / `add_logger_name` 不能和 `PrintLoggerFactory` 一起用**
+>
+> `structlog.stdlib.filter_by_level` 和 `structlog.stdlib.add_logger_name` 这两个processor，设计前提是底层 `logger_factory` 产出的是**真正的 `logging.Logger`**（比如用 `structlog.stdlib.LoggerFactory()`）——前者要读 `logger.disabled`，后者要读 `logger.name`。
+>
+> 但这里为了直接输出 JSON、不依赖 Python 标准 logging 的 handler 机制，用的是 `structlog.PrintLoggerFactory()`，它产出的 `PrintLogger` 根本没有 `.disabled` / `.name` 这两个属性。只要调用 `logger.info(...)`，就会在这两个 processor 里炸出：
+> ```
+> AttributeError: 'PrintLogger' object has no attribute 'disabled'
+> AttributeError: 'PrintLogger' object has no attribute 'name'
+> ```
+> 这个 bug 在代码写好之后不会立刻暴露——因为只要没人调用 `setup_logging()`，`structlog.configure()` 就不会生效，用的是 structlog 默认配置，不会报错。**只有在服务启动时真正调用了 `setup_logging()`，第一条 `logger.info()` 才会崩掉。** 所以本章的代码必须按上面的最终版本抄（不含这两行），或者干脆把 `logger_factory` 换成 `structlog.stdlib.LoggerFactory()`（那样就需要这两个 processor 配合工作）。
+>
+> 这里选择保留 `PrintLoggerFactory()`，直接删掉这两个 processor：日志级别过滤已经由 `wrapper_class=structlog.make_filtering_bound_logger(logging.INFO)` 处理，`add_logger_name` 只是加个 `logger_name` 字段，不影响功能，删掉不影响可观测性目标。
 
 **使用示例（在 Agentic Loop 里）：**
 
@@ -7742,6 +7961,10 @@ logger.info(
 ```json
 {"event": "agent_loop_turn", "session_id": "user_001", "turn": 2, "provider": "claude-sonnet-4-6", "input_tokens": 1234, "output_tokens": 567, "tool_calls": ["calculator"], "stop_reason": "tool_use", "timestamp": "2025-01-01T12:00:00Z", "level": "info"}
 ```
+
+> **为什么 JSON 就叫"机器可解析"？** 每条日志是一个字段固定的 JSON 对象，机器不用写正则去猜，直接按 key 过滤和聚合：`session_id == "user_001"` 拉出一次请求的全部日志、`level == "error"` 筛所有错误、对 `elapsed_ms` 字段直接算平均/分位数。临时排查时命令行用 `jq` 就能拆（`... | jq 'select(.level=="warning")'`）；生产环境则交给日志聚合系统自动建索引。
+>
+> **本项目的日志聚合方案：Grafana Loki。** 服务只管把 JSON 日志打到标准输出（stdout），由采集器 **Promtail** 读取容器 stdout 推送给 **Loki** 存储，最后在 **Grafana** 里用 LogQL 查询——这样日志（Loki）、指标（Prometheus）、链路（Tempo）三样都在同一个 Grafana 界面，还能靠共同的 `session_id` 互相跳转。具体部署脚本见第 13 章，本章 11.3.1 先预拉镜像。
 
 ---
 
@@ -7823,10 +8046,11 @@ def record_request(provider: str, model: str, status: str, latency: float, usage
 **在 FastAPI 中暴露 /metrics 端点：**
 
 ```python
-# main.py 里添加
+# main.py
 
-from fastapi import Response
-from observability.metrics import generate_latest, CONTENT_TYPE_LATEST
+from fastapi import FastAPI, HTTPException, Response
+from observability.metrics import generate_latest, CONTENT_TYPE_LATEST, record_request
+from providers.types import Usage
 
 @app.get("/metrics")
 async def metrics():
@@ -7836,6 +8060,88 @@ async def metrics():
         media_type=CONTENT_TYPE_LATEST,
     )
 ```
+
+放在 `/health` 之后、`/ask` 之前即可，路由顺序不影响功能。
+
+**在 `/ask` 里调用 `record_request()`——成功和失败都要记：**
+
+只暴露端点还不够，指标数字要有人在业务代码里"打点"才会变化。`/ask` 是完整响应接口（第 6 章的 `CoordinatorAgent.run()`），在它的成功分支和异常分支都调用一次 `record_request()`，这样无论请求成不成功，`agent_requests_total{status=...}` 都会增加：
+
+```python
+# main.py
+@app.post("/ask", response_model=AskResponse)
+async def ask_endpoint(req: AskRequest) -> AskResponse:
+    start = time.time()
+    log = logger.bind(session_id=req.session_id)
+    log.info("ask_request_received", question=req.question[:60])
+
+    try:
+        result = await _coordinator.run(req.question, session_id=req.session_id)
+        elapsed_ms = round((time.time() - start) * 1000)
+        log.info("ask_request_done", elapsed_ms=elapsed_ms)
+
+        # 成功：记 provider/model/status=success 三个维度 + 延迟 + token 用量
+        record_request(
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            status="success",
+            latency=time.time() - start,
+            usage=Usage(input_tokens=result.input_tokens, output_tokens=result.output_tokens),
+        )
+        return AskResponse(
+            text=result.text,
+            session_id=req.session_id,
+            usage={
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+            },
+        )
+    except Exception as e:
+        elapsed_ms = round((time.time() - start) * 1000)
+        log.error("ask_request_error", elapsed_ms=elapsed_ms, error=str(e))
+
+        # 失败：status=error，不传 usage（这次请求没有真实 token 用量数据）
+        record_request(
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            status="error",
+            latency=time.time() - start,
+        )
+        return AskResponse(session_id=req.session_id, error=str(e))
+```
+
+> **注意 1**：`AskResult`（`coordinator/agent.py` 里 `CoordinatorAgent.run()` 的返回类型）没有 `provider`/`model` 字段，所以这里的 label 直接取 `settings.llm_provider` / `settings.llm_model`（全局配置），而不是从 result 里取——单 provider 部署场景下这是等价的，如果以后要支持每次请求动态切换 provider，需要把 provider/model 一起放进 `AskResult`。
+>
+> **注意 2**：`GET /ask/stream`（SSE 流式接口）**没有**接入 `record_request()`——它的生成器只管边生成边往外推文本增量，函数返回前拿不到聚合后的最终 usage 和总耗时，要打点得先改造流式生成器在结束时收集 usage，本次没有做这一步，如果需要可以补。
+
+---
+
+### 11.3.1 预拉取可观测性栈镜像
+
+可观测性三件套需要独立部署，本章先拉取镜像（确保网络通畅、镜像可下载），具体 Docker 部署脚本统一放到第 13 章。各镜像职责：
+
+| 镜像 | 维度 | 职责 |
+|------|------|------|
+| `prom/prometheus:latest` | 指标 | 定期拉取 `/metrics` 并存储 |
+| `grafana/tempo:latest` | 链路 | 接收 OTLP 链路并存储 |
+| `grafana/loki:latest` | 日志 | 存储 JSON 日志，供 LogQL 查询 |
+| `grafana/promtail:latest` | 日志 | 采集器：读容器 stdout 推给 Loki |
+| `grafana/grafana:latest` | 可视化 | 统一界面，同时连上以上三者 |
+
+```bash
+# 预拉取镜像（约 800MB，首次下载需要几分钟）
+docker pull prom/prometheus:latest
+docker pull grafana/grafana:latest
+docker pull grafana/tempo:latest
+docker pull grafana/loki:latest
+docker pull grafana/promtail:latest
+```
+
+> **为什么用 Tempo 而不是 Jaeger？** 两者都能接收 OpenTelemetry（OTLP）链路数据，但 Tempo 是 Grafana 官方的链路存储后端，**不需要单独的 UI**——它直接作为 Grafana 的一个数据源，链路和指标（Prometheus）在同一个 Grafana 界面里查看，运维一套即可。Jaeger 则自带独立 UI（16686 端口），需要额外开一个页面。本指南统一到 Grafana，所以选 Tempo。
+>
+> **Loki 和 Promtail 为什么是两个镜像？** Loki 只负责存储和查询日志，本身不会主动去读日志文件；Promtail 是配套的**采集器（agent）**，它读取容器的 stdout 日志再推送给 Loki。这和 Prometheus「主动拉指标」相反——日志是「被推送」进来的，所以需要 Promtail 这个推送方。
+>
+> 这些镜像在第 13 章的 `docker-compose.yml` 里会和 PolyCoder 服务一起编排启动，这里先不写部署脚本，避免分散注意力。
 
 ---
 
@@ -7850,19 +8156,21 @@ OpenTelemetry 链路追踪。
   "用户的这个请求，经过了哪些 Agent？每个 Agent 耗时多少？哪里最慢？"
 
 每个操作（一次 Agent 调用、一次工具调用）创建一个 Span（跨度）。
-多个 Span 串成一条链路（Trace），在 Jaeger 或 Tempo 中可视化展示。
+多个 Span 串成一条链路（Trace），推送到 Tempo 存储，在 Grafana 的 Explore 页面里可视化展示。
 """
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.resources import Resource
 
+from observability.logging import logger   # setup_logging 先于 setup_tracing 调用，此时 logger 已配置
+
 
 def setup_tracing(service_name: str = "my-agent", otlp_endpoint: str | None = None):
     """
     初始化链路追踪，在服务启动时调用一次。
 
-    otlp_endpoint：OTLP 导出地址（Jaeger、Tempo 等）
+    otlp_endpoint：OTLP 导出地址（Tempo、Jaeger 等），例如 http://tempo:4317
     如果不传，链路数据不导出（但代码里的 tracer 调用不报错）。
     """
     resource = Resource.create({"service.name": service_name})
@@ -7873,9 +8181,9 @@ def setup_tracing(service_name: str = "my-agent", otlp_endpoint: str | None = No
             from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
             exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
             provider.add_span_processor(BatchSpanProcessor(exporter))
-            print(f"[Tracing] 链路追踪已启动，导出到：{otlp_endpoint}")
+            logger.info("tracing_enabled", otlp_endpoint=otlp_endpoint)
         except ImportError:
-            print("[Tracing] 未安装 opentelemetry-exporter-otlp，链路数据不导出")
+            logger.warning("tracing_exporter_missing", hint="未安装 opentelemetry-exporter-otlp，链路数据不导出")
 
     trace.set_tracer_provider(provider)
 
@@ -7886,47 +8194,153 @@ tracer = trace.get_tracer("my-agent")
 
 **在 Agentic Loop 里添加追踪：**
 
+`run_agent_loop`（`agent_core/loop.py`）里，一次调用是一个 Trace：外层一个 `agent_loop` Span 贯穿整个 while 循环，每一轮 LLM 调用是一个 `turn_N` 子 Span。
+
 ```python
 from observability.tracing import tracer
 
-# 在 run_agent_loop 函数里：
+# agent_core/loop.py — run_agent_loop 函数体
 with tracer.start_as_current_span("agent_loop") as loop_span:
-    loop_span.set_attribute("session_id", session_id)
+    loop_span.set_attribute("session_id", session_id or "")
     loop_span.set_attribute("provider", provider.model_name)
 
     while True:
-        with tracer.start_as_current_span(f"turn_{state.turn_count}") as turn_span:
-            # ... LLM 调用
+        # ...（压缩检查 / 轮次限制检查）
 
-        if tool_calls:
-            for tc in tool_calls:
-                with tracer.start_as_current_span(f"tool_{tc.name}") as tool_span:
-                    tool_span.set_attribute("tool.name", tc.name)
-                    # ... 工具执行
+        with tracer.start_as_current_span(f"turn_{state.turn_count}") as turn_span:
+            # ... LLM 调用（流式/非流式）
+            turn_span.set_attribute("input_tokens", turn_usage.input_tokens)
+            turn_span.set_attribute("output_tokens", turn_usage.output_tokens)
+            turn_span.set_attribute("tool_calls", [tc.name for tc in tool_calls])
+
+        # ...
+        tool_results = await executor.execute_all(tool_calls)   # 见下方
 ```
+
+**工具调用的 Span 要放在 `ToolExecutor` 内部，不要放在 loop 里的 `for` 循环：**
+
+`ToolExecutor.execute_all()`（`agent_core/executor.py`）用 `asyncio.gather()` **并行**执行所有工具调用（见 6.x 章）。如果照搬"每个工具一个 Span"的直觉写法，在 `run_agent_loop` 里用 `for tc in tool_calls:` 顺序创建 Span，会把并行执行改成串行，白白拖慢速度。正确做法是把 Span 下沉到实际执行单个工具的 `_execute_one` 里，`asyncio.gather` 调度多个协程时各自的 Span 仍然独立记录，互不影响并发：
+
+```python
+# agent_core/executor.py
+from observability.tracing import tracer
+
+class ToolExecutor:
+    async def execute_all(self, tool_calls):
+        # 保持并行：Span 不在这里逐个创建
+        tasks = [self._execute_one(tc) for tc in tool_calls]
+        return list(await asyncio.gather(*tasks))
+
+    async def _execute_one(self, tool_call):
+        with tracer.start_as_current_span(f"tool_{tool_call.name}") as tool_span:
+            tool_span.set_attribute("tool.name", tool_call.name)
+            # ... 执行工具，异常时 tool_span.set_attribute("tool.error", ...)
+```
+
+**在服务启动时初始化：`setup_logging()` + `setup_tracing()`**
+
+两者都必须在服务启动时各调用一次，且顺序是先日志、后追踪（这样 `setup_tracing()` 内部如果打日志，走的已经是配置好的结构化 logger）：
+
+- `setup_logging()` 不调用 → 用 structlog 默认配置，日志不是 JSON 格式，`session_id` 等字段也不会自动带上。
+- `setup_tracing()` 不调用 → `tracer` 用的是 OpenTelemetry 默认 `TracerProvider`（No-op），Span 正常创建但不会导出到任何地方，`agent_loop`/`turn_N`/`tool_xxx` 全部是空转。
+
+`otlp_endpoint` 从配置读取，不填就只在本地"空转"（不报错，也不导出）：
+
+```python
+# core/config.py
+class Settings(BaseSettings):
+    ...
+    # 可观测性：OpenTelemetry 链路追踪导出地址（Jaeger/Tempo 等），不填则不导出
+    otel_exporter_otlp_endpoint: str = ""
+```
+
+```python
+# main.py
+from observability.logging import logger, setup_logging
+from observability.tracing import setup_tracing
+from core.config import settings
+from core.workspace import get_workspace
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _swarm_save_task
+
+    setup_logging()
+    setup_tracing(service_name="my-agent", otlp_endpoint=settings.otel_exporter_otlp_endpoint or None)
+
+    # 初始化统一工作目录：所有工具和子 Agent 的文件操作都限定在此目录内。
+    # 用 WORKSPACE=/path uvicorn main:app 指定，不设则用当前目录。
+    workspace = get_workspace()
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    logger.info("server_starting")
+    logger.info("workspace_ready", workspace=str(workspace))   # 启动即打印实际工作目录，方便确认
+    logger.info("api_docs_url", url="http://localhost:8002/docs")
+    logger.info("stream_test_hint", hint="curl -N 'http://localhost:8002/ask/stream?question=你好'")
+
+    # ... 原有的 Redis 恢复 / 常驻 Swarm Agent 启动 / 后台备份任务逻辑不变
+
+    yield
+
+    # ... 原有的收尾逻辑不变
+    logger.info("server_shutdown")
+```
+
+> **启动时确认工作目录**：服务起来后第一时间会打印一条 `{"event": "workspace_ready", "workspace": "/data/workspace", ...}` 日志。通过飞书或 HTTP 触发的任何文件操作，都落在这个目录里——排查"文件写到哪去了"时先看这条日志。
+
+**验证方式**：用 `TestClient` 触发一次完整的 `lifespan`（比直接跑 `uvicorn` 更快看到启动阶段的报错），确认没有异常且能拿到 `/metrics` 数据：
+
+```python
+import main
+from fastapi.testclient import TestClient
+
+with TestClient(main.app) as c:
+    r = c.get("/metrics")
+    print(r.status_code)   # 200
+    print([l for l in r.text.splitlines() if "agent_requests_total" in l])
+```
+
+如果这里报 `AttributeError: 'PrintLogger' object has no attribute 'disabled'`（或 `'name'`），说明 `observability/logging.py` 还是旧版本，回到 11.2 节把 `filter_by_level` / `add_logger_name` 从 processors 列表删掉。
 
 ---
 
 ## 11.5 本章检查清单
 
 ```
+□ observability/logging.py 的 processors 里不含 structlog.stdlib.filter_by_level /
+  add_logger_name（跟 PrintLoggerFactory 不兼容，会在第一条日志时报 AttributeError）
+
 □ setup_logging() 在 lifespan 里调用，日志输出为 JSON 格式
+  验证：用 TestClient 触发 lifespan，看到 {"event": "server_starting", ...} 而不报错
 
 □ /metrics 端点可访问
   验证：curl http://localhost:8002/metrics | grep agent_requests
 
-□ 发送几次请求后，agent_requests_total 计数器增加
+□ /ask 的成功分支和异常分支都调用了 record_request()
+  验证：发送几次 /ask 请求后，agent_requests_total{status="success"} 计数器增加；
+        故意触发一次异常，agent_requests_total{status="error"} 也增加
+
+□ （已知缺口）/ask/stream 暂未接入 record_request()——流式生成器结束时拿不到聚合 usage，
+  如需要，要先改造生成器在收尾时收集 usage 再打点
 
 □ Grafana 能连接到 Prometheus 并展示 agent_latency_seconds 的图表
 
-□ （可选）Jaeger 中能看到一条完整的链路（包含各个 Span）
+□ 日志输出到 stdout（不写死到文件），这样 Promtail 才能采集到并推给 Loki（部署见第 13 章）
+  验证：docker compose logs agent 能看到一行行 JSON 日志
+
+□ setup_tracing() 在 lifespan 里调用，且在 setup_logging() 之后（否则 Span 只在本地创建，不会导出）
+
+□ 工具 Span（tool_{name}）建在 ToolExecutor._execute_one 里，不要改成串行 for 循环
+
+□ （可选）配置 OTEL_EXPORTER_OTLP_ENDPOINT 后，链路推送到 Tempo，在 Grafana → Explore →
+  选择 Tempo 数据源里能看到一条完整的链路（agent_loop → turn_N → tool_xxx）
 ```
 
 ---
 
 # 第 12 章：阶段 12 —— 飞书机器人
 
-> **本章目标**：在飞书里 @ 机器人就能使用 Agent，支持私聊和群聊，显示"思考中"状态。
+> **本章目标**：在飞书里 @ 机器人就能使用 Agent，支持私聊和群聊，显示"处理中"状态。
 
 ---
 
@@ -7969,8 +8383,8 @@ client.py（调用飞书 API 发送回复）
 6. 左侧菜单 → **「凭证与基础信息」** → 复制 **App ID** 和 **App Secret**
 7. 在 `.env` 里填写：
    ```dotenv
-   FEISHU_APP_ID=cli_xxxxxxxx
-   FEISHU_APP_SECRET=xxxxxxxx
+   FEISHU_APP_ID=cli_aadee18ccc7c9cd8
+   FEISHU_APP_SECRET=RM0oosaFQBdtEHJzyYzC5bFqAaZLAAsf
    ```
 8. 回到应用首页 → 点击「发布版本」→ 「创建版本」→ 填写版本号 → 申请发布
 
@@ -8047,68 +8461,116 @@ class FeishuClient:
                 },
             )
 
-    async def add_reaction(self, message_id: str, emoji: str = "Thinking"):
+    async def send_markdown(self, receive_id: str, markdown: str, id_type: str = "open_id"):
         """
-        添加 Emoji 反应（显示"思考中"效果）。
+        以交互式卡片（interactive）发送 Markdown 内容——飞书的 text 类型不渲染 Markdown，
+        必须用卡片里的 markdown 元素，才能显示加粗、代码块、列表、链接等格式。
 
-        emoji 参数：飞书支持的 Emoji 类型名称
-        "Thinking" = 💭 思考中
-        "THUMBSUP"  = 👍
+        receive_id / id_type：同 send_text。
+        """
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {"tag": "markdown", "content": markdown},
+            ],
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={id_type}",
+                headers=await self._headers(),
+                json={
+                    "receive_id": receive_id,
+                    "msg_type": "interactive",
+                    "content": json.dumps(card, ensure_ascii=False),
+                },
+            )
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"send_markdown 失败：code={data.get('code')} msg={data.get('msg')}")
+        return data.get("data", {})
+
+    async def add_reaction(self, message_id: str, emoji: str = "OnIt") -> dict:
+        """
+        添加 Emoji 反应（显示"处理中"效果），返回响应里的 data（含 reaction_id）。
+
+        emoji 参数：飞书支持的 emoji_type 枚举值，**大小写敏感**，必须用官方合法值：
+        "OnIt"     = 👌 处理中（本项目默认，表示"正在处理你的消息"）
+        "THUMBSUP" = 👍
+        非法值（如 "Thinking"）会返回 code=231001 reaction type is invalid。
+        完整枚举见：https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
         """
         async with httpx.AsyncClient() as client:
-            await client.post(
+            resp = await client.post(
                 f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reactions",
                 headers=await self._headers(),
                 json={
                     "reaction_type": {"emoji_type": emoji}
                 },
             )
+        data = resp.json()
+        if data.get("code") != 0:
+            # 暴露飞书的真实错误（reaction type 非法、权限不足等），不要静默吞掉
+            raise RuntimeError(f"add_reaction 失败：code={data.get('code')} msg={data.get('msg')}")
+        return data.get("data", {})
 
-    async def remove_reaction(self, message_id: str, reaction_id: str):
-        """移除 Emoji 反应（处理完成后移除"思考中"）。"""
+    async def remove_reaction(self, message_id: str, reaction_id: str) -> dict:
+        """移除 Emoji 反应（处理完成后移除"处理中"）。"""
         async with httpx.AsyncClient() as client:
-            await client.delete(
+            resp = await client.delete(
                 f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}",
                 headers=await self._headers(),
             )
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"remove_reaction 失败：code={data.get('code')} msg={data.get('msg')}")
+        return data.get("data", {})
 ```
+
+> **⚠️ emoji_type 是大小写敏感的固定枚举，别自己编。** 直觉上会写 `"Thinking"` 表示"思考中"，但它**不是**飞书的合法值，会返回 `code=231001 reaction type is invalid`——而且如果 `add_reaction` 不检查 `code`、不 `return data`（早期写法就是发完请求什么都不返回），这个错误会被上层的 `except` 静默吞掉，表现成「能回答但没有表情」，极难排查。本项目用 `OnIt`（👌 处理中），实测有效。
+
+> **⚠️ 为什么 Agent 回复要用 `send_markdown` 而不是 `send_text`？** 飞书的 `msg_type: "text"` 是**纯文本**，`**加粗**`、代码块、`# 标题`、列表会原样显示成字面量，不渲染。Agent 的回复几乎都含 Markdown，所以要用 `interactive` 交互式卡片 + `markdown` 元素发送（`send_markdown`）才能正确渲染。注意飞书支持的是 Markdown 的**子集**（加粗/斜体/代码/链接/列表可用，复杂表格、多级嵌套可能不支持）。纯文本的命令回复（`/help`、`/clear`）继续用 `send_text` 即可，没必要包卡片。
 
 ---
 
 ## 12.4 消息处理器 `feishu/handler.py`
 
+> **并发策略：latest-wins 防抖（debounce）。** 用户连发多条消息时，如果每条都并发处理，会出现两个 Bug：① 多条的「加表情 → 调 LLM → 回复 → 去表情」四步交错执行，**时序错乱**；② 配合飞书重推，还会**一条消息被回复多次**。本项目的策略是**只处理最新一条、丢弃中间的**——收到消息先进一个防抖窗口（0.8s），窗口内又来新消息就取消上一条的处理任务。
+
+> **去重放到哪里？** event_id 去重**不在这里做**，而在上游 `ws_manager` 的**同步回调**里做（见 12.5）——那里是 SDK 单线程串行调用，不会有并发穿透；如果放在 async 的 `handle_event` 里，原始推送和飞书重推的两个协程会并发穿过「检查-添加」，去重失效。
+
 ```python
 # feishu/handler.py
 """
 飞书消息事件处理器。
+
+并发策略：latest-wins 防抖（debounce）。同一会话连发多条消息时，只处理最新一条、
+丢弃中间的——收到消息先进入一个防抖窗口，窗口内若又来新消息，就取消上一条的处理任务。
+这样避免了「表情/回复时序错乱」和「一条消息被回复多次」的问题。
+（event_id 去重在上游 ws_manager 的同步回调里做，那里是单线程，不会有并发穿透。）
 """
+import asyncio
 import json
-import time
 from .client import FeishuClient
-from agent import ask   # 传 session_id 就是带记忆的调用
+from coordinator.agent import CoordinatorAgent, clear_session   # 传 session_id 就是带记忆的调用
+from observability.logging import logger
 
 
 class MessageHandler:
 
+    # 防抖窗口：窗口内同一会话的新消息会取代旧消息。正常单条对话几乎无感。
+    _DEBOUNCE_SEC = 0.8
+
     def __init__(self, client: FeishuClient):
         self.client = client
-        self._processed_events: set[str] = set()   # 消息去重
+        self._coordinator = CoordinatorAgent()
+        # 每个会话当前正在等待/处理的任务，新消息到来时取消它（latest-wins）
+        self._pending: dict[str, asyncio.Task] = {}
 
     async def handle_event(self, event_data: dict):
-        """处理飞书推送的事件。"""
+        """处理飞书推送的事件：解析消息，按会话做 latest-wins 防抖调度。"""
         # 只处理消息接收事件
         if event_data.get("header", {}).get("event_type") != "im.message.receive_v1":
             return
-
-        # 消息去重（飞书可能重复推送同一条消息）
-        event_id = event_data.get("header", {}).get("event_id", "")
-        if event_id in self._processed_events:
-            return
-        self._processed_events.add(event_id)
-
-        # 清理过期的去重记录（避免集合无限增长）
-        if len(self._processed_events) > 10000:
-            self._processed_events = set()
 
         event = event_data.get("event", {})
         message = event.get("message", {})
@@ -8149,6 +8611,30 @@ class MessageHandler:
         if not text:
             return
 
+        # latest-wins 防抖：同一会话已有待处理任务，先取消（丢弃旧消息，只回最新一条）
+        old = self._pending.get(session_key)
+        if old and not old.done():
+            old.cancel()
+
+        self._pending[session_key] = asyncio.create_task(
+            self._debounced_process(session_key, receive_id, receive_id_type, message_id, text)
+        )
+
+    async def _debounced_process(self, session_key, receive_id, receive_id_type, message_id, text):
+        """先等一个防抖窗口，窗口内若被新消息取消就直接退出，否则真正处理。"""
+        try:
+            await asyncio.sleep(self._DEBOUNCE_SEC)
+        except asyncio.CancelledError:
+            return   # 窗口内被更新的消息取代，直接放弃这条
+        try:
+            await self._process(session_key, receive_id, receive_id_type, message_id, text)
+        finally:
+            # 处理完清理自己（避免 _pending 无限增长）
+            if self._pending.get(session_key) is asyncio.current_task():
+                self._pending.pop(session_key, None)
+
+    async def _process(self, session_key, receive_id, receive_id_type, message_id, text):
+        """真正处理一条消息：命令 / 加表情 → 调 Agent → 回复 → 去表情。"""
         # 内置命令处理
         if text.strip() in ("/help", "帮助"):
             await self.client.send_text(
@@ -8159,29 +8645,30 @@ class MessageHandler:
             return
 
         if text.strip() in ("/clear", "清除历史"):
-            from persistence.session_store import SessionStore
-            store = SessionStore()
-            await store.clear(session_key)
+            await clear_session(session_key)
             await self.client.send_text(receive_id, "对话历史已清除。", id_type=receive_id_type)
             return
 
-        # 添加"思考中"Emoji 反应
+        # 添加"处理中"Emoji 反应（OnIt 是飞书表示"正在处理"的合法枚举值，
+        # 大小写敏感；"Thinking" 不是合法值，会返回 231001 reaction type is invalid）
         reaction_id = None
         try:
-            reaction_resp = await self.client.add_reaction(message_id, "Thinking")
+            reaction_resp = await self.client.add_reaction(message_id, "OnIt")
             reaction_id = reaction_resp.get("reaction_id")
-        except Exception:
-            pass   # Emoji 反应失败不影响主流程
+        except Exception as e:
+            # Emoji 反应失败不影响主流程，但要打日志（别静默吞掉，否则「没表情」极难排查）
+            logger.warning("feishu_add_reaction_failed", session_id=session_key, error=str(e))
 
         # 调用 Agent
         try:
-            result = await ask(text, session_id=session_key)
-            await self.client.send_text(receive_id, result.text, id_type=receive_id_type)
+            result = await self._coordinator.run(text, session_id=session_key)
+            # Agent 回复常含 Markdown（代码块、加粗、列表），用卡片发送才能正确渲染
+            await self.client.send_markdown(receive_id, result.text, id_type=receive_id_type)
         except Exception as e:
             await self.client.send_text(receive_id, f"处理时遇到错误，请稍后重试。", id_type=receive_id_type)
-            print(f"[Handler] 错误：{e}")
+            logger.error("feishu_handle_message_failed", session_id=session_key, error=str(e))
         finally:
-            # 移除"思考中"Emoji
+            # 移除"处理中"Emoji
             if reaction_id:
                 try:
                     await self.client.remove_reaction(message_id, reaction_id)
@@ -8193,6 +8680,19 @@ class MessageHandler:
 
 ## 12.5 WebSocket 管理器 `feishu/ws_manager.py`
 
+> **⚠️ 这一节有三个非踩不可的坑，踩中任意一个都会导致「飞书能发消息，但后端完全收不到」。** 坑 1、坑 3 不报错、极难排查，坑 2 报一句 `This event loop is already running` 也很误导。直接抄下面的最终版本，别按直觉写。
+
+**坑 1：`ws.Client.start()` 是同步阻塞方法，不能 `await`。**
+lark SDK 的 `ws.Client.start()` 内部自己 `loop.run_until_complete(...)`，它是一个**同步函数**（返回 `None`）。如果写成 `await ws_client.start()`，等于 `await None` → `TypeError`，**WebSocket 连接根本没建立**。正确做法是放到独立线程里跑，不阻塞 FastAPI 主 loop。
+
+**坑 2：lark 用模块级全局 loop，会和 FastAPI 主 loop 撞车。**
+lark 在 `import` 时就执行了 `loop = asyncio.get_event_loop()`（`lark_oapi/ws/client.py` 模块级），在主线程 import 就**抓住了 FastAPI 的主 loop**。即使把 `start()` 丢到线程里，它内部 `loop.run_until_complete(...)` 用的还是这个主 loop，于是报 `This event loop is already running`。正确做法是在工作线程里**新建一个线程私有 loop**，并**覆盖 lark 的模块级 loop 变量**，让 SDK 跑在这个独立 loop 上。
+
+**坑 3：SDK 用同步方式调用事件回调，`async def` 回调会被丢弃。**
+SDK 内部是 `processor.do(data)` **同步**调用你的回调，拿到协程对象后**从不 `await`**。所以如果 `_on_message` 写成 `async def`，它的函数体（`handle_event`）**永远不会执行**。正确做法是把 `_on_message` 写成**同步函数**，内部用 `asyncio.run_coroutine_threadsafe(...)` 把异步的 `handle_event` 投递回**主 event loop**执行（handler 用的 Redis/httpx 等资源都绑在主 loop）。
+
+> **两个 loop 各司其职**：lark 的 WebSocket 连接跑在**工作线程的私有 loop**（坑 2），业务处理 `handle_event` 跑在 **FastAPI 主 loop**（坑 3），靠 `run_coroutine_threadsafe` 在两者之间投递。
+
 ```python
 # feishu/ws_manager.py
 """
@@ -8200,11 +8700,29 @@ class MessageHandler:
 
 飞书的长连接（Long Connection）模式：你的服务主动连接飞书的 WebSocket 服务器，
 飞书有新消息时通过这条连接推送过来。
+
+三个必须注意的坑（否则后端收不到消息）：
+1. lark SDK 的 ws.Client.start() 是**同步阻塞**方法（内部自己 run_until_complete），
+   不能 await，要放到独立线程里跑，否则会阻塞/破坏 FastAPI 主 loop。
+2. lark 在 import 时用**模块级全局 loop**（lark_oapi.ws.client.loop = get_event_loop()），
+   在主线程 import 就抓住了 FastAPI 的主 loop。直接在线程里跑 start() 会报
+   "This event loop is already running"。必须在工作线程里新建一个**线程私有 loop**，
+   并覆盖 lark 模块的全局 loop 变量，让 SDK 的 run_until_complete 跑在这个独立 loop 上。
+3. SDK 用**同步方式**调用事件回调（processor.do(data)，不会 await 协程）。而我们的
+   handle_event 是 async 的，所以回调里要用 run_coroutine_threadsafe 把协程投递回
+   主 event loop 执行——直接 async def 回调会被 SDK 丢弃，body 永不执行。
 """
+import asyncio
+import json
+
 import lark_oapi as lark
+import lark_oapi.ws.client as lark_ws_client
+from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+
 from .client import FeishuClient
 from .handler import MessageHandler
 from core.config import settings
+from observability.logging import logger
 
 
 class FeishuWSManager:
@@ -8212,20 +8730,22 @@ class FeishuWSManager:
     def __init__(self):
         self._client_http = FeishuClient()
         self._handler = MessageHandler(self._client_http)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # event_id 去重：在同步回调里做（单线程，无并发穿透）。飞书会重推同一条消息，
+        # 尤其当回调 ACK 慢的时候——所以既要秒 ACK，也要在这里挡住重推。
+        self._seen_events: set[str] = set()
 
     async def start(self):
         """启动飞书 WebSocket 长连接，开始接收事件。"""
+        # 记住主 event loop：SDK 的回调跑在别的线程，要靠它把协程调度回来
+        self._loop = asyncio.get_running_loop()
 
-        # 使用飞书 SDK 创建 WebSocket 客户端
-        cli = lark.Client.builder() \
-            .app_id(settings.feishu_app_id) \
-            .app_secret(settings.feishu_app_secret) \
+        # 注册事件处理器（无加密：encrypt_key 和 verification_token 传空字符串）
+        event_dispatcher = (
+            lark.EventDispatcherHandler.builder("", "")
+            .register_p2_im_message_receive_v1(self._on_message)
             .build()
-
-        # 注册事件处理器
-        event_dispatcher = lark.EventDispatcherHandler.builder(
-            lark.ENCRYPT_KEY_SETTING_NO_ENCRYPTED, ""
-        ).register_p2_im_message_receive_v1(self._on_message).build()
+        )
 
         ws_client = lark.ws.Client(
             settings.feishu_app_id,
@@ -8233,46 +8753,111 @@ class FeishuWSManager:
             event_handler=event_dispatcher,
         )
 
-        print("[Feishu] WebSocket 连接已建立，等待消息...")
-        await ws_client.start()   # 阻塞，持续监听
+        logger.info("feishu_ws_connecting")
+        # 在独立线程里跑：线程内建一个私有 loop 并覆盖 lark 的模块级 loop，
+        # 避免和 FastAPI 主 loop 冲突（This event loop is already running）
+        await asyncio.to_thread(self._run_ws_blocking, ws_client)
 
-    async def _on_message(self, data):
-        """收到飞书消息事件时的回调。"""
+    def _run_ws_blocking(self, ws_client) -> None:
+        """在工作线程里以线程私有 loop 运行 lark 的同步阻塞 start()。"""
+        thread_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(thread_loop)
+        # 关键：覆盖 lark 模块级全局 loop，让 SDK 内部 run_until_complete 用这个私有 loop
+        lark_ws_client.loop = thread_loop
         try:
-            await self._handler.handle_event(data.to_dict())
+            ws_client.start()   # 同步阻塞，持续监听
+        finally:
+            thread_loop.close()
+
+    def _on_message(self, data: P2ImMessageReceiveV1) -> None:
+        """
+        收到飞书消息事件时的回调（SDK 在独立线程里同步调用）。
+
+        这里是同步函数——SDK 不会 await 协程。关键点：
+        - 必须**立刻返回**（不等 handle_event 跑完），否则 lark 迟迟不向飞书 ACK，
+          飞书判定推送失败会重推同一条消息 → 一条消息被处理多次。
+        - event_id 去重在这里做：本回调是 SDK 单线程串行调用，不会有并发穿透。
+        - 用 run_coroutine_threadsafe 把 handle_event 投递回主 loop，但**不 result()**（fire-and-forget）。
+        """
+        try:
+            # P2ImMessageReceiveV1 是对象，先 marshal 成 JSON 再转回 dict，
+            # 这样 handler 里 event_data.get("header", {}).get("event_type") 才拿得到值
+            payload = json.loads(lark.JSON.marshal(data))
+
+            # event_id 去重：挡住飞书的重推（同步单线程，安全）
+            event_id = payload.get("header", {}).get("event_id", "")
+            if event_id:
+                if event_id in self._seen_events:
+                    return
+                self._seen_events.add(event_id)
+                if len(self._seen_events) > 10000:
+                    self._seen_events.clear()
+
+            # fire-and-forget：投递到主 loop 后立刻返回，让 lark 秒 ACK
+            asyncio.run_coroutine_threadsafe(
+                self._handler.handle_event(payload),
+                self._loop,
+            )
         except Exception as e:
-            print(f"[Feishu] 事件处理失败：{e}")
+            logger.error("feishu_event_dispatch_failed", error=str(e))
 ```
+
+> **为什么 `_on_message` 用 `lark.JSON.marshal(data)` 而不是 `data.to_dict()`？** 回调收到的是 `P2ImMessageReceiveV1` 对象，它的 `header` / `event` 是嵌套对象而非 dict。用 SDK 的 `lark.JSON.marshal()` 序列化成 JSON 字符串、再 `json.loads` 转回 dict，才能得到 `handler.py` 里 `event_data.get("header", {}).get("event_type")` 所依赖的标准结构。
+
+> **⚠️ 为什么回调不能 `future.result()`？** 早期写法在回调里 `future.result()` **阻塞等** `handle_event` 全跑完（调 LLM 可能好几秒）才返回。但 lark 要等回调返回才向飞书 ACK，而**飞书的 ACK 超时只有几秒**——等不到就判定推送失败、**重推同一条消息**，于是「发 1 条被回复 2 次」。所以回调必须 fire-and-forget 秒 ACK，重推则靠上面的 event_id 去重挡住。
 
 ---
 
 ## 12.6 在 FastAPI 启动时连接飞书
 
+飞书 WebSocket 不是单独的 lifespan，而是**融进第 11 章那个已有的 `lifespan`**——
+在 Redis 恢复、常驻 Swarm Agent、后台备份任务都启动之后再拉起，关闭时最先取消。
+只有配置了 `feishu_app_id` + `feishu_app_secret` 才启动，没配就整段跳过（不影响
+纯 HTTP / CLI 部署）：
+
 ```python
-# main.py 的 lifespan 里添加
+# main.py 的 lifespan（在第 11 章版本上补充飞书部分，其余逻辑不变）
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import asyncio
+    global _swarm_save_task
 
-    # 启动飞书 WebSocket（在后台任务里运行，不阻塞主服务）
+    setup_logging()
+    setup_tracing(service_name="my-agent", otlp_endpoint=settings.otel_exporter_otlp_endpoint or None)
+
+    workspace = get_workspace()
+    workspace.mkdir(parents=True, exist_ok=True)
+    logger.info("server_starting")
+    logger.info("workspace_ready", workspace=str(workspace))
+
+    # 1~3. Redis 恢复 / 常驻 Swarm Agent / 后台备份（第 11 章逻辑，此处省略）
+    ...
+
+    # 4. 启动飞书 WebSocket（配了 App ID/Secret 才启动），后台任务运行，不阻塞主服务
     feishu_task = None
     if settings.feishu_app_id and settings.feishu_app_secret:
         from feishu.ws_manager import FeishuWSManager
         ws_manager = FeishuWSManager()
         feishu_task = asyncio.create_task(ws_manager.start())
-        print("[Main] 飞书 WebSocket 已启动")
+        logger.info("feishu_ws_started")
 
     yield
 
-    # 关闭时取消飞书任务
+    # 5. 收尾：先取消飞书任务，再停 Swarm Agent / 备份任务 / 关闭连接（第 11 章逻辑）
     if feishu_task:
         feishu_task.cancel()
         try:
             await feishu_task
         except asyncio.CancelledError:
             pass
+
+    # ... 停 Swarm Agent、停备份、save_to_redis、close（第 11 章逻辑，此处省略）
+    logger.info("server_shutdown")
 ```
+
+> **两个提醒**：① `asyncio` 已在 `main.py` 顶部 import，不要在 lifespan 里再局部
+> `import asyncio`；② 日志用项目统一的 `logger.info("feishu_ws_started")`（结构化 JSON，
+> 能被 Loki 采集），不要用 `print`。
 
 ---
 
@@ -8283,19 +8868,36 @@ async def lifespan(app: FastAPI):
 
 □ 飞书应用已启用机器人功能，已申请 im:message 读写权限
 
-□ 服务启动时看到"飞书 WebSocket 已启动"的日志
+□ 服务启动时看到 {"event": "feishu_ws_started", ...} 和 {"event": "feishu_ws_connecting", ...} 的日志
 
 □ 私聊机器人能收到回复
 
+□ （排查「发消息后端完全收不到」）先自查 12.5 的三个坑：
+  - ws_client.start() 是否误写成 await（应放到独立线程跑，不 await）
+  - 启动是否报 "This event loop is already running"（应在工作线程建私有 loop
+    并覆盖 lark_ws_client.loop）
+  - _on_message 是否误写成 async def（应为同步函数 + run_coroutine_threadsafe）
+
 □ 群聊 @机器人能收到回复
 
-□ 发消息时出现"思考中"💭 Emoji，回复后消失
+□ 发消息时出现"处理中"👌 Emoji（OnIt），回复后消失
+  （如果没出现：看日志有没有 231001 reaction type is invalid——emoji_type 用错了；
+   emoji_type 是大小写敏感的固定枚举，见 12.3 的合法值说明）
+
+□ Agent 回复的 Markdown 正确渲染（加粗、代码块、列表显示为格式，而非字面量）
+  （用 send_markdown 走 interactive 卡片；若显示成 **加粗** 字面量，说明还在用 send_text）
 
 □ /help 命令返回帮助文字
 
 □ /clear 命令清除会话历史，下次对话 Agent 不再记得之前内容
 
-□ 消息去重生效（快速发两条同样的消息，只处理一次）
+□ event_id 去重生效（飞书重推同一条消息，只处理一次）——去重在 12.5 的同步回调里做
+
+□ 连发多条消息不乱序、不重复回复：
+  - 快速连发 3 条不同消息，只回复最新那一条（latest-wins 防抖，见 12.4 的 _DEBOUNCE_SEC）
+  - 不会出现「发 3 条回 4 条」（说明回调已 fire-and-forget、飞书不再因 ACK 超时重推）
+
+□ 回调不阻塞：_on_message 里没有 future.result()（否则 ACK 慢会触发飞书重推）
 ```
 
 ---
@@ -8311,11 +8913,17 @@ async def lifespan(app: FastAPI):
 ```
 my-agent/
 ├── Dockerfile
+├── .dockerignore        ← 构建时排除 .venv / 缓存等，避免污染镜像、加快构建
 ├── docker-compose.yml
+├── prometheus.yml       ← Prometheus 抓取配置
+├── tempo.yaml           ← Tempo 链路存储配置
+├── promtail-config.yaml ← Promtail 日志采集配置（推给 Loki）
+├── grafana/
+│   └── provisioning/
+│       └── datasources/
+│           └── datasources.yaml   ← Grafana 数据源自动配置（Prometheus + Tempo + Loki）
 ├── entrypoint.sh
-├── .env.shared       ← 所有环境共用的配置
-├── .env.dev          ← 开发环境配置（热重载）
-└── .env.prod         ← 生产环境配置（多 worker）
+└── .env.docker          ← Docker 部署用的唯一环境配置（本地开发用 .env）
 ```
 
 ---
@@ -8339,28 +8947,35 @@ my-agent/
 
 ## 13.3 `Dockerfile`
 
+本项目用 **uv** 管理依赖（`pyproject.toml` + `uv.lock`），所以 Dockerfile 基于 uv 官方镜像、用 `uv sync` 按锁文件精确安装，而不是 `pip install requirements.txt`。这样容器里装的依赖版本和本地 `uv.lock` 完全一致，也不用再单独维护 `requirements.txt`。
+
 ```dockerfile
 # Dockerfile
 
-# 使用官方 Python 3.11 slim 镜像（slim 是最小版本，去掉了不需要的工具）
-FROM python:3.11-slim
+# 使用 uv 官方镜像（自带 uv + Python 3.14，和 .python-version / pyproject 的 requires-python 一致）
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim
 
 # 设置工作目录
 WORKDIR /app
 
-# 设置 Python 不生成 .pyc 文件（容器里不需要）
+# 设置 Python 不生成 .pyc 文件（容器里不需要）；输出不缓冲（日志实时可见）
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+# 用国内镜像加速依赖下载
+ENV UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 先复制依赖文件（利用 Docker 层缓存：依赖没变时不重新安装）
-COPY requirements.txt .
+# 先只复制依赖清单，利用 Docker 层缓存（依赖没变时不重装）
+COPY pyproject.toml uv.lock ./
 
-# 安装依赖（--no-cache-dir 减小镜像大小）
-RUN pip install --no-cache-dir -r requirements.txt \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 按 uv.lock 精确安装依赖到 .venv（--frozen 不改锁文件；--no-install-project 此时还没复制项目代码；
+# --no-dev 不装 dev 依赖组，如 pytest）
+RUN uv sync --frozen --no-install-project --no-dev
 
 # 再复制应用代码（代码改动时只需重新构建这一层，依赖层缓存有效）
 COPY . .
+
+# 把项目本身也装进环境（此时代码已就位）
+RUN uv sync --frozen --no-dev
 
 # 暴露服务端口（声明意图，实际映射在 docker-compose.yml 里）
 EXPOSE 8002
@@ -8371,6 +8986,32 @@ RUN chmod +x entrypoint.sh
 # 启动命令
 ENTRYPOINT ["./entrypoint.sh"]
 ```
+
+> **两次 `uv sync` 是为了层缓存**：第一次只装第三方依赖（代码没复制，改代码不会让这层失效）；第二次在复制代码后把项目本身装进环境。依赖没变时，第一次那层直接命中缓存，重建镜像很快。
+>
+> **`uv run` 前缀**：依赖装在 `.venv` 里，所以 `entrypoint.sh` 启动命令要用 `uv run uvicorn ...`（见 13.4），让 uv 用虚拟环境里的 uvicorn；直接 `uvicorn ...` 会找不到命令。
+
+### 13.3.1 `.dockerignore`
+
+`COPY . .` 会把整个项目目录复制进镜像。本地的 `.venv/`（可能几百 MB，且是为本机 Python 构建的，进容器无用甚至冲突）、`__pycache__`、`.git` 等都不该进镜像——用 `.dockerignore` 排除，既加快构建又减小镜像：
+
+```gitignore
+# .dockerignore
+.venv/
+__pycache__/
+*.pyc
+.git/
+.pytest_cache/
+sessions/
+workspace/
+logs/
+.env
+.env.*
+*.md
+.vscode/
+```
+
+> **关键是排除 `.venv/`**：uv 在容器内会用 `uv sync` 重新创建 `.venv`，本地那份必须挡在镜像外，否则可能覆盖容器内正确的依赖。`.env*` 也排除——密钥通过 docker-compose 的 `env_file` 注入，不打进镜像。
 
 ---
 
@@ -8383,14 +9024,14 @@ ENTRYPOINT ["./entrypoint.sh"]
 set -e   # 任何命令失败就退出
 
 echo "=== My Agent 服务启动 ==="
-echo "环境：${ENV:-dev}"
 echo "Provider：${LLM_PROVIDER:-anthropic}"
 
 # 等待 Redis 就绪（最多等 30 秒）
+# 用 uv run python + redis 库探活，不依赖 redis-cli（uv slim 镜像没装它）
 if [ -n "${REDIS_HOST}" ]; then
     echo "等待 Redis 就绪..."
     for i in $(seq 1 30); do
-        if redis-cli -h "${REDIS_HOST:-redis}" -p "${REDIS_PORT:-6379}" ping > /dev/null 2>&1; then
+        if uv run python -c "import redis, sys; sys.exit(0 if redis.Redis(host='${REDIS_HOST:-redis}', port=${REDIS_PORT:-6379}).ping() else 1)" > /dev/null 2>&1; then
             echo "Redis 已就绪"
             break
         fi
@@ -8398,22 +9039,16 @@ if [ -n "${REDIS_HOST}" ]; then
     done
 fi
 
-# 根据环境启动不同配置
-if [ "${ENV}" = "prod" ]; then
-    echo "生产模式：4 个 Worker，无热重载"
-    exec uvicorn main:app \
-        --host 0.0.0.0 \
-        --port 8002 \
-        --workers 4 \
-        --no-access-log
-else
-    echo "开发模式：单 Worker，热重载开启"
-    exec uvicorn main:app \
-        --host 0.0.0.0 \
-        --port 8002 \
-        --reload
-fi
+# 单 Worker + 热重载启动（uv run 会用 .venv 里的 uvicorn）
+# 单 worker 也避免了飞书 WebSocket 在多 worker 下各连一次导致的重复处理
+echo "启动：单 Worker，热重载开启"
+exec uv run uvicorn main:app \
+    --host 0.0.0.0 \
+    --port 8002 \
+    --reload
 ```
+
+> **为什么 Redis 探活不用 `redis-cli`？** uv 的 slim 镜像里没有 `redis-cli` 这个命令行工具，而项目依赖里本来就有 `redis` 库，所以直接 `uv run python -c "...redis.Redis(...).ping()"` 探活，不用额外 `apt install redis-tools`。
 
 ---
 
@@ -8435,16 +9070,14 @@ services:
     ports:
       - "${APP_PORT:-8002}:8002"    # 主机端口:容器端口
     env_file:
-      - .env.shared
-      - .env.${ENV:-dev}            # 根据 ENV 变量加载对应的 .env 文件
-    environment:
-      - REDIS_HOST=redis            # 覆盖：在 Docker 网络里用服务名访问 Redis
+      - .env.docker                 # 唯一的容器环境配置（不再分 dev/prod）
     depends_on:
       redis:
         condition: service_healthy  # 等 Redis 健康检查通过后才启动 agent
     restart: unless-stopped         # 除非手动停止，否则崩溃后自动重启
     volumes:
       - ./sessions:/app/sessions    # 把会话文件映射到主机，重建容器不丢失
+      - ./workspace:/app/workspace  # 工作目录（WORKSPACE）映射到主机，工具产出不丢失
 
   # ── Redis 服务 ────────────────────────────────────────────────────
   redis:
@@ -8459,52 +9092,276 @@ services:
     volumes:
       - redis_data:/data            # Redis 数据持久化（容器重建不丢失）
 
+  # ── Prometheus 监控 ──────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    restart: unless-stopped
+
+  # ── Grafana 可视化（一处看齐：指标 Prometheus + 链路 Tempo + 日志 Loki）─
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # 开启 Tempo 相关特性（trace 到 metrics 的跳转）
+      - GF_FEATURE_TOGGLES_ENABLE=traceToMetrics
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # 数据源自动配置：容器启动时自动连好 Prometheus / Tempo / Loki，无需手动点界面
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+
+  # ── Tempo 链路追踪（存储后端，UI 走 Grafana）─────────────────────
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    ports:
+      - "4317:4317"                  # OTLP gRPC 接收端口（你的服务 push span 到这里）
+      - "3200:3200"                  # Tempo HTTP API（Grafana 数据源查询用）
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml
+      - tempo_data:/var/tempo
+    restart: unless-stopped
+
+  # ── Loki 日志存储（存储后端，UI 走 Grafana）─────────────────────
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]  # 用镜像自带默认配置即可
+    ports:
+      - "3100:3100"                  # Loki HTTP API（Promtail 推日志 + Grafana 查询都走这里）
+    volumes:
+      - loki_data:/loki
+    restart: unless-stopped
+
+  # ── Promtail 日志采集器（读容器 stdout，推给 Loki）──────────────
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    command: ["-config.file=/etc/promtail/config.yaml"]
+    volumes:
+      - ./promtail-config.yaml:/etc/promtail/config.yaml
+      # 读取宿主机上的容器日志（Docker 把每个容器 stdout 写成 json-file）
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+    depends_on:
+      - loki
+
 volumes:
   redis_data:
+  prometheus_data:
+  grafana_data:
+  tempo_data:
+  loki_data:
 ```
+
+> **镜像清单**（共 7 个）：`ghcr.io/astral-sh/uv:python3.14-bookworm-slim`（Dockerfile FROM，uv + Python 3.14） + `redis:7-alpine`（会话缓存） + `prom/prometheus:latest`（指标抓取） + `grafana/grafana:latest`（统一可视化） + `grafana/tempo:latest`（链路存储） + `grafana/loki:latest`（日志存储） + `grafana/promtail:latest`（日志采集）。其中 `my-agent:latest` 是通过 Dockerfile `build` 生成的，不是外部镜像。
+>
+> **Tempo / Loki 都没有独立 UI**：它们只是存储后端，查看统一走 Grafana。Tempo 收链路（4317）、供查询（3200）；Loki 收日志 + 供查询都走同一个端口（3100）。
+>
+> **Promtail 为什么要挂载 docker.sock 和 containers 目录？** Docker 默认把每个容器的 stdout 写成宿主机上的 json-file 日志文件，Promtail 需要读到这些文件、并通过 `docker.sock` 拿到容器名/标签，才能把日志打上 `container` 标签推给 Loki。两个挂载都是**只读（`:ro`）**，Promtail 不会改动它们。
+
+**项目根目录下创建 `prometheus.yml`**（与 `docker-compose.yml` 同级）：
+
+```yaml
+# prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "polycoder"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["agent:8002"]       # Docker 网络内用服务名访问
+        labels:
+          service: "polycoder"
+```
+
+> **targets 说明**：docker-compose 内所有服务共享同一个 Docker 网络，所以这里直接填服务名 `agent:8002`，不需要 `host.docker.internal`。
 
 ---
 
-## 13.6 拆分环境变量文件
+### 13.5.1 `tempo.yaml`（Tempo 配置，与 `docker-compose.yml` 同级）
 
-**`.env.shared`（所有环境共用）：**
+Tempo 需要一个配置文件告诉它「从哪个端口收链路」「存到哪里」。下面是一份最小可用的单机配置（本地文件存储，不接对象存储）：
+
+```yaml
+# tempo.yaml
+server:
+  http_listen_port: 3200          # Grafana 数据源查询走这个端口
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"   # 接收你的服务 push 过来的 OTLP gRPC 链路
+
+ingester:
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 24h          # 链路数据保留 24 小时（本地开发够用）
+
+storage:
+  trace:
+    backend: local                # 本地磁盘存储（生产可换成 s3/gcs）
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+```
+
+> **端口对应关系**：你的服务把 Span 推到 `tempo:4317`（OTLP gRPC，见 `.env.docker` 里的 `OTEL_EXPORTER_OTLP_ENDPOINT`），Grafana 查询链路时连的是 `tempo:3200`（HTTP API）。两个端口各司其职，别搞混。
+
+---
+
+### 13.5.2 `promtail-config.yaml`（日志采集配置，与 `docker-compose.yml` 同级）
+
+Loki 用镜像自带的默认配置就能跑，不需要额外文件。真正要配的是采集器 **Promtail**——告诉它「读哪里的日志」「推给谁」。下面这份配置用 Docker 服务发现，自动采集所有容器的 stdout：
+
+```yaml
+# promtail-config.yaml
+server:
+  http_listen_port: 9080
+
+positions:
+  filename: /tmp/positions.yaml   # 记录读到哪了，重启不重复采集
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push   # 推给 Loki（Docker 网络内用服务名）
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:              # 通过 docker.sock 自动发现所有容器
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # 把容器名提取成 container 标签，查询时可按容器过滤
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: container
+```
+
+> **验证日志被 JSON 解析**：本项目日志本身就是 JSON（第 11 章），进入 Grafana 后在 Loki 查询里加一个 `| json` 管道（见 13.7.1），就能把 `session_id`、`event`、`level` 等字段拆出来单独过滤。Promtail 这里不需要预先解析 JSON，交给查询时按需展开更灵活。
+
+---
+
+### 13.5.3 Grafana 数据源自动配置（免手动点界面）
+
+第 11 章检查清单里「打开 Grafana 手动添加 Prometheus 数据源」这一步，可以用 Grafana 的 **provisioning** 机制自动完成——把数据源写进一个 YAML 文件，Grafana 启动时自动加载。这样 `docker compose up` 之后，Prometheus、Tempo、Loki 三个数据源就已经连好了。
+
+**创建 `grafana/provisioning/datasources/datasources.yaml`**（注意目录层级，`docker-compose.yml` 里挂载的就是这个路径）：
+
+```yaml
+# grafana/provisioning/datasources/datasources.yaml
+apiVersion: 1
+
+datasources:
+  # ── 指标：Prometheus ──────────────────────────────────────────
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090      # Docker 网络内用服务名
+    isDefault: true
+
+  # ── 链路：Tempo ───────────────────────────────────────────────
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200           # 连 Tempo 的 HTTP 查询端口
+    jsonData:
+      # 从链路 Span 跳到对应指标（可选，增强联动）
+      tracesToMetrics:
+        datasourceUid: prometheus
+      # 服务依赖图需要的节点/边指标
+      serviceMap:
+        datasourceUid: prometheus
+
+  # ── 日志：Loki ────────────────────────────────────────────────
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100            # 连 Loki 的 HTTP 查询端口
+```
+
+> **目录结构**：完成后项目根目录多出这些配置文件：
+> ```
+> my-agent/
+> ├── docker-compose.yml
+> ├── prometheus.yml
+> ├── tempo.yaml
+> ├── promtail-config.yaml
+> └── grafana/
+>     └── provisioning/
+>         └── datasources/
+>             └── datasources.yaml
+> ```
+> Grafana 官方约定 `provisioning/datasources/` 下的所有 YAML 都会在启动时被读取，无需在文件名上做特殊约定。
+
+---
+
+## 13.6 环境变量文件
+
+Docker 部署只用**一个** `.env.docker`（不再分 dev/prod）。本地开发仍用 `.env`，两者互不干扰。
 
 ```dotenv
-# .env.shared — 所有环境共用的配置
+# .env.docker — Docker 部署用的唯一环境配置（本地开发用 .env）
 
-ANTHROPIC_API_KEY=sk-ant-...
-LLM_PROVIDER=anthropic
-LLM_MODEL=claude-sonnet-4-6
+# ── LLM Provider（示例用 DeepSeek，走 openai 兼容接口；用 Claude 就填 anthropic）─
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+OPENAI_MODEL=deepseek-v4-pro
+LLM_MODEL=claude-sonnet-4-6   # 仅 anthropic provider 时生效
+
 APP_PORT=8002
-```
 
-**`.env.dev`（开发环境）：**
+# ── 飞书机器人（第 12 章）──────────────────────────────────────────
+FEISHU_APP_ID=cli_...
+FEISHU_APP_SECRET=...
 
-```dotenv
-# .env.dev — 开发环境
-ENV=dev
+# ── Redis（Docker 网络内用服务名 redis 访问）──────────────────────
 REDIS_HOST=redis
 REDIS_PORT=6379
+# 如需密码，取消注释并给 docker-compose.yml 的 redis 服务加 --requirepass
+# REDIS_PASSWORD=your_strong_password_here
+
+# ── 工作目录（第 0 章）——容器内所有工具/子 Agent 的文件操作都限定在此目录内 ─
+WORKSPACE=/app/workspace
+
+# ── OpenTelemetry 链路追踪导出地址（第 11 章）——推送到 Tempo 的 OTLP gRPC 端口 ─
+OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
 ```
 
-**`.env.prod`（生产环境）：**
+> **Docker 里的工作目录**：容器 `WORKDIR` 是 `/app`（第 13.3 节 Dockerfile），这里把工作区设为 `/app/workspace` 与代码目录分开。13.5 的 agent 服务已加卷映射 `./workspace:/app/workspace`（和 `./sessions:/app/sessions` 同理），工具产出的文件会落到主机的 `./workspace`，容器重建也不丢失。
+>
+> **`REDIS_HOST=redis`**：容器间用 compose 里的服务名 `redis` 互访，不是 `localhost`（那是本地 `.env` 的写法）。
 
-```dotenv
-# .env.prod — 生产环境
-ENV=prod
-REDIS_HOST=redis
-REDIS_PORT=6379
-
-# 生产环境建议设置 Redis 密码
-REDIS_PASSWORD=your_strong_password_here
-```
-
-**在 `.gitignore` 里排除这些文件：**
+**在 `.gitignore` 里排除这个文件：**
 
 ```
-.env.shared
-.env.dev
-.env.prod
+.env.docker
 ```
 
 ---
@@ -8512,14 +9369,11 @@ REDIS_PASSWORD=your_strong_password_here
 ## 13.7 构建和启动命令
 
 ```bash
-# 开发模式启动（热重载，方便调试）
-ENV=dev docker compose up --build
+# 启动（前台，看日志）
+docker compose up --build
 
 # 后台启动
-ENV=dev docker compose up -d --build
-
-# 生产模式启动
-ENV=prod docker compose up -d --build
+docker compose up -d --build
 
 # 查看实时日志
 docker compose logs -f agent
@@ -8548,6 +9402,63 @@ curl -X POST http://localhost:8002/ask \
 
 ---
 
+## 13.7.1 在 Grafana 里查看指标、链路和日志
+
+启动后所有可观测性数据都在一个 Grafana 界面查看，登录信息：`http://localhost:3000`，账号密码都是 `admin`（首次登录会要求改密码，本地可跳过）。
+
+**① 确认数据源已自动连好**
+
+`Connections → Data Sources`，应该看到 provisioning 自动创建的三个数据源：
+- **Prometheus**（`http://prometheus:9090`）——指标
+- **Tempo**（`http://tempo:3200`）——链路
+- **Loki**（`http://loki:3100`）——日志
+
+各自点进去拉到底 `Save & test`，看到绿色 "successfully" 即连接正常。如果这里是空的，说明 `grafana/provisioning/datasources/datasources.yaml` 没挂载进去，检查 `docker-compose.yml` 的 volumes 路径和文件是否存在，然后 `docker compose restart grafana`。
+
+**② 查看链路（Tempo）**
+
+先发几次 `/ask` 请求产生链路数据，然后：
+
+1. 左侧菜单 `Explore`
+2. 顶部数据源下拉选 **Tempo**
+3. 查询模式选 `Search`，Service Name 选 `my-agent`（对应 `tracing.py` 里的 `service.name`），点 `Run query`
+4. 结果列表里点任意一条 trace，右侧展开火焰图，能看到完整链路：`agent_loop → turn_0 → tool_xxx → turn_1 → ...`，每段的耗时一目了然
+
+> 如果 Search 标签页是灰的/不可用，用 `TraceQL` 模式输入 `{}` 也能列出最近的全部链路。
+
+**③ 查看指标（Prometheus）**
+
+同样在 `Explore`，数据源切到 **Prometheus**，输入指标名验证打点是否生效，例如：
+- `agent_requests_total` —— 请求总数（按 provider/model/status 分类）
+- `rate(agent_latency_seconds_sum[5m]) / rate(agent_latency_seconds_count[5m])` —— 平均延迟
+- `active_requests` —— 当前活跃请求数
+
+需要长期看板可以在 `Dashboards → New` 里把这些指标做成图表面板。
+
+**④ 查看日志（Loki）**
+
+同样在 `Explore`，数据源切到 **Loki**，用 LogQL 查询。因为本项目日志是 JSON，加 `| json` 就能把字段拆出来精确过滤：
+
+```logql
+# 只看 agent 容器的日志
+{container="agent"}
+
+# 拆出 JSON 字段后，只看 warning 及以上级别
+{container="agent"} | json | level=~"warning|error"
+
+# 追踪某一次请求的完整日志（就是上一个问题里排查时间线的做法）
+{container="agent"} | json | session_id="49da725d-176f-4e35-8f6c-e2cb3bfa379a"
+
+# 只看 Redis 连接失败
+{container="agent"} | json | event=~"session_store_redis.*"
+```
+
+> **三件套联动**：因为日志、链路、指标都在同一个 Grafana，排查问题时可以从一条指标异常（Prometheus 看到延迟飙高）→ 跳到对应时间段的日志（Loki 按 `session_id` 过滤）→ 再跳到那次请求的链路火焰图（Tempo 看哪个 Span 最慢），一条龙定位根因。
+
+需要长期看板可以在 `Dashboards → New` 里把指标图表和日志面板放到同一个 dashboard。
+
+---
+
 ## 13.8 常见部署问题
 
 **Q：docker compose up 时报 "Permission denied" 关于 entrypoint.sh？**
@@ -8565,7 +9476,33 @@ A：Redis 还没有就绪。检查：
 
 **Q：API Key 配置了但服务返回认证错误？**
 
-A：检查 `.env.shared` 文件是否在 docker compose 的 `env_file` 里，以及 Key 格式是否正确（没有额外空格）。
+A：检查 `.env.docker` 文件是否在 docker compose 的 `env_file` 里，以及 Key 格式是否正确（没有额外空格）。
+
+**Q：Grafana 里 Tempo 数据源没有自动出现 / 测试连接失败？**
+
+A：分两种情况：
+1. **数据源根本没出现**：provisioning 文件没挂载进去。确认 `grafana/provisioning/datasources/datasources.yaml` 存在，且 `docker-compose.yml` 里 grafana 的 volumes 有 `./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources`，然后 `docker compose restart grafana`。
+2. **出现了但测试失败**：URL 要填 `http://tempo:3200`（HTTP 查询端口），不是 `4317`（那是 OTLP 接收端口，Grafana 连它会失败）。
+
+**Q：发了请求但 Grafana Explore 里搜不到链路？**
+
+A：按顺序排查：
+1. `.env.docker` 里 `OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317` 是否配置（不配就不导出，见第 11 章）。
+2. 依赖 `opentelemetry-exporter-otlp-proto-grpc` 是否装了（没装的话 `tracing.py` 会打印 "未安装...链路数据不导出"）。
+3. `docker compose logs tempo` 看 Tempo 是否正常启动、有没有报 `tempo.yaml` 配置错误。
+4. Tempo 有几秒的 ingester 缓冲，发完请求稍等几秒再刷新查询。
+
+**Q：Grafana Loki 里查不到任何日志？**
+
+A：日志链路是 `agent 打到 stdout → Promtail 采集 → 推给 Loki`，逐段排查：
+1. `docker compose logs agent` 本身能看到 JSON 日志吗？看不到说明 agent 没往 stdout 打日志（检查 `setup_logging()` 是否调用）。
+2. `docker compose logs promtail` 有没有报错？常见是挂载路径不对——确认 `/var/lib/docker/containers` 和 `/var/run/docker.sock` 都挂进去了。
+3. Loki 数据源 URL 要填 `http://loki:3100`；LogQL 至少要有一个标签选择器，直接输 `| json` 会报错，正确写法是 `{container="agent"} | json`。
+4. 容器名标签可能不是 `agent` 而是 `my-agent-agent-1` 之类，先用 `{container=~".+"}` 列出全部，确认实际标签值再精确过滤。
+
+**Q：Promtail 挂载 docker.sock 报权限错误？**
+
+A：宿主机上 `/var/run/docker.sock` 属于 root/docker 组。本指南容器以默认用户跑、且用户是 root，通常能读；如果宿主机做了严格权限隔离，可给 promtail 服务加 `user: root` 或把当前用户加入 docker 组。
 
 ---
 
@@ -8574,17 +9511,31 @@ A：检查 `.env.shared` 文件是否在 docker compose 的 `env_file` 里，以
 ```
 □ Dockerfile 构建成功（docker build -t my-agent . 无报错）
 
-□ docker compose up 能正常启动（两个服务都变成 running）
+□ docker compose up 能正常启动（7 个服务都变成 running：
+  agent + redis + prometheus + grafana + tempo + loki + promtail）
 
 □ redis 服务健康检查通过（docker compose ps 显示 healthy）
 
 □ curl http://localhost:8002/health 返回 200
 
+□ curl http://localhost:8002/metrics 能拉到指标数据（如 agent_requests_total）
+
+□ 打开 http://localhost:9090 → Status → Targets，polycoder 状态为 UP
+
+□ 打开 http://localhost:3000 → Connections → Data Sources，Prometheus / Tempo / Loki 三个数据源
+  已自动出现（provisioning 生效），各自点 "Test" 均通过
+
+□ 打开 http://localhost:3000 → Explore → 选择 Tempo 数据源 → Search，能搜到链路数据
+  （需先发几次 /ask 请求；Tempo 没有独立 UI，链路只在 Grafana 里看）
+
+□ 打开 http://localhost:3000 → Explore → 选择 Loki 数据源 → 输入 {container="agent"} | json，
+  能看到结构化日志，且可按 session_id / level / event 字段过滤
+
 □ 发送问题能得到回答（end-to-end 验证）
 
 □ docker compose down 然后再 up，会话历史仍然存在（volumes 持久化有效）
 
-□ ENV=prod 模式下看到 4 个 uvicorn worker
+□ 启动日志出现「启动：单 Worker，热重载开启」（单一环境，单 worker + reload）
 ```
 
 ---
@@ -8905,7 +9856,7 @@ def _get_sub_agents() -> dict:
 
 ```
 my-agent/
-├── .env / .env.shared / .env.dev / .env.prod
+├── .env（本地开发） / .env.docker（Docker 部署）
 ├── .gitignore
 ├── requirements.txt
 ├── Dockerfile
@@ -8927,9 +9878,8 @@ my-agent/
 │   ├── openai.py
 │   └── gemini.py
 │
-├── agent/                  ← 阶段 4：Agentic Loop
-│   ├── __init__.py         ← 只做导出（from .api import ...）
-│   ├── api.py              ← 对外接口（ask、ask_stream、AskResult）
+├── agent_core/              ← 阶段 4：Agentic Loop（后期从 agent/ 改名而来，见 4.6 更新说明）
+│   ├── __init__.py
 │   ├── loop.py
 │   ├── state.py
 │   ├── executor.py
@@ -9014,7 +9964,7 @@ my-agent/
 | 报错信息 | 原因 | 解决方法 |
 |---------|------|---------|
 | `AuthenticationError: 401` | API Key 不正确或未设置 | 检查 `.env` 中对应 Provider 的 Key |
-| `ModuleNotFoundError: anthropic` | 依赖未安装 | `pip install -r requirements.txt` |
+| `ModuleNotFoundError: anthropic` | 依赖未安装 | `uv sync`（本地开发）或重建镜像（容器） |
 | `context_length_exceeded` | 对话历史超出 Token 限制 | 启用第 8 章的历史压缩 |
 | `Connection refused (6379)` | Redis 未启动 | Windows/Docker：`docker start redis-dev`；Mac：`brew services start redis`（见 7.6 节） |
 | `Connection refused (11434)` | Ollama 未启动 | `ollama serve` |
@@ -9204,7 +10154,7 @@ Commit 命名规范：
 ### 亮点 5：生产级可观测性三件套
 
 - **结构化日志（structlog）**：JSON 格式，每条日志携带 session_id / turn / token 信息，便于 ELK / Loki 检索
-- **链路追踪（OpenTelemetry）**：每次 LLM 调用、工具执行均生成 Span，可在 Jaeger / Zipkin 中追踪完整链路
+- **链路追踪（OpenTelemetry）**：每次 LLM 调用、工具执行均生成 Span，推送到 Grafana Tempo，在 Grafana Explore 里追踪完整链路
 - **Prometheus 指标**：暴露请求数、P99 延迟、Token 消耗速率，接入 Grafana 大盘
 
 ### 亮点 6：飞书机器人全链路集成
@@ -9743,7 +10693,7 @@ A：登录账户后进入「账户设置」→「升级套餐」，支持支付�
 在已有的 Agentic Loop（第 4-5 章实现）里，工具通过 `ToolRegistry` 注册：
 
 ```python
-# 在 main.py 或 agent/ 入口文件里，初始化时注册工具
+# 在 main.py 或 agent_core/ 入口文件里，初始化时注册工具
 
 from tools.weather import WeatherTool
 from tools.knowledge_base import KnowledgeBaseTool
@@ -10252,14 +11202,14 @@ import textwrap
 
 sys.path.insert(0, ".")
 
-from agent.loop import run_agent_loop
+from agent_core.loop import run_agent_loop
 from providers.router import get_provider
 from providers.types import Message, TextBlock
 from tools.builtin.read_file import ReadFileTool
 from tools.builtin.run_python import RunPythonTool
 from tools.builtin.search_code import SearchCodeTool
 from tools.registry import ToolRegistry
-from agent.executor import ToolExecutor
+from agent_core.executor import ToolExecutor
 from core.metrics import SessionMetrics
 
 
@@ -10557,9 +11507,17 @@ tools/
 
 修改文件：
 providers/types.py                ← 新增 ImageBlock 类型
-providers/anthropic.py            ← _to_sdk_messages() 支持 ImageBlock
+providers/base.py                 ← 新增 supports_vision 能力声明
+providers/anthropic.py            ← _to_sdk_messages() 支持 ImageBlock；supports_vision = True
+providers/openai.py               ← _to_openai_messages() 支持 ImageBlock；按模型名判断 supports_vision
+providers/gemini.py               ← _to_gemini_messages() 支持 inline_data 图片 Part；supports_vision = True
+providers/router.py               ← 新增 get_vision_provider()：视觉调用可配置成独立于对话的 Provider
+core/config.py                    ← 新增 VISION_PROVIDER / VISION_MODEL 配置项
 pyproject.toml                    ← 新增 pymupdf、pillow 依赖
 ```
+
+> **为什么要新增 `get_vision_provider()`，而不是直接用对话用的 `get_provider()`？**
+> 15.3.1 会展开讲：多模态能力是"模型级"的，不是"Provider 级"的。同一个 `openai` Provider，backend 换成 `gpt-4o` 就支持图片，换成 `deepseek-chat` 或本地 `qwen2.5:7b`（纯文本）就不支持。如果图片描述调用硬编码复用 `LLM_PROVIDER`，一旦主对话配置成了不支持视觉的模型，图片会在适配器里被静默丢弃——不报错，只是描述结果变得毫无意义，很难排查。本章让"视觉调用用哪个 Provider/模型"成为一个独立的、可选的配置项，默认回退到对话 Provider，但可以单独指向一个明确支持视觉的模型。
 
 ---
 
@@ -10582,7 +11540,25 @@ pyproject.toml                    ← 新增 pymupdf、pillow 依赖
 ```
 
 Anthropic SDK 原生支持这种格式，我们只需要在 `providers/types.py` 加一个 `ImageBlock` 类型，
-然后在 `providers/anthropic.py` 里告诉适配器如何把它转成 SDK 所需的字典即可。
+然后在各 Provider 适配器里告诉它如何把这个类型转成对应 SDK 所需的格式即可。
+
+### 15.3.1b 视觉能力是"模型级"的，不是"Provider 级"的
+
+本项目的 `LLM_PROVIDER` 选的是**适配器**（anthropic / openai / gemini），但 `openai` 这个适配器
+背后可能接的是 GPT-4o（支持图片），也可能接的是 DeepSeek、Ollama 跑的 Qwen2.5（纯文本，不支持图片）。
+也就是说，同一个 Provider 名字，换一个模型名，视觉能力就可能完全不同。
+
+如果图片描述功能（`caption_image()`）直接复用对话用的 `get_provider()`：
+- 用户在 `.env` 里配置 `LLM_PROVIDER=openai` + `OPENAI_MODEL=deepseek-chat`（纯文本模型）跑对话，
+- 知识库加载 PDF 时，图片会被转成 `ImageBlock` 发给这个 Provider，
+- 但 `deepseek-chat` 根本不支持图片输入，请求实际发出的是一条"图片被丢弃、只剩空文本"的消息，
+- LLM 不会报错，只会基于空输入编一段不相关的描述——知识库检索质量下降，且没有任何报错线索。
+
+**解决方案：让"视觉调用用哪个 Provider/模型"成为独立、可选的配置**（`VISION_PROVIDER` /
+`VISION_MODEL`，见 15.6.5），未设置时才回退到对话 Provider；同时给 `BaseProvider` 加一个
+`supports_vision` 能力声明（15.6.1），在真正发起视觉调用前做一次显式校验——不支持就直接抛错，
+而不是让图片被静默吃掉。这样即使主对话跑在本地纯文本模型上，也能单独指定一个支持视觉的 Provider
+（比如 Anthropic 或 GPT-4o）专门处理图片描述，两者互不影响。
 
 ### 15.3.2 PDF 里有什么
 
@@ -10671,9 +11647,36 @@ ContentBlock = Union[TextBlock, ToolUseBlock, ToolResultBlock, ImageBlock]
 
 ---
 
-## 15.6 更新 Anthropic 适配器支持图片 `providers/anthropic.py`
+## 15.6 更新 Provider 层：图片支持 + 独立的视觉 Provider 配置
 
-打开 `providers/anthropic.py`，做两处修改：
+上一节说过，视觉能力是"模型级"的。这一节要做三件事：
+1. 给 `BaseProvider` 加一个 `supports_vision` 能力声明；
+2. 让三个适配器（Anthropic / OpenAI / Gemini）都能把 `ImageBlock` 转成各自 SDK 需要的格式，
+   并按各自的方式判断自己是否真的支持视觉；
+3. 在 `core/config.py` 和 `providers/router.py` 里新增 `get_vision_provider()`，
+   让图片相关的调用可以配置成一个和对话**完全独立**的 Provider/模型。
+
+### 15.6.1 能力声明 `providers/base.py`
+
+打开 `providers/base.py`（对应 3.4 节），在已有的 `supports_tool_use` 属性后面加一个新属性：
+
+```python
+# providers/base.py（在 supports_tool_use 属性后面追加）
+
+    @property
+    def supports_vision(self) -> bool:
+        """
+        是否支持图片输入。
+
+        默认返回 False——多模态是模型级能力而不是 Provider 级能力，
+        必须由具体子类根据自己接的模型显式声明，不能笼统地假设"这家厂商都支持"。
+        """
+        return False
+```
+
+### 15.6.2 Anthropic 适配器 `providers/anthropic.py`
+
+做两处修改：
 
 **修改 1：顶部导入加入 ImageBlock（约第 11-15 行）**
 
@@ -10693,7 +11696,8 @@ from .types import (
 )
 ```
 
-**修改 2：`_to_sdk_messages()` 方法里，在 `else: # TextBlock` 之前加入 ImageBlock 处理**
+**修改 2：`_to_sdk_messages()` 方法里，在 `else: # TextBlock` 之前加入 ImageBlock 处理，
+并加上 `supports_vision` 属性**
 
 找到下面这段（约第 40-56 行），在 `else:` 之前插入 ImageBlock 的处理分支：
 
@@ -10725,6 +11729,302 @@ from .types import (
                 else:  # TextBlock
                     blocks.append({"type": "text", "text": block.text})
 ```
+
+再在类里新增 `supports_vision`（放在 `model_name` 属性后面即可）：
+
+```python
+    @property
+    def supports_vision(self) -> bool:
+        # Claude 3 及之后的全系列模型（含本项目默认的 claude-sonnet-4-6）原生支持图片输入。
+        return True
+```
+
+### 15.6.3 OpenAI 适配器 `providers/openai.py`
+
+`OpenAIProvider` 比较特殊：它是"一个适配器，接多种后端"（GPT-4o、DeepSeek、Ollama 本地模型……），
+同一份代码背后的模型是否支持图片完全不确定，不能像 Anthropic 那样写死 `True`。
+这里用一个尽力而为的模型名匹配，并允许用 `.env` 显式覆盖，避免匹配不到时死板地拒绝。
+
+**修改 1：`_to_openai_messages()` 加入 ImageBlock 处理**
+
+OpenAI 的图片格式是在 `content` 数组里插入 `{"type": "image_url", ...}`，需要把已有的纯文本
+`content` 也改成数组形式：
+
+```python
+# providers/openai.py
+# 顶部导入加入 ImageBlock：
+from .types import (
+    Message, ToolDefinition, ProviderResponse,
+    StreamChunk, TextBlock, ToolUseBlock, ToolResultBlock, ImageBlock,
+    Usage, TextDelta, MessageStart, MessageStop,
+)
+```
+
+```python
+    def _to_openai_messages(self, messages: list[Message], system: str) -> list[dict]:
+        result = []
+        if system:
+            result.append({"role": "system", "content": system})
+
+        for msg in messages:
+            text_content = ""
+            image_parts = []          # ← 新增：收集图片块
+            tool_calls = []
+            tool_results = []
+
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    text_content = block.text
+                elif isinstance(block, ImageBlock):           # ← 新增这一段
+                    image_parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{block.media_type};base64,{block.data}",
+                        },
+                    })
+                elif isinstance(block, ToolUseBlock):
+                    tool_calls.append({
+                        "id": block.id,
+                        "type": "function",
+                        "function": {
+                            "name": block.name,
+                            "arguments": json.dumps(block.input, ensure_ascii=False),
+                        },
+                    })
+                elif isinstance(block, ToolResultBlock):
+                    tool_results.append(block)
+
+            if tool_results:
+                for tr in tool_results:
+                    result.append({
+                        "role": "tool",
+                        "tool_call_id": tr.tool_use_id,
+                        "content": tr.content,
+                    })
+            elif tool_calls:
+                m = {"role": "assistant", "content": text_content or None, "tool_calls": tool_calls}
+                result.append(m)
+            elif image_parts:
+                # 有图片：content 必须是数组，文字块和图片块混在一起
+                content = image_parts
+                if text_content:
+                    content = [{"type": "text", "text": text_content}] + image_parts
+                result.append({"role": msg.role, "content": content})
+            else:
+                result.append({"role": msg.role, "content": text_content})
+
+        return result
+```
+
+> 对比原来的实现：`ImageBlock` 之前完全没有对应分支，会直接落进 `for` 循环末尾什么都不做——
+> 图片被静默丢弃，`text_content` 还是空字符串，最终发出去的是一条空文本消息，不会有任何报错。
+> 这正是 15.3.1b 提到的问题，这里把它补上。
+
+**修改 2：新增 `supports_vision`，按模型名判断**
+
+```python
+    # 已知支持视觉输入的模型名关键词（按需扩充）。
+    # 这是"尽力而为"的启发式判断，不是 OpenAI 官方能力查询接口——
+    # 如果你接的是一个不在列表里、但实际支持视觉的模型，用 VISION_CAPABLE=true 显式覆盖（见 15.6.5）。
+    _VISION_MODEL_HINTS = ("gpt-4o", "gpt-4.1", "gpt-4-vision", "gpt-5", "o1", "o3", "-vl", "vision")
+
+    def __init__(self, api_key: str, model: str, base_url: str | None = None,
+                 supports_vision: bool | None = None):
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._model = model
+        # 显式传入优先；否则按模型名做启发式匹配
+        self._supports_vision = (
+            supports_vision if supports_vision is not None
+            else any(hint in model.lower() for hint in self._VISION_MODEL_HINTS)
+        )
+
+    @property
+    def supports_vision(self) -> bool:
+        return self._supports_vision
+```
+
+### 15.6.4 Gemini 适配器 `providers/gemini.py`
+
+Gemini 用 `inline_data` Part 传图片，而不是 `image_url`：
+
+**修改 1：`_to_gemini_messages()` 加入 ImageBlock 处理**
+
+```python
+# 顶部导入加入 ImageBlock：
+from .types import (
+    Message, ToolDefinition, ProviderResponse,
+    StreamChunk, TextBlock, ToolUseBlock, ToolResultBlock, ImageBlock,
+    Usage, TextDelta, MessageStart, MessageStop,
+)
+```
+
+```python
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    parts.append({"text": block.text})
+                elif isinstance(block, ImageBlock):           # ← 新增这一段
+                    parts.append({
+                        "inline_data": {
+                            "mime_type": block.media_type,
+                            "data": block.data,
+                        }
+                    })
+                elif isinstance(block, ToolUseBlock):
+                    parts.append({
+                        "function_call": {
+                            "name": block.name,
+                            "args": block.input,
+                        }
+                    })
+                elif isinstance(block, ToolResultBlock):
+                    parts.append({
+                        "function_response": {
+                            "name": block.tool_use_id,
+                            "response": {
+                                "result": block.content,
+                                "is_error": block.is_error,
+                            },
+                        }
+                    })
+```
+
+**修改 2：新增 `supports_vision`**
+
+```python
+    @property
+    def supports_vision(self) -> bool:
+        # Gemini 1.5 / 2.0 系列（含本项目默认的 gemini-2.0-flash）原生支持图片输入。
+        return True
+```
+
+### 15.6.5 新增配置项 `core/config.py`
+
+```python
+# core/config.py（在 Settings 类里新增，放在 llm_model 字段附近）
+
+    # 视觉调用专用的 Provider/模型（可选）。
+    # 留空时回退到对话用的 llm_provider/对应模型，见 providers/router.py 的 get_vision_provider()。
+    vision_provider: str = ""
+    vision_model: str = ""
+    # 当模型名不在 OpenAIProvider 的启发式列表里，但实际支持视觉时，用这个显式声明。
+    vision_capable: bool = False
+```
+
+对应 `.env` 里新增（放在 15.2 节列出的通用配置区域，全部留空/False 表示"跟对话 Provider 走"）：
+
+```dotenv
+# ── 视觉调用专用 Provider（可选，留空则和对话共用同一个 Provider）─────
+VISION_PROVIDER=              # 留空 | anthropic | openai | gemini
+VISION_MODEL=                 # 留空则用该 Provider 的默认模型
+VISION_CAPABLE=false           # 如果 VISION_PROVIDER=openai 且模型不在内置视觉模型名单里，改成 true
+```
+
+> 典型用法：对话走本地 Ollama（`LLM_PROVIDER=openai` + `OPENAI_MODEL=qwen2.5:7b`，省 Token、
+> 响应快），但知识库里有带图表的 PDF，单独配 `VISION_PROVIDER=anthropic`，图片描述改走 Claude。
+> 两条调用链互不干扰，换任意一边都不用动代码。
+
+### 15.6.6 视觉 Provider 路由 `providers/router.py`
+
+把原来 `get_provider()` 里"按名字 + 模型创建实例"的逻辑拆成一个可复用的内部函数，
+再加一个 `get_vision_provider()`：
+
+```python
+# providers/router.py
+"""
+根据 .env 配置选择并返回 Provider 实例。
+
+对话用的 Provider 和图片理解用的 Provider 是分开路由的：
+  get_provider()        → 对话/工具调用，看 LLM_PROVIDER
+  get_vision_provider()  → 图片描述，看 VISION_PROVIDER（留空则回退到 LLM_PROVIDER）
+两者可以指向完全不同的后端，互不影响。
+"""
+from functools import lru_cache
+from .base import BaseProvider
+from core.config import settings
+
+
+def _default_model(name: str) -> str:
+    """某个 Provider 名字在没有单独指定模型时，用哪个默认模型。"""
+    return {
+        "anthropic": settings.llm_model,
+        "openai": settings.openai_model,
+        "ollama": settings.openai_model,
+        "deepseek": settings.openai_model,
+        "azure": settings.openai_model,
+        "gemini": settings.gemini_model,
+    }.get(name, settings.llm_model)
+
+
+@lru_cache(maxsize=8)
+def _build_provider(name: str, model: str) -> BaseProvider:
+    """
+    按 (Provider 名, 模型名) 创建并缓存一个 Provider 实例。
+
+    用 (name, model) 联合做缓存 key，是因为对话 Provider 和视觉 Provider
+    可能是同一个适配器（如都用 openai）但配了不同模型，不能共用一个实例。
+    """
+    if name == "anthropic":
+        from .anthropic import AnthropicProvider
+        return AnthropicProvider(api_key=settings.anthropic_api_key, model=model)
+
+    elif name in ("openai", "ollama", "deepseek", "azure"):
+        from .openai import OpenAIProvider
+        return OpenAIProvider(
+            api_key=settings.openai_api_key,
+            model=model,
+            base_url=settings.openai_base_url or None,
+            supports_vision=settings.vision_capable or None,
+        )
+
+    elif name == "gemini":
+        from .gemini import GeminiProvider
+        return GeminiProvider(api_key=settings.gemini_api_key, model=model)
+
+    else:
+        raise ValueError(
+            f"不支持的 Provider: '{name}'。"
+            f"可选值：anthropic / openai / gemini。"
+            f"检查 .env 里的 LLM_PROVIDER 配置。"
+        )
+
+
+def get_provider() -> BaseProvider:
+    """获取对话用的 Provider（看 LLM_PROVIDER）。"""
+    name = settings.llm_provider.lower()
+    return _build_provider(name, _default_model(name))
+
+
+def get_vision_provider() -> BaseProvider:
+    """
+    获取图片理解用的 Provider。
+
+    - 配置了 VISION_PROVIDER：用它（可以和对话 Provider 完全不同）。
+    - 没配置：回退到对话 Provider（get_provider()）。
+    - 选中的 Provider 必须 supports_vision=True，否则直接报错——
+      宁可在调用前就失败，也不要让图片被适配器悄悄丢弃却拿到一段无意义的描述。
+    """
+    name = (settings.vision_provider or settings.llm_provider).lower()
+    model = settings.vision_model or _default_model(name)
+    provider = _build_provider(name, model)
+
+    if not provider.supports_vision:
+        raise ValueError(
+            f"用于视觉调用的 Provider '{name}'（模型 '{model}'）不支持图片输入。\n"
+            f"请设置 VISION_PROVIDER / VISION_MODEL 指向一个支持视觉的模型"
+            f"（如 anthropic + claude-sonnet-4-6，或 openai + gpt-4o）；"
+            f"如果确认该模型其实支持视觉，设置 VISION_CAPABLE=true。"
+        )
+    return provider
+
+
+def clear_provider_cache() -> None:
+    """测试/切换配置后清空缓存，让下次调用按新配置重新创建实例。"""
+    _build_provider.cache_clear()
+```
+
+> `get_provider()` 原来用 `@lru_cache(maxsize=1)` 直接包住自己；现在缓存下沉到 `_build_provider`，
+> `get_provider()`/`get_vision_provider()` 变成薄封装。行为不变（同名同模型只创建一次客户端），
+> 但多了一条路由：`(anthropic, claude-sonnet-4-6)` 和 `(openai, gpt-4o)` 可以同时存在两个实例。
 
 ---
 
@@ -10791,7 +12091,7 @@ class DocumentChunk:
 
 import base64
 from providers.types import Message, TextBlock, ImageBlock
-from providers.router import get_provider
+from providers.router import get_vision_provider
 
 
 _CAPTION_SYSTEM = "你是一个文档图片分析专家，擅长从各种图片中提取关键信息。"
@@ -10833,12 +12133,17 @@ async def caption_image(image_bytes: bytes, media_type: str = "image/jpeg") -> s
     工作原理：
         1. 把二进制图片数据用 base64 编码，变成文字字符串
         2. 构造一条包含图片块和文字指令的消息
-        3. 发给 LLM，等待描述文字
+        3. 发给视觉 Provider，等待描述文字
+
+    这里用 get_vision_provider()而不是 get_provider()：图片理解可以配置成和主对话
+    完全独立的 Provider/模型（见 15.6.5、15.6.6），不受 LLM_PROVIDER 配的是否支持视觉影响。
+    如果没配 VISION_PROVIDER，也没配 VISION_CAPABLE，选中的模型又确实不支持视觉，
+    get_vision_provider() 会在这里直接抛 ValueError，而不是把图片悄悄丢掉再返回一段乱猜的描述。
     """
     if not image_bytes:
         return ""
 
-    provider = get_provider()
+    provider = get_vision_provider()
     b64_data = base64.b64encode(image_bytes).decode("utf-8")
 
     messages = [
@@ -11140,6 +12445,7 @@ touch tools/document_loaders/__init__.py          # macOS/Linux
 
 from tools.base import BaseTool
 from providers.types import ToolDefinition
+from observability.logging import logger
 
 
 class ToolRegistry:
@@ -11150,7 +12456,7 @@ class ToolRegistry:
     def register(self, tool: BaseTool) -> None:
         """注册一个工具。工具名重复时会覆盖旧的。"""
         self._tools[tool.name] = tool
-        print(f"  [Registry] 注册工具：{tool.name}")
+        logger.info("tool_registered", tool_name=tool.name)
 
     def get(self, name: str) -> BaseTool | None:
         """按名字查找工具，找不到返回 None。"""
@@ -11464,101 +12770,76 @@ A：登录账户后进入「账户设置」→「升级套餐」，支持支付�
 
 ---
 
-## 15.11 更新 `agent/agent.py` 接入工具
+## 15.11 让知识库工具接入 Coordinator 架构
 
-用以下内容替换 `agent/agent.py`，让 `ask()` 带上知识库工具：
+> `agent/agent.py` 在第 10 章已经被删除了，所以知识库工具不是"整体替换一个单
+> Agent 的工具列表"，而是要接到 Coordinator 的"规划 → 分发 →聚合"结构里——
+> 知识库检索本质上是一类子任务，交给一个新的子 Agent 去做最自然，跟
+> `code_reviewer`、`test_writer` 是同一种模式（`sub_agents/base.py`）。
+
+新建 `sub_agents/knowledge_agent.py`，复用 `SubAgent` 基类，只需要声明
+`system_prompt` 和 `tools`：
 
 ```python
-# agent/agent.py（完整替换）
-
-import asyncio
-from asyncio import Queue
-from dataclasses import dataclass, field
-from typing import AsyncGenerator
-
-from .loop import run_agent_loop, LoopResult
-from providers.router import get_provider
+# sub_agents/knowledge_agent.py
+from .base import SubAgent
+from tools.knowledge_base import KnowledgeBaseTool
 
 
-SYSTEM_PROMPT = (
-    "你是一个智能助手，有知识库搜索能力。"
-    "当用户询问公司政策、产品信息、技术文档等内部知识时，"
-    "请先调用 search_knowledge_base 工具查询，再基于查询结果回答。"
-    "用中文回答，回答要简洁准确。"
-)
+class KnowledgeAgent(SubAgent):
 
+    def __init__(self, kb_dir: str = "knowledge_base"):
+        # kb_dir 可注入，方便测试时换成 tests/fixtures 下的测试知识库（16.10/16.11）
+        self._kb_dir = kb_dir
 
-@dataclass
-class AskResult:
-    text: str
-    input_tokens: int
-    output_tokens: int
-    turn_count: int = 1
+    @property
+    def name(self) -> str:
+        return "knowledge_agent"
 
-
-def _build_executor_and_tools():
-    """初始化工具注册表和执行器，返回 (executor, tool_definitions)。"""
-    from tools.registry import ToolRegistry
-    from agent.executor import ToolExecutor
-
-    registry = ToolRegistry.default()
-    executor = ToolExecutor(registry)
-    return executor, registry.all_definitions()
-
-
-async def ask(question: str) -> AskResult:
-    """非流式调用，使用 Agentic Loop + 知识库工具。"""
-    provider = get_provider()
-    executor, tools = _build_executor_and_tools()
-
-    result: LoopResult = await run_agent_loop(
-        prompt=question,
-        provider=provider,
-        system=SYSTEM_PROMPT,
-        tools=tools,
-        executor=executor,
-        max_turns=10,
-    )
-
-    return AskResult(
-        text=result.text,
-        input_tokens=result.total_usage.input_tokens,
-        output_tokens=result.total_usage.output_tokens,
-        turn_count=result.turn_count,
-    )
-
-
-async def ask_stream(question: str) -> AsyncGenerator[str, None]:
-    """流式调用。"""
-    queue: Queue[str | None] = Queue()
-
-    def on_delta(text: str):
-        queue.put_nowait(text)
-
-    async def run_loop():
-        provider = get_provider()
-        executor, tools = _build_executor_and_tools()
-        await run_agent_loop(
-            prompt=question,
-            provider=provider,
-            system=SYSTEM_PROMPT,
-            tools=tools,
-            executor=executor,
-            max_turns=10,
-            on_text_delta=on_delta,
+    @property
+    def system_prompt(self) -> str:
+        return (
+            "你是知识库检索专家，专注回答公司政策、产品信息、技术文档等内部知识类问题。"
+            "先调用 search_knowledge_base 工具查询，再基于查询结果用中文简洁准确地回答，"
+            "不要凭空编造知识库里没有的内容。"
         )
-        queue.put_nowait(None)
 
-    loop_task = asyncio.create_task(run_loop())
-
-    while True:
-        chunk = await queue.get()
-        if chunk is None:
-            break
-        yield chunk
-
-    await loop_task
+    @property
+    def tools(self):
+        return [KnowledgeBaseTool(kb_dir=self._kb_dir)]
 ```
+
+在 `coordinator/dispatcher.py` 的 `_get_sub_agents()` 里注册它：
+
+```python
+# coordinator/dispatcher.py
+
+def _get_sub_agents() -> dict:
+    from sub_agents.code_writer import CodeWriterAgent
+    from sub_agents.code_reviewer import CodeReviewerAgent
+    from sub_agents.debugger import DebuggerAgent
+    from sub_agents.test_writer import TestWriterAgent
+    from sub_agents.knowledge_agent import KnowledgeAgent
+    return {
+        "code_writer":     CodeWriterAgent(),
+        "code_reviewer":   CodeReviewerAgent(),
+        "debugger":        DebuggerAgent(),
+        "test_writer":     TestWriterAgent(),
+        "knowledge_agent": KnowledgeAgent(),
+    }
+```
+
+再让 `coordinator/planner.py` 的规划提示词知道有这么一个子 Agent 可用——在
+`_COORDINATOR_SYSTEM` 里补一条：
+
+```
+- knowledge_agent：回答公司政策、产品规格、内部文档类问题（会调用知识库检索工具）
+```
+
+这样"我们公司的退货政策是什么？"这类问题，规划阶段会生成一个
+`{"agent": "knowledge_agent", "input": "..."}` 的任务，交给 `dispatch()` 执行，
+跟审查代码、写测试走的是完全相同的分发和聚合逻辑——不需要再单独维护一套
+"给单 Agent 挂工具"的旁路实现。
 
 ---
 
@@ -11651,6 +12932,9 @@ Agent：根据公司退货政策，购买后 7 天内可无理由退货，但商
 □ cli.py 问退货政策，Agent 日志显示执行了 search_knowledge_base 工具
 □ （可选）在 knowledge_base/ 放一个 PDF，重跑加载，确认提取了图片描述
 □ （可选）在 knowledge_base/ 放一张 PNG 图片，确认生成了文字描述
+□ 验证视觉 Provider 独立配置生效：临时设 VISION_PROVIDER=openai + OPENAI_MODEL=deepseek-chat
+  （纯文本模型），重跑图片加载，应看到 get_vision_provider() 抛出 ValueError 而不是静默返回空描述；
+  改回 VISION_PROVIDER=（留空）或指向支持视觉的模型后恢复正常
 ```
 
 ---
@@ -11689,8 +12973,8 @@ tests/
 └── test_agent_e2e.py                  ← Agent 端到端集成测试（调 LLM）
 
 修改文件：
-agent/loop.py    ← 在 LLM 调用和工具执行处埋点，收集 metrics
-agent/agent.py     ← AskResult 新增 metrics 字段
+agent_core/loop.py     ← 在 LLM 调用和工具执行处埋点，收集 metrics
+coordinator/agent.py   ← AskResult 新增 metrics 字段
 pyproject.toml   ← pytest 异步配置
 ```
 
@@ -11943,9 +13227,9 @@ class SessionMetrics:
 
 ---
 
-## 16.5 在 Agentic Loop 中埋点 `agent/loop.py`
+## 16.5 在 Agentic Loop 中埋点 `agent_core/loop.py`
 
-在现有 `agent/loop.py` 的基础上添加 metrics 收集。
+在现有 `agent_core/loop.py` 的基础上添加 metrics 收集。
 这里给出完整的替换版本，便于直接对比：
 
 **修改点 1：顶部添加导入**
@@ -12045,7 +13329,8 @@ async def run_agent_loop(
 把执行过程改成逐个计时：
 
 ```python
-        print(f"  [Loop] 第 {state.turn_count} 轮，执行 {len(tool_calls)} 个工具调用")
+        # loop.py 顶部已 from observability.logging import logger
+        logger.info("loop_turn_tools", turn=state.turn_count, tool_count=len(tool_calls))
 
         # 逐个执行工具并记录耗时（并发执行，各自计时）
         import asyncio as _asyncio
@@ -12100,14 +13385,30 @@ async def run_agent_loop(
 
 ---
 
-## 16.6 更新 `agent/agent.py` 暴露指标
+## 16.6 更新 `coordinator/agent.py` 暴露指标
 
-在上一章修改后的 `agent/agent.py` 基础上，给 `AskResult` 加入 metrics 字段：
+`agent/agent.py` 已经删除了，`AskResult` 现在定义在 `coordinator/agent.py`。
+跟单 Agent 版本不同的是，Coordinator 一次 `run()` 背后是多次 LLM 调用（规划一次 +
+每个子 Agent 各一次），每次调用如果都用 16.5 埋点后的 `run_agent_loop`，会各自产出
+一个 `SessionMetrics`——所以这里要做的不是简单地把某一次 `result.metrics` 传下去，
+而是把它们合并成一份汇总指标：
 
 ```python
-# agent/agent.py — 修改 AskResult dataclass
+# core/metrics.py（新增一个合并函数）
 
-from core.metrics import SessionMetrics   # ← 新增导入
+def merge_metrics(session_id: str, question: str, parts: list[SessionMetrics]) -> SessionMetrics:
+    """把多个子调用（规划 + 各子 Agent）各自的 SessionMetrics 合并成一份汇总。"""
+    merged = SessionMetrics(session_id=session_id, question=question)
+    for part in parts:
+        merged.turns.extend(part.turns)
+        merged.tool_records.extend(part.tool_records)
+    return merged
+```
+
+```python
+# coordinator/agent.py — AskResult 加 metrics 字段，run() 里合并各子调用的指标
+
+from core.metrics import SessionMetrics, merge_metrics   # ← 新增导入
 
 @dataclass
 class AskResult:
@@ -12118,28 +13419,28 @@ class AskResult:
     metrics: SessionMetrics | None = None  # ← 新增字段
 
 
-# ask() 函数里，创建 AskResult 时传入 metrics：
-async def ask(question: str) -> AskResult:
-    provider = get_provider()
-    executor, tools = _build_executor_and_tools()
+class CoordinatorAgent:
+    async def run(self, user_request: str, session_id: str | None = None) -> AskResult:
+        ...
+        # make_plan() 内部的规划调用、dispatch() 里每个子 Agent 的调用，
+        # 都各自产出一个 SessionMetrics（16.5 埋点后 run_agent_loop 的返回值），
+        # 这里统一收集起来再合并
+        metrics_parts: list[SessionMetrics] = [plan_result.metrics]
+        if tasks:
+            metrics_parts.extend(sub_result.metrics for sub_result in dispatch_results)
 
-    result: LoopResult = await run_agent_loop(
-        prompt=question,
-        provider=provider,
-        system=SYSTEM_PROMPT,
-        tools=tools,
-        executor=executor,
-        max_turns=10,
-    )
-
-    return AskResult(
-        text=result.text,
-        input_tokens=result.total_usage.input_tokens,
-        output_tokens=result.total_usage.output_tokens,
-        turn_count=result.turn_count,
-        metrics=result.metrics,    # ← 新增这一行
-    )
+        total = _sum_usage(usages)
+        return AskResult(
+            text=text,
+            input_tokens=total.input_tokens,
+            output_tokens=total.output_tokens,
+            metrics=merge_metrics(session_id or "anonymous", user_request, metrics_parts),
+        )
 ```
+
+> 这里省略了 `make_plan`/`dispatch` 具体怎么把 `SessionMetrics` 一路传出来的
+> 管道代码——思路跟本章前面给 usage 加汇总（`_sum_usage`）完全一样：`make_plan`
+> 额外返回一份 metrics，`dispatch`/`_run_one` 也一样，最后在 `run()` 里统一合并。
 
 ---
 
@@ -12599,34 +13900,30 @@ async def test_execute_empty_query_does_not_crash(loaded_kb):
 """
 
 import pytest
-from agent import ask
+from coordinator.agent import CoordinatorAgent
+
+
+def _patch_knowledge_agent(monkeypatch, test_kb_dir):
+    """
+    把 dispatcher 里注册的 knowledge_agent 换成指向测试知识库目录的实例，
+    不影响真实的 knowledge_base/ 文件夹。15.11 里 KnowledgeAgent 支持传 kb_dir，
+    就是为了这里能这样注入测试夹具。
+    """
+    import coordinator.dispatcher as dispatcher_module
+    from sub_agents.knowledge_agent import KnowledgeAgent
+
+    agents = dispatcher_module._get_sub_agents()
+    agents["knowledge_agent"] = KnowledgeAgent(kb_dir=test_kb_dir)
+    monkeypatch.setattr(dispatcher_module, "_agents", agents)
 
 
 async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
-    """
-    问退货政策时，Agent 应该调用 search_knowledge_base 工具。
+    """问退货政策时，规划器应该把任务分给 knowledge_agent，并触发 search_knowledge_base 工具。"""
+    _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
-    monkeypatch 临时把知识库目录换成测试目录，
-    不影响真实的 knowledge_base/ 文件夹。
-    """
-    # 临时替换 agent/agent.py 里的工具注册逻辑，使用测试知识库
-    import agent.agent as agent_module
-    import tools.registry as reg_module
-    from tools.registry import ToolRegistry
-    from tools.knowledge_base import KnowledgeBaseTool
-    from agent.executor import ToolExecutor
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("我们公司的退货政策是什么？退货有什么条件？")
 
-    def mock_build_executor_and_tools():
-        registry = ToolRegistry()
-        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
-        executor = ToolExecutor(registry)
-        return executor, registry.all_definitions()
-
-    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build_executor_and_tools)
-
-    result = await ask("我们公司的退货政策是什么？退货有什么条件？")
-
-    # 断言 Agent 调用了知识库工具
     assert result.metrics is not None, "metrics 不应该为 None"
     assert "search_knowledge_base" in result.metrics.tool_names_called, (
         f"退货问题应该触发知识库工具，实际工具调用：{result.metrics.tool_names_called}"
@@ -12634,21 +13931,11 @@ async def test_policy_question_triggers_kb_tool(test_kb_dir, monkeypatch):
 
 
 async def test_product_spec_question_triggers_kb_tool(test_kb_dir, monkeypatch):
-    """问产品规格时，Agent 应该调用 search_knowledge_base 工具。"""
-    import agent.agent as agent_module
-    from tools.registry import ToolRegistry
-    from tools.knowledge_base import KnowledgeBaseTool
-    from agent.executor import ToolExecutor
+    """问产品规格时，同样应该路由到 knowledge_agent 并触发工具调用。"""
+    _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
-    def mock_build_executor_and_tools():
-        registry = ToolRegistry()
-        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
-        executor = ToolExecutor(registry)
-        return executor, registry.all_definitions()
-
-    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build_executor_and_tools)
-
-    result = await ask("ProCoder X1 的内存是多少？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("ProCoder X1 的内存是多少？")
 
     assert result.metrics is not None
     assert "search_knowledge_base" in result.metrics.tool_names_called, (
@@ -12658,17 +13945,16 @@ async def test_product_spec_question_triggers_kb_tool(test_kb_dir, monkeypatch):
 
 async def test_simple_question_does_not_need_tool():
     """
-    普通问题（不需要查知识库的）不应该触发工具调用。
-
-    Agent 的 system prompt 说明只有内部知识才查知识库，
-    像"1+1等于几"这种常识问题应该直接回答。
+    普通问题（不需要查知识库的）应该走 direct_reply，不经过任何子 Agent，
+    自然也就没有工具调用——规划器判断这类问题不需要拆解成任务。
     """
-    result = await ask("1 加 1 等于几？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("1 加 1 等于几？")
 
     assert result.metrics is not None
-    assert result.turn_count == 1, "数学问题不应该需要工具，应该一轮就完成"
-    # 可能调用了工具（如果 Agent 不确定），但更常见的是不调用
-    # 这里只验证回答里包含"2"
+    assert not result.metrics.tool_names_called, (
+        f"数学问题不应该触发任何工具调用，实际：{result.metrics.tool_names_called}"
+    )
     assert "2" in result.text, f"1+1 应该等于 2，实际回答：{result.text}"
 ```
 
@@ -12688,28 +13974,41 @@ Agent 端到端集成测试。
 """
 
 import pytest
-from agent import ask, AskResult
+from coordinator.agent import CoordinatorAgent, AskResult
 from core.metrics import SessionMetrics
+
+
+def _patch_knowledge_agent(monkeypatch, test_kb_dir):
+    """同 16.10：把 knowledge_agent 换成指向测试知识库目录的实例。"""
+    import coordinator.dispatcher as dispatcher_module
+    from sub_agents.knowledge_agent import KnowledgeAgent
+
+    agents = dispatcher_module._get_sub_agents()
+    agents["knowledge_agent"] = KnowledgeAgent(kb_dir=test_kb_dir)
+    monkeypatch.setattr(dispatcher_module, "_agents", agents)
 
 
 # ── 基础对话测试 ──────────────────────────────────────────────────────────────
 
 
 async def test_ask_returns_ask_result():
-    """ask() 应该返回 AskResult 类型，不崩溃。"""
-    result = await ask("用一句话解释什么是 Python")
+    """CoordinatorAgent.run() 应该返回 AskResult 类型，不崩溃。"""
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("用一句话解释什么是 Python")
     assert isinstance(result, AskResult)
 
 
 async def test_ask_returns_non_empty_text():
     """回答不应该为空。"""
-    result = await ask("用一句话解释什么是 Python")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("用一句话解释什么是 Python")
     assert len(result.text) > 10, f"回答太短：{result.text}"
 
 
 async def test_ask_returns_chinese_response():
     """Agent 应该用中文回答（system prompt 里要求了）。"""
-    result = await ask("What is Python?")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("What is Python?")
     has_chinese = any("一" <= ch <= "鿿" for ch in result.text)
     assert has_chinese, f"应该包含中文，实际回答：{result.text[:100]}"
 
@@ -12718,33 +14017,38 @@ async def test_ask_returns_chinese_response():
 
 
 async def test_metrics_populated_after_ask():
-    """ask() 完成后，metrics 应该被填充。"""
-    result = await ask("用一句话解释什么是机器学习")
+    """run() 完成后，metrics 应该被填充（规划调用 + 直接回复各自的 SessionMetrics 已被 merge_metrics 合并）。"""
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("用一句话解释什么是机器学习")
     assert result.metrics is not None, "metrics 不应该为 None"
     assert isinstance(result.metrics, SessionMetrics)
 
 
 async def test_metrics_has_at_least_one_turn():
-    """至少应该有一轮 LLM 调用记录。"""
-    result = await ask("2 + 2 等于多少？")
+    """至少应该有一轮 LLM 调用记录（规划本身也是一轮）。"""
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("2 + 2 等于多少？")
     assert len(result.metrics.turns) >= 1
 
 
 async def test_metrics_input_tokens_positive():
     """输入 token 数应该大于 0。"""
-    result = await ask("你好")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("你好")
     assert result.metrics.total_input_tokens > 0
 
 
 async def test_metrics_output_tokens_positive():
     """输出 token 数应该大于 0。"""
-    result = await ask("你好")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("你好")
     assert result.metrics.total_output_tokens > 0
 
 
 async def test_metrics_latency_positive():
     """LLM 调用延迟应该大于 0（毫秒）。"""
-    result = await ask("你好")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("你好")
     assert result.metrics.avg_llm_latency_ms > 0
 
 
@@ -12753,24 +14057,16 @@ async def test_metrics_latency_positive():
 
 async def test_kb_query_triggers_tool_call(test_kb_dir, monkeypatch):
     """
-    知识库相关问题应该触发工具调用，且回答基于知识库内容。
+    知识库相关问题应该被规划器路由给 knowledge_agent，触发工具调用，
+    且回答基于知识库内容。
 
     这是最重要的集成测试：验证 RAG 完整链路：
-    提问 → Agent 决定查知识库 → 检索到相关文档 → 基于文档回答
+    提问 → 规划器识别为知识库问题 → 分发给 knowledge_agent → 检索到相关文档 → 基于文档回答
     """
-    import agent.agent as agent_module
-    from tools.registry import ToolRegistry
-    from tools.knowledge_base import KnowledgeBaseTool
-    from agent.executor import ToolExecutor
+    _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
-    def mock_build():
-        registry = ToolRegistry()
-        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
-        return ToolExecutor(registry), registry.all_definitions()
-
-    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
-
-    result = await ask("请介绍一下退货政策，退货有什么条件？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("请介绍一下退货政策，退货有什么条件？")
 
     assert result.metrics is not None
     # 验证工具被调用了
@@ -12785,19 +14081,10 @@ async def test_kb_answer_contains_relevant_info(test_kb_dir, monkeypatch):
     """
     基于知识库的回答应该包含文档里的具体信息，而不是泛泛而谈。
     """
-    import agent.agent as agent_module
-    from tools.registry import ToolRegistry
-    from tools.knowledge_base import KnowledgeBaseTool
-    from agent.executor import ToolExecutor
+    _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
-    def mock_build():
-        registry = ToolRegistry()
-        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
-        return ToolExecutor(registry), registry.all_definitions()
-
-    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
-
-    result = await ask("ProCoder X1 的 CPU 规格是什么？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("ProCoder X1 的 CPU 规格是什么？")
 
     assert result.metrics is not None
     # test_products.md 里写了"8 核"
@@ -12811,32 +14098,28 @@ async def test_kb_answer_contains_relevant_info(test_kb_dir, monkeypatch):
 
 async def test_multi_turn_when_tool_used(test_kb_dir, monkeypatch):
     """
-    当 Agent 使用工具时，turn_count 应该 >= 2
-    （第 1 轮：决定调工具；第 2 轮：基于工具结果回答）。
+    当子 Agent 使用工具时，聚合后的 metrics.turns 长度应该 >= 2
+    （规划这一轮 + knowledge_agent 内部至少一轮工具调用轮次）。
+
+    注意：CoordinatorAgent.AskResult.turn_count 不再是"单个 Agent 循环的轮次数"
+    （Coordinator 本身涉及多次 LLM 调用），这里改成检查合并后的 metrics.turns，
+    语义更准确。
     """
-    import agent.agent as agent_module
-    from tools.registry import ToolRegistry
-    from tools.knowledge_base import KnowledgeBaseTool
-    from agent.executor import ToolExecutor
+    _patch_knowledge_agent(monkeypatch, test_kb_dir)
 
-    def mock_build():
-        registry = ToolRegistry()
-        registry.register(KnowledgeBaseTool(kb_dir=test_kb_dir))
-        return ToolExecutor(registry), registry.all_definitions()
-
-    monkeypatch.setattr(agent_module, "_build_executor_and_tools", mock_build)
-
-    result = await ask("保修期多久？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("保修期多久？")
 
     if result.metrics.total_tool_calls > 0:
-        assert result.turn_count >= 2, (
-            f"调用了工具但 turn_count={result.turn_count}，应该 >= 2"
+        assert len(result.metrics.turns) >= 2, (
+            f"调用了工具但只有 {len(result.metrics.turns)} 轮记录，应该 >= 2"
         )
 
 
 async def test_cost_estimate_is_reasonable():
     """估算费用应该在合理范围内（不为 0，不超过 1 美元）。"""
-    result = await ask("你好，请问你是什么？")
+    coordinator = CoordinatorAgent()
+    result = await coordinator.run("你好，请问你是什么？")
     cost = result.metrics.estimated_cost_usd
     assert cost > 0, "费用估算不应该为 0"
     assert cost < 1.0, f"单次问答费用超过 1 美元，异常：${cost:.5f}"
@@ -12951,8 +14234,8 @@ if result.metrics:
 □ 运行 pytest tests/test_metrics.py -v，全部通过（不需要 API Key）
 □ 准备了 tests/fixtures/knowledge_base/ 里的两个测试文档
 □ 运行 pytest tests/test_rag.py -v，全部通过
-□ 修改了 agent/loop.py，加入 metrics 埋点
-□ 修改了 agent/agent.py，AskResult 有 metrics 字段
+□ 修改了 agent_core/loop.py，加入 metrics 埋点
+□ 修改了 coordinator/agent.py，AskResult 有 metrics 字段
 □ 运行 pytest tests/test_agent_e2e.py::test_ask_returns_ask_result -v，通过
 □ 运行全部集成测试 pytest tests/ -v，无错误（或仅有预期的 skip）
 □ 修改 cli.py 加入 metrics.print_report()，对话后能看到统计报告

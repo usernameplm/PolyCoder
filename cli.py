@@ -3,18 +3,20 @@ cli.py — 命令行交互入口
 
 功能：
 - 循环读取用户输入
-- 调用 ask() 并打印回答
+- 调用 CoordinatorAgent.run()（规划→分发→聚合，跟 /ask 一致）并打印回答
 - /usage 命令查看累计 Token 用量
 - Ctrl+C 退出
 """
 
 import asyncio
-from agent import ask
+from coordinator.agent import CoordinatorAgent
+
+_coordinator = CoordinatorAgent()
 
 
 async def main():
     print("=" * 50)
-    print("  Agent 已就绪（直接调用 Anthropic API）")
+    print("  Agent 已就绪（Coordinator 架构：规划→分发→聚合）")
     print("  输入问题后按回车，输入 /usage 查看 Token 用量")
     print("  按 Ctrl+C 退出")
     print("=" * 50)
@@ -45,7 +47,7 @@ async def main():
         # 调用 Agent
         try:
             print("Agent：", end="", flush=True)
-            result = await ask(question)
+            result = await _coordinator.run(question)
             print(result.text)
 
             # 累计 Token 用量

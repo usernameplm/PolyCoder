@@ -1,0 +1,25 @@
+# tempo.yaml
+server:
+  http_listen_port: 3200          # Grafana 数据源查询走这个端口
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"   # 接收你的服务 push 过来的 OTLP gRPC 链路
+
+ingester:
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 24h          # 链路数据保留 24 小时（本地开发够用）
+
+storage:
+  trace:
+    backend: local                # 本地磁盘存储（生产可换成 s3/gcs）
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal

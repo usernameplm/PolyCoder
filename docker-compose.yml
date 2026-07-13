@@ -1,0 +1,116 @@
+# docker-compose.yml
+
+version: "3.9"
+
+services:
+
+  # ── 你的 Agent 服务 ──────────────────────────────────────────────
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: my-agent:latest
+    ports:
+      - "${APP_PORT:-8002}:8002"    # 主机端口:容器端口
+    env_file:
+      - .env.docker                 # 唯一的容器环境配置（不再分 dev/prod）
+    depends_on:
+      redis:
+        condition: service_healthy  # 等 Redis 健康检查通过后才启动 agent
+    restart: unless-stopped         # 除非手动停止，否则崩溃后自动重启
+    volumes:
+      - ./sessions:/app/sessions    # 把会话文件映射到主机，重建容器不丢失
+      - ./workspace:/app/workspace  # 工作目录（WORKSPACE）映射到主机，工具产出不丢失
+
+  # ── Redis 服务 ────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine           # 使用 Alpine 版本，体积小
+    command: redis-server --save 60 1 --loglevel warning  # 60 秒内有 1 次写入就持久化
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data            # Redis 数据持久化（容器重建不丢失）
+
+  # ── Prometheus 监控 ──────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    restart: unless-stopped
+
+  # ── Grafana 可视化（一处看齐：指标 Prometheus + 链路 Tempo + 日志 Loki）─
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # 开启 Tempo 相关特性（trace 到 metrics 的跳转）
+      - GF_FEATURE_TOGGLES_ENABLE=traceToMetrics
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # 数据源自动配置：容器启动时自动连好 Prometheus / Tempo / Loki，无需手动点界面
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+
+  # ── Tempo 链路追踪（存储后端，UI 走 Grafana）─────────────────────
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    ports:
+      - "4317:4317"                  # OTLP gRPC 接收端口（你的服务 push span 到这里）
+      - "3200:3200"                  # Tempo HTTP API（Grafana 数据源查询用）
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml
+      - tempo_data:/var/tempo
+    restart: unless-stopped
+
+  # ── Loki 日志存储（存储后端，UI 走 Grafana）─────────────────────
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]  # 用镜像自带默认配置即可
+    ports:
+      - "3100:3100"                  # Loki HTTP API（Promtail 推日志 + Grafana 查询都走这里）
+    volumes:
+      - loki_data:/loki
+    restart: unless-stopped
+
+  # ── Promtail 日志采集器（读容器 stdout，推给 Loki）──────────────
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    command: ["-config.file=/etc/promtail/config.yaml"]
+    volumes:
+      - ./promtail-config.yaml:/etc/promtail/config.yaml
+      # 读取宿主机上的容器日志（Docker 把每个容器 stdout 写成 json-file）
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+    depends_on:
+      - loki
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  tempo_data:
+  loki_data:

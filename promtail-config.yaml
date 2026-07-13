@@ -1,0 +1,20 @@
+# promtail-config.yaml
+server:
+  http_listen_port: 9080
+
+positions:
+  filename: /tmp/positions.yaml   # 记录读到哪了，重启不重复采集
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push   # 推给 Loki（Docker 网络内用服务名）
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:              # 通过 docker.sock 自动发现所有容器
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # 把容器名提取成 container 标签，查询时可按容器过滤
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: container

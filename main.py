@@ -3,7 +3,7 @@ main.py — FastAPI Web 服务入口
 
 提供两个接口：
   POST /ask        → 完整响应（等待全部内容）
-  GET  /ask/stream → SSE 流式响应（逐 token 实时推送）
+  GET  /ask/stream → SSE 流式响应（按子任务完成顺序推送，均走 Coordinator 架构）
 
 额外接口：
   GET /health      → 健康检查（运维用）
@@ -15,10 +15,13 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
+
+from observability.metrics import generate_latest, CONTENT_TYPE_LATEST, record_request
+from providers.types import Usage
 
 import asyncio
 from swarm.blackboard import Blackboard
@@ -28,10 +31,12 @@ from swarm.test_writer_agent import TestWriterSwarmAgent
 from swarm.task_types import TaskType
 from persistence.redis_client import create_redis_client
 from swarm.code_extractor import extract_python_code
-from swarm.sandbox import resolve_safe_path, PathTraversalError
+from core.workspace import get_workspace, resolve_safe_path, PathTraversalError
 
-from agent import ask, ask_stream, clear_session
-from observability.logging import logger
+from coordinator.agent import CoordinatorAgent, clear_session
+from observability.logging import logger, setup_logging
+from observability.tracing import setup_tracing
+from core.config import settings
 
 from typing import Any
 
@@ -83,7 +88,7 @@ class SwarmAskResponse(BaseModel):
 
 class ApplyRequest(BaseModel):
     """POST /swarm/tasks/{task_id}/apply 的请求体格式"""
-    path: str = Field(..., min_length=1, description="写入的目标路径，相对工作目录（SWARM_WORKSPACE），如 'out/auth.fixed.py'")
+    path: str = Field(..., min_length=1, description="写入的目标路径，相对工作目录（WORKSPACE），如 'out/auth.fixed.py'")
 
 
 class ApplyResponse(BaseModel):
@@ -95,7 +100,11 @@ class ApplyResponse(BaseModel):
 
 # ── 应用生命周期（启动/关闭钩子）────────────────────────────────────
 
-# 全局白板 + Swarm Agent 后台任务（跟 _coordinator 一样，启动时初始化一次）
+# 全局 Coordinator 实例（POST /ask 走这条架构：规划 → 分发 → 聚合）
+_coordinator = CoordinatorAgent()
+
+# 全局白板 + Swarm Agent 后台任务（POST /swarm/ask 走这条架构：发布任务到白板，
+# 由常驻 Swarm Agent 异步认领执行），跟 _coordinator 一样，启动时初始化一次
 _blackboard = Blackboard()
 _swarm_agent_tasks: list[asyncio.Task] = []
 _redis_client = create_redis_client()
@@ -123,7 +132,16 @@ async def periodic_save(blackboard: Blackboard, redis_client, interval: float = 
 async def lifespan(app: FastAPI):
     global _swarm_save_task
 
+    setup_logging()
+    setup_tracing(service_name="my-agent", otlp_endpoint=settings.otel_exporter_otlp_endpoint or None)
+
+    # 初始化统一工作目录：所有工具和子 Agent 的文件操作都限定在此目录内。
+    # 用 WORKSPACE=/path uvicorn main:app 指定，不设则用当前目录。
+    workspace = get_workspace()
+    workspace.mkdir(parents=True, exist_ok=True)
+
     logger.info("server_starting")
+    logger.info("workspace_ready", workspace=str(workspace))
     logger.info("api_docs_url", url="http://localhost:8002/docs")
     logger.info("stream_test_hint", hint="curl -N 'http://localhost:8002/ask/stream?question=你好'")
 
@@ -141,9 +159,24 @@ async def lifespan(app: FastAPI):
     # 3. 后台定期备份，不阻塞主流程
     _swarm_save_task = asyncio.create_task(periodic_save(_blackboard, _redis_client))
 
+    # 4. 启动飞书 WebSocket（配置了 App ID/Secret 才启动），在后台任务里运行，不阻塞主服务
+    feishu_task = None
+    if settings.feishu_app_id and settings.feishu_app_secret:
+        from feishu.ws_manager import FeishuWSManager
+        ws_manager = FeishuWSManager()
+        feishu_task = asyncio.create_task(ws_manager.start())
+        logger.info("feishu_ws_started")
+
     yield
 
-    # 4. 收尾：停 Agent、停后台备份任务、退出前再存一次、关闭连接
+    # 5. 收尾：停飞书、停 Agent、停后台备份任务、退出前再存一次、关闭连接
+    if feishu_task:
+        feishu_task.cancel()
+        try:
+            await feishu_task
+        except asyncio.CancelledError:
+            pass
+
     for task in _swarm_agent_tasks:
         task.cancel()
     await asyncio.gather(*_swarm_agent_tasks, return_exceptions=True)
@@ -183,10 +216,20 @@ async def health_check():
     return {"status": "ok", "timestamp": int(time.time())}
 
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus 指标端点（Prometheus 服务器来拉取数据）。"""
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
+
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(req: AskRequest) -> AskResponse:
     """
-    完整响应接口：调用 Agent 回答问题，支持按 session_id 记忆多轮对话（第 10 章）。
+    完整响应接口：走 Coordinator 架构（规划 → 分发 → 聚合，第 6 章），
+    支持按 session_id 记忆多轮对话（第 10 章，已接入 CoordinatorAgent）。
 
     请求体：{"question": "你的问题", "session_id": "可选，同一会话传相同值"}
     响应体：{"text": "回答", "session_id": "...", "usage": {...}, "error": null}
@@ -196,28 +239,43 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
     log.info("ask_request_received", question=req.question[:60])
 
     try:
-        result = await ask(req.question, session_id=req.session_id)
+        result = await _coordinator.run(req.question, session_id=req.session_id)
         elapsed_ms = round((time.time() - start) * 1000)
         log.info("ask_request_done", elapsed_ms=elapsed_ms)
+        record_request(
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            status="success",
+            latency=time.time() - start,
+            usage=Usage(input_tokens=result.input_tokens, output_tokens=result.output_tokens),
+        )
         return AskResponse(
             text=result.text,
             session_id=req.session_id,
             usage={
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
-                "turn_count": result.turn_count,
             },
         )
     except Exception as e:
         elapsed_ms = round((time.time() - start) * 1000)
         log.error("ask_request_error", elapsed_ms=elapsed_ms, error=str(e))
+        record_request(
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            status="error",
+            latency=time.time() - start,
+        )
         return AskResponse(session_id=req.session_id, error=str(e))
 
 
 @app.get("/ask/stream")
 async def ask_stream_endpoint(question: str, session_id: str | None = None):
     """
-    SSE 流式响应接口：逐 token 实时推送，适合前端打字机效果。
+    SSE 流式响应接口：走 Coordinator 架构（跟 /ask 一致，规划→分发→聚合），
+    按子任务完成顺序推送——不需要子 Agent 时整块推送回复，需要多个子 Agent 时
+    哪个先跑完就先推送哪个，不等全部任务聚合完（不是逐 token，规划阶段要拿到
+    完整 JSON 才能解析出任务列表，没法边生成边流）。
 
     URL 参数：?question=你的问题&session_id=可选，同一会话传相同值
     响应：text/event-stream 格式，逐块推送 JSON 数据
@@ -232,7 +290,7 @@ async def ask_stream_endpoint(question: str, session_id: str | None = None):
         每次 yield 一条 SSE 格式的消息（'data: {...}\\n\\n'）。
         """
         try:
-            async for chunk in ask_stream(question, session_id=session_id):
+            async for chunk in _coordinator.ask_stream(question, session_id=session_id):
                 # 把文本片段包装成 SSE 格式
                 data = json.dumps(
                     {"type": "text_delta", "text": chunk},

@@ -1,0 +1,29 @@
+# grafana/provisioning/datasources/datasources.yaml
+apiVersion: 1
+
+datasources:
+  # ── 指标：Prometheus ──────────────────────────────────────────
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090      # Docker 网络内用服务名
+    isDefault: true
+
+  # ── 链路：Tempo ───────────────────────────────────────────────
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200           # 连 Tempo 的 HTTP 查询端口
+    jsonData:
+      # 从链路 Span 跳到对应指标（可选，增强联动）
+      tracesToMetrics:
+        datasourceUid: prometheus
+      # 服务依赖图需要的节点/边指标
+      serviceMap:
+        datasourceUid: prometheus
+
+  # ── 日志：Loki ────────────────────────────────────────────────
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100            # 连 Loki 的 HTTP 查询端口
