@@ -10250,7 +10250,7 @@ structlog · OpenTelemetry · Prometheus · 飞书开发 · 多 Provider · Prom
 
 本节实现两个真实工具：
 - **天气工具**：接入 OpenWeatherMap（免费，注册即用）
-- **本地知识库 RAG**：不依赖向量数据库，用 TF-IDF 实现，5 分钟搭起来
+- **本地知识库 RAG**：基础版用 TF-IDF，5 分钟搭起来；第 15 章升级为 embedding（bge-small-zh-v1.5）+ Qdrant 向量检索，支持语义匹配
 
 ---
 
@@ -10447,6 +10447,10 @@ asyncio.run(test())
 
 这是一个**不依赖向量数据库**的轻量 RAG 实现，用 TF-IDF 做相关性检索。
 优点：零依赖（不需要 FAISS / ChromaDB），搭建 5 分钟，效果足够演示。
+
+> **本节是基础版**：只支持纯文本 + 字面匹配，用于快速跑通 RAG 流程。第 15 章会把它升级为
+> **embedding（bge-small-zh-v1.5）+ Qdrant 向量检索**，支持 PDF/图片和语义匹配（见 15.3.4、15.9）。
+> 如果你直接以最终形态实现，可跳过本节的 TF-IDF 版本。
 
 ```python
 # tools/knowledge_base.py
@@ -11484,8 +11488,8 @@ agg demo.cast demo.gif
 ├── screenshot.png → 发给视觉 LLM 描述 → 得到文本块
 └── policy.md      → 直接读取文字
          ↓ 统一变成 DocumentChunk（文本）
-         ↓ TF-IDF 建索引
-         ↓ 用户查询 → 检索相关块 → 返回给 LLM 作为上下文
+         ↓ bge-small-zh-v1.5 编码成向量 → 写入 Qdrant（cosine 距离）
+         ↓ 用户查询 → 编码成向量 → 向量库近邻检索 → 返回相关块给 LLM 作为上下文
 ```
 
 ---
@@ -11513,7 +11517,10 @@ providers/openai.py               ← _to_openai_messages() 支持 ImageBlock；
 providers/gemini.py               ← _to_gemini_messages() 支持 inline_data 图片 Part；supports_vision = True
 providers/router.py               ← 新增 get_vision_provider()：视觉调用可配置成独立于对话的 Provider
 core/config.py                    ← 新增 VISION_PROVIDER / VISION_MODEL 配置项
-pyproject.toml                    ← 新增 pymupdf、pillow 依赖
+pyproject.toml                    ← 新增 pymupdf、pillow、sentence-transformers、qdrant-client 依赖
+
+外部服务：
+Qdrant（Docker）                   ← 本地向量库，存放文档 embedding，见 15.4
 ```
 
 > **为什么要新增 `get_vision_provider()`，而不是直接用对话用的 `get_provider()`？**
@@ -11580,33 +11587,92 @@ Layer 1：document_loaders/（负责"读懂"各种格式的文件）
   ImageLoader → list[DocumentChunk]（异步：调用视觉 LLM）
 
 Layer 2：knowledge_base.py（负责索引、检索）
-  KnowledgeBaseTool.ensure_loaded()  → 扫描目录，调用对应加载器
-  KnowledgeBaseTool.execute()        → TF-IDF 检索，返回 top-k 结果
+  KnowledgeBaseTool.ensure_loaded()  → 扫描目录，调用加载器 + 编码建向量索引
+  KnowledgeBaseTool.execute()        → 向量近邻检索（cosine），返回 top-k 结果
 ```
 
 这样做的好处：以后想支持新格式（如 Word、Excel），只需新增一个 Loader，不需要动检索逻辑。
+
+### 15.3.4 为什么用向量检索（Embedding + Qdrant）而不是 TF-IDF
+
+第 9 章的基础 RAG 用的是 **TF-IDF**：把文本分词后按"词频 × 逆文档频率"打分。它简单、零依赖，
+但只会做**字面匹配**——查询"请假"匹配不到写着"休假 / 年假"的文档，因为它不理解语义。
+
+本章升级为**向量检索**，核心是两个组件：
+
+| 组件 | 作用 | 本项目选型 |
+|---|---|---|
+| **Embedding 模型** | 把文本"翻译"成一串数字（向量），语义相近的文本向量也相近 | `bge-small-zh-v1.5` |
+| **向量数据库** | 高效存储向量，按"距离/夹角"快速找出最相近的若干条 | `Qdrant`（cosine 距离）|
+
+检索流程：文档和查询都用**同一个 embedding 模型**编码成向量，再用**余弦相似度**（cosine，
+衡量两个向量夹角，越接近 1 越相关）在 Qdrant 里做近邻检索。这样"请假流程"和"怎么申请年假"
+即使一个字都不重合，也能因为语义相近而匹配上——这是 TF-IDF 做不到的。
+
+**为什么是这套选型：**
+- **bge-small-zh-v1.5**：BAAI 智源开源，中文效果强，仅 ~100MB，CPU 就能跑，**完全免费、离线、
+  数据不出本地**，无需任何 API Key；
+- **Qdrant**：专用向量库（Rust 实现），Docker 一键启动，原生支持 cosine 距离、HNSW 索引和元数据
+  过滤，和项目"本地 + Docker 部署"的调性一致；
+- 文档量再大（上万篇）也扛得住，比 TF-IDF 每次全量扫描更能扩展。
+
+> **成本权衡**：相比 TF-IDF，代价是多了一个 embedding 模型（首次下载 ~100MB）和一个 Qdrant 容器。
+> 但换来了语义级检索能力，且两者都免费、可本地部署，对演示和生产都够用。
 
 ---
 
 ## 15.4 安装新依赖
 
+本章依赖分两部分：**多模态文档解析**（PDF/图片）和**向量检索**（embedding 模型 + 向量库）。
+
 在项目根目录运行：
 
 ```bash
 # 激活虚拟环境（确保提示符前有 (.venv)）
-uv add pymupdf pillow
+uv add pymupdf pillow sentence-transformers qdrant-client
 ```
 
 `pyproject.toml` 会自动更新，加入：
 ```toml
-"pymupdf>=1.24.0",
-"pillow>=10.0.0",
+"pymupdf>=1.24.0",              # PDF 文字 + 图片提取
+"pillow>=10.0.0",              # 图片处理
+"sentence-transformers>=3.0.0", # 加载 bge-small-zh-v1.5，本地生成 embedding
+"qdrant-client>=1.9.0",        # Qdrant 向量库客户端
+```
+
+### 启动 Qdrant（Docker）
+
+Qdrant 是独立服务，用官方镜像一键启动，数据持久化到本地目录：
+
+```bash
+docker run -d --name qdrant \
+  -p 6333:6333 -p 6334:6334 \
+  -v "$(pwd)/qdrant_storage:/qdrant/storage" \
+  qdrant/qdrant
+```
+
+> **不想起容器？** `KnowledgeBaseTool` 支持传 `qdrant_url=":memory:"` 走纯内存模式，
+> 进程退出即清空——适合跑测试或临时演示（16.9 的测试夹具就用这个，见下文）。
+
+### 首次运行会自动下载 embedding 模型
+
+`bge-small-zh-v1.5` 权重约 100MB，首次 `SentenceTransformer(...)` 调用时会自动从
+HuggingFace 下载并缓存到 `~/.cache/huggingface/`，之后离线可用。国内网络慢可提前设置镜像：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com   # 可选：走国内镜像加速下载
 ```
 
 验证安装：
 ```bash
-python -c "import fitz; import PIL; print('依赖安装成功')"
+python -c "import fitz, PIL; from sentence_transformers import SentenceTransformer; from qdrant_client import QdrantClient; print('依赖安装成功')"
 # 预期输出：依赖安装成功
+```
+
+验证 Qdrant 已启动：
+```bash
+curl http://localhost:6333/healthz
+# 预期输出：healthz check passed
 ```
 
 ---
@@ -12067,7 +12133,7 @@ class DocumentChunk:
     - 纯文本文件：直接是文件内容
     - PDF：文字内容 + 图片描述（拼接在一起）
     - 图片文件：视觉 LLM 生成的描述文字
-    TF-IDF 就是基于这个字段做检索的。"""
+    embedding 就是基于这个字段编码成向量做检索的。"""
 
     image_count: int = 0
     """原始文档中包含的图片数量（纯文本为 0）。"""
@@ -12086,7 +12152,7 @@ class DocumentChunk:
 调用视觉 LLM，为图片生成文字描述。
 
 这个函数是多模态 RAG 的核心：
-它把图片"翻译"成文字，让纯文本的 TF-IDF 引擎也能理解图片内容。
+它把图片"翻译"成文字，让基于文本 embedding 的检索引擎也能理解图片内容。
 """
 
 import base64
@@ -12495,22 +12561,31 @@ class ToolRegistry:
 ```python
 # tools/knowledge_base.py
 """
-多模态本地知识库检索工具。
+多模态本地知识库检索工具（向量检索版）。
 
 支持三种文件格式：
   .txt / .md  → TextLoader（直接读取文字）
   .pdf        → PDFLoader（提取文字 + 并发调用视觉 LLM 描述图片）
   .jpg .png 等 → ImageLoader（调用视觉 LLM 描述整张图片）
 
-检索算法：TF-IDF（无需向量数据库，零额外依赖）。
+检索算法：Embedding（bge-small-zh-v1.5）+ Qdrant 向量库 + 余弦相似度。
+  - 用 sentence-transformers 加载本地开源模型 bge-small-zh-v1.5，把文本编码成 512 维向量；
+  - 向量存进 Qdrant（本地 Docker，cosine 距离），查询时对 query 编码后做近邻检索；
+  - 相比 TF-IDF 的"字面匹配"，向量检索能理解语义（"请假"能匹配到"休假/年假"）。
+
+为什么是 bge-small-zh-v1.5 + Qdrant：
+  - bge-small-zh-v1.5：BAAI 开源、中文效果强、仅 ~100MB，CPU 就能跑，完全免费、离线、数据不出本地；
+  - Qdrant：专用向量库，Docker 一键启动，原生支持 cosine 距离 / HNSW 索引 / 元数据过滤；
+  - 两者都无需 API Key，和项目"本地 + Docker 部署"的调性一致。
 """
 
-import re
-import math
 import asyncio
 import json
 from pathlib import Path
-from collections import Counter
+
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
 
 from tools.base import BaseTool
 from tools.document_loaders.base import DocumentChunk
@@ -12520,63 +12595,53 @@ from tools.document_loaders.image_loader import ImageLoader
 from providers.types import ToolDefinition
 
 
-# ── TF-IDF 检索算法 ────────────────────────────────────────────────────────────
+# ── Embedding 模型（进程内单例，避免重复加载 ~100MB 权重）─────────────────────────
 
-def _tokenize(text: str) -> list[str]:
-    """简单分词：英文按单词切分，中文按字切分。"""
-    en_tokens = re.findall(r"[a-zA-Z]+", text.lower())
-    zh_tokens = re.findall(r"[一-鿿]", text)
-    return en_tokens + zh_tokens
+_EMBED_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
+_EMBED_DIM = 512  # bge-small-zh-v1.5 输出维度
+_embedder: SentenceTransformer | None = None
 
 
-def _tfidf_score(query: str, doc_text: str, all_doc_texts: list[str]) -> float:
-    """
-    计算查询词对某文档的 TF-IDF 相关性分数。
-
-    TF（词频）= 查询词在文档中的出现频率
-    IDF（逆文档频率）= log((文档总数 + 1) / (含该词的文档数 + 1))
-    最终分数 = 所有查询词的 TF × IDF 之和
-    """
-    query_tokens = _tokenize(query)
-    doc_tokens = _tokenize(doc_text)
-    doc_counter = Counter(doc_tokens)
-    doc_len = len(doc_tokens) or 1
-
-    score = 0.0
-    for token in query_tokens:
-        tf = doc_counter.get(token, 0) / doc_len
-        df = sum(1 for d in all_doc_texts if token in _tokenize(d))
-        idf = math.log((len(all_doc_texts) + 1) / (df + 1))
-        score += tf * idf
-
-    return score
+def _get_embedder() -> SentenceTransformer:
+    """懒加载 embedding 模型。首次调用会自动从 HuggingFace 下载权重并缓存到本地。"""
+    global _embedder
+    if _embedder is None:
+        # 首次加载耗时几秒；normalize_embeddings 在 encode 时开启，配合 cosine 距离
+        _embedder = SentenceTransformer(_EMBED_MODEL_NAME)
+    return _embedder
 
 
-def _extract_best_chunk(content: str, query: str, chunk_size: int = 500) -> str:
-    """从长文本中提取最相关的段落（滑动窗口）。"""
-    query_tokens = set(_tokenize(query))
-    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-
-    if not paragraphs:
-        return content[:chunk_size]
-
-    best = max(
-        paragraphs,
-        key=lambda p: sum(1 for t in _tokenize(p) if t in query_tokens),
-        default=paragraphs[0],
+def _embed(texts: list[str]) -> list[list[float]]:
+    """把一批文本编码成归一化向量（L2 归一化后配合 cosine 距离即等价于点积）。"""
+    model = _get_embedder()
+    vectors = model.encode(
+        texts,
+        normalize_embeddings=True,   # 归一化，cosine 相似度更稳定
+        convert_to_numpy=True,
     )
+    return vectors.tolist()
 
-    if len(best) <= chunk_size:
-        return best
-    return best[:chunk_size] + "..."
+
+def _extract_best_chunk(content: str, chunk_size: int = 500) -> str:
+    """截取文档开头一段作为展示片段（向量检索命中的是整块，这里只做长度裁剪）。"""
+    content = content.strip()
+    if len(content) <= chunk_size:
+        return content
+    return content[:chunk_size] + "..."
 
 
 # ── 知识库工具 ─────────────────────────────────────────────────────────────────
 
 class KnowledgeBaseTool(BaseTool):
 
-    def __init__(self, kb_dir: str = "knowledge_base"):
+    def __init__(
+        self,
+        kb_dir: str = "knowledge_base",
+        qdrant_url: str = "http://localhost:6333",
+        collection: str = "knowledge_base",
+    ):
         self.kb_dir = Path(kb_dir)
+        self.collection = collection
         self._docs: list[DocumentChunk] = []
         self._loaded = False
 
@@ -12584,14 +12649,22 @@ class KnowledgeBaseTool(BaseTool):
         self._pdf_loader = PDFLoader()
         self._image_loader = ImageLoader()
 
+        # 连接 Qdrant（Docker 起的本地服务，见 15.4）。
+        # 也可传 ":memory:" 走纯内存模式，适合测试/演示不想起容器的场景。
+        if qdrant_url == ":memory:":
+            self._qdrant = QdrantClient(":memory:")
+        else:
+            self._qdrant = QdrantClient(url=qdrant_url)
+
     async def ensure_loaded(self):
-        """延迟加载：第一次被调用时触发文档加载，之后直接返回。"""
+        """延迟加载：第一次被调用时触发文档加载 + 建向量索引，之后直接返回。"""
         if not self._loaded:
             await self._load_all()
+            self._build_index()
             self._loaded = True
 
     async def _load_all(self):
-        """扫描目录，对每个文件调用对应的加载器。"""
+        """扫描目录，对每个文件调用对应的加载器（得到 DocumentChunk 列表）。"""
         if not self.kb_dir.exists():
             print(f"  [KnowledgeBase] 目录不存在：{self.kb_dir}")
             return
@@ -12628,8 +12701,38 @@ class KnowledgeBaseTool(BaseTool):
 
         print(f"  [KnowledgeBase] 加载完成，共 {len(self._docs)} 个文档块")
 
+    def _build_index(self):
+        """把所有 DocumentChunk 编码成向量，写入 Qdrant 集合（重建）。"""
+        # 每次重建：删掉旧集合再按 embedding 维度 + cosine 距离新建
+        self._qdrant.recreate_collection(
+            collection_name=self.collection,
+            vectors_config=VectorParams(size=_EMBED_DIM, distance=Distance.COSINE),
+        )
+
+        if not self._docs:
+            return
+
+        vectors = _embed([doc.text for doc in self._docs])
+        points = [
+            PointStruct(
+                id=i,
+                vector=vec,
+                # payload 存原始内容，检索命中后直接取回，无需再回查文件
+                payload={
+                    "title": doc.title,
+                    "source": doc.source,
+                    "text": doc.text,
+                    "image_count": doc.image_count,
+                },
+            )
+            for i, (vec, doc) in enumerate(zip(vectors, self._docs))
+        ]
+        self._qdrant.upsert(collection_name=self.collection, points=points)
+        print(f"  [KnowledgeBase] 向量索引完成，共 {len(points)} 个向量"
+              f"（模型 {_EMBED_MODEL_NAME}，维度 {_EMBED_DIM}）")
+
     async def reload(self):
-        """重新加载知识库（热更新，不重启服务）。"""
+        """重新加载知识库并重建向量索引（热更新，不重启服务）。"""
         self._docs.clear()
         self._loaded = False
         await self.ensure_loaded()
@@ -12667,6 +12770,9 @@ class KnowledgeBaseTool(BaseTool):
             "required": ["query"],
         }
 
+    # cosine 相似度低于此阈值视为不相关（归一化向量下取值范围约 [-1, 1]）
+    _SCORE_THRESHOLD = 0.3
+
     async def execute(self, inputs: dict) -> str:
         """
         检索知识库，返回 top_k 最相关的文档片段。
@@ -12685,24 +12791,24 @@ class KnowledgeBaseTool(BaseTool):
                 "error": f"知识库为空。请在 {self.kb_dir}/ 目录放置文档。"
             }, ensure_ascii=False)
 
-        all_texts = [d.text for d in self._docs]
-
-        scored = sorted(
-            [(_tfidf_score(query, doc.text, all_texts), doc) for doc in self._docs],
-            key=lambda x: x[0],
-            reverse=True,
+        # 1. 把 query 编码成向量  2. 在 Qdrant 里做 cosine 近邻检索
+        query_vec = _embed([query])[0]
+        hits = self._qdrant.search(
+            collection_name=self.collection,
+            query_vector=query_vec,
+            limit=top_k,
+            score_threshold=self._SCORE_THRESHOLD,  # 低于阈值的直接被过滤掉
         )
 
         results = []
-        for score, doc in scored[:top_k]:
-            if score < 0.0001:
-                break
+        for hit in hits:
+            payload = hit.payload
             results.append({
-                "title": doc.title,
-                "source": doc.source,
-                "relevance": round(score, 4),
-                "content": _extract_best_chunk(doc.text, query),
-                "has_images": doc.image_count > 0,
+                "title": payload["title"],
+                "source": payload["source"],
+                "relevance": round(hit.score, 4),   # cosine 相似度，越接近 1 越相关
+                "content": _extract_best_chunk(payload["text"]),
+                "has_images": payload["image_count"] > 0,
             })
 
         if not results:
@@ -13000,7 +13106,7 @@ pyproject.toml   ← pytest 异步配置
 ```
 第一层：不需要调用 LLM（快速，可以在没有 API Key 时运行）
   test_metrics.py  → 验证 SessionMetrics 的计算逻辑
-  test_rag.py      → 验证 TF-IDF 检索算法是否返回正确文档
+  test_rag.py      → 验证向量检索（embedding + Qdrant 内存模式）是否返回正确文档
 
 第二层：需要调用 LLM（较慢，需要 .env 里配置了 API Key）
   test_tool_accuracy.py → 验证 Agent 对需要查知识库的问题会调用工具
@@ -13532,12 +13638,18 @@ async def loaded_kb(test_kb_dir):
     用法（在测试函数里声明参数名即可）：
         async def test_something(loaded_kb):
             result = await loaded_kb.execute({"query": "退货"})
+
+    这里用 qdrant_url=":memory:" 走纯内存向量库，测试不依赖 Docker 起的 Qdrant 服务，
+    且每个测试实例互相隔离、退出即清空。
     """
     from tools.knowledge_base import KnowledgeBaseTool
-    kb = KnowledgeBaseTool(kb_dir=test_kb_dir)
+    kb = KnowledgeBaseTool(kb_dir=test_kb_dir, qdrant_url=":memory:")
     await kb.ensure_loaded()
     return kb
 ```
+
+> **首次跑测试会下载 embedding 模型**（~100MB），之后走本地缓存。CI 环境建议预热缓存
+> 或提前 `export HF_ENDPOINT=https://hf-mirror.com`。
 
 在 `pyproject.toml` 里加入 pytest 的 asyncio 配置（避免每个异步测试都要手写 `asyncio.run()`）：
 
@@ -13757,7 +13869,8 @@ def test_to_dict_contains_required_keys():
 
 ## 16.9 RAG 检索质量测试 `tests/test_rag.py`
 
-这批测试使用固定的测试文档，验证 TF-IDF 检索算法的正确性，**不需要调用 LLM**。
+这批测试使用固定的测试文档，验证向量检索的正确性，**不调用对话 LLM**。
+（注意：会用到本地 embedding 模型 bge-small-zh-v1.5，首次运行需下载权重；向量库走 `:memory:` 内存模式，无需 Docker。）
 
 ```python
 # tests/test_rag.py
@@ -13765,8 +13878,8 @@ def test_to_dict_contains_required_keys():
 RAG 检索质量测试。
 
 使用 tests/fixtures/knowledge_base/ 里的已知文档，
-验证 TF-IDF 检索算法对不同查询的返回结果是否符合预期。
-不调用 LLM，运行速度快。
+验证 embedding + Qdrant 向量检索对不同查询的返回结果是否符合预期。
+不调用对话 LLM；embedding 用本地开源模型，向量库走内存模式，运行较快。
 """
 
 import pytest
@@ -13858,8 +13971,8 @@ async def test_unrelated_query_returns_not_found_or_low_score(loaded_kb):
     data = json.loads(result)
 
     if data.get("found"):
-        # 如果"找到"了，相关度分数应该很低
-        assert data["results"][0]["relevance"] < 0.01, (
+        # 低于 _SCORE_THRESHOLD(0.3) 的会被 Qdrant 直接过滤；即使命中，cosine 相似度也应偏低
+        assert data["results"][0]["relevance"] < 0.5, (
             f"无关查询的相关度分数过高：{data['results'][0]['relevance']}"
         )
 
@@ -14185,9 +14298,9 @@ pytest tests/ -v
 FAILED tests/test_rag.py::test_retrieve_policy_by_refund_query
 AssertionError: 退货问题应该返回政策文档，实际返回：test_products.md
 
-解读：TF-IDF 检索了错误的文档。
-可能原因：test_policy.md 里没有「退货」相关的词，或者词汇重合度低。
-修复方向：检查 test_policy.md 的内容，确保包含「退货」「天」等关键词。
+解读：向量检索返回了错误的文档。
+可能原因：test_policy.md 的语义与「退货」查询不够贴近，或两篇测试文档语义太接近难以区分。
+修复方向：检查 test_policy.md 的内容，让退货政策描述更完整具体；必要时调低 _SCORE_THRESHOLD 或换更强的 embedding 模型（如 bge-base-zh-v1.5）。
 ```
 
 ### 在 cli.py 里打印指标报告
