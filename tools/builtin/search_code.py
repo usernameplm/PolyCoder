@@ -6,14 +6,16 @@
 import re
 from pathlib import Path
 from tools.base import BaseTool
+from core.workspace import get_workspace
 
 _CODE_EXTENSIONS = {".py", ".js", ".ts", ".go", ".java", ".cpp", ".c", ".rs", ".md"}
 
 
 class SearchCodeTool(BaseTool):
 
-    def __init__(self, workspace: str = "."):
-        self.workspace = Path(workspace).resolve()
+    def __init__(self, workspace: str | Path | None = None):
+        # 默认使用全局统一工作目录（环境变量 WORKSPACE）；传参仅用于测试/临时覆盖。
+        self.workspace = Path(workspace).resolve() if workspace is not None else get_workspace()
 
     @property
     def name(self) -> str:

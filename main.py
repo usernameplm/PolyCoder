@@ -31,7 +31,7 @@ from swarm.test_writer_agent import TestWriterSwarmAgent
 from swarm.task_types import TaskType
 from persistence.redis_client import create_redis_client
 from swarm.code_extractor import extract_python_code
-from swarm.sandbox import resolve_safe_path, PathTraversalError
+from core.workspace import get_workspace, resolve_safe_path, PathTraversalError
 
 from coordinator.agent import CoordinatorAgent, clear_session
 from observability.logging import logger, setup_logging
@@ -88,7 +88,7 @@ class SwarmAskResponse(BaseModel):
 
 class ApplyRequest(BaseModel):
     """POST /swarm/tasks/{task_id}/apply 的请求体格式"""
-    path: str = Field(..., min_length=1, description="写入的目标路径，相对工作目录（SWARM_WORKSPACE），如 'out/auth.fixed.py'")
+    path: str = Field(..., min_length=1, description="写入的目标路径，相对工作目录（WORKSPACE），如 'out/auth.fixed.py'")
 
 
 class ApplyResponse(BaseModel):
@@ -135,7 +135,13 @@ async def lifespan(app: FastAPI):
     setup_logging()
     setup_tracing(service_name="my-agent", otlp_endpoint=settings.otel_exporter_otlp_endpoint or None)
 
+    # 初始化统一工作目录：所有工具和子 Agent 的文件操作都限定在此目录内。
+    # 用 WORKSPACE=/path uvicorn main:app 指定，不设则用当前目录。
+    workspace = get_workspace()
+    workspace.mkdir(parents=True, exist_ok=True)
+
     logger.info("server_starting")
+    logger.info("workspace_ready", workspace=str(workspace))
     logger.info("api_docs_url", url="http://localhost:8002/docs")
     logger.info("stream_test_hint", hint="curl -N 'http://localhost:8002/ask/stream?question=你好'")
 
@@ -153,9 +159,24 @@ async def lifespan(app: FastAPI):
     # 3. 后台定期备份，不阻塞主流程
     _swarm_save_task = asyncio.create_task(periodic_save(_blackboard, _redis_client))
 
+    # 4. 启动飞书 WebSocket（配置了 App ID/Secret 才启动），在后台任务里运行，不阻塞主服务
+    feishu_task = None
+    if settings.feishu_app_id and settings.feishu_app_secret:
+        from feishu.ws_manager import FeishuWSManager
+        ws_manager = FeishuWSManager()
+        feishu_task = asyncio.create_task(ws_manager.start())
+        logger.info("feishu_ws_started")
+
     yield
 
-    # 4. 收尾：停 Agent、停后台备份任务、退出前再存一次、关闭连接
+    # 5. 收尾：停飞书、停 Agent、停后台备份任务、退出前再存一次、关闭连接
+    if feishu_task:
+        feishu_task.cancel()
+        try:
+            await feishu_task
+        except asyncio.CancelledError:
+            pass
+
     for task in _swarm_agent_tasks:
         task.cancel()
     await asyncio.gather(*_swarm_agent_tasks, return_exceptions=True)

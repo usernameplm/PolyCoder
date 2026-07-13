@@ -1,5 +1,6 @@
 from pathlib import Path
 from tools.base import BaseTool
+from core.workspace import get_workspace, resolve_safe_path, PathTraversalError
 
 
 class ListDirTool(BaseTool):
@@ -12,14 +13,20 @@ class ListDirTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "目录路径，默认为当前目录", "default": "."},
+                "path": {"type": "string", "description": "目录路径，相对工作目录，默认为工作目录根", "default": "."},
                 "depth": {"type": "integer", "description": "显示深度（1=仅当前层，默认 2）", "default": 2},
             },
         }
     async def execute(self, inputs: dict) -> str:
-        base = Path(inputs.get("path", "."))
+        # 限定在工作目录内，禁止路径穿越
+        try:
+            base = resolve_safe_path(inputs.get("path", "."))
+        except PathTraversalError as e:
+            return f"错误：{e}"
+        if not base.exists():
+            return f"错误：目录不存在：{inputs.get('path', '.')}"
         depth = min(int(inputs.get("depth", 2)), 4)
-        lines = [str(base)]
+        lines = [str(base.relative_to(get_workspace())) or "."]
         for p in sorted(base.rglob("*")):
             rel = p.relative_to(base)
             if len(rel.parts) > depth: continue

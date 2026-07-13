@@ -277,7 +277,12 @@ GEMINI_MODEL=gemini-2.0-flash
 # ── 通用配置 ──────────────────────────────────────────────────────
 LLM_MODEL=claude-sonnet-4-6  # Anthropic Provider 使用的默认模型
 APP_PORT=8002                 # 服务监听端口
+
+# ── 工作目录（所有工具和子 Agent 的文件操作都限定在此目录内）──────────
+WORKSPACE=.                   # 默认当前目录；生产建议指向一个专门的工作区，如 /data/workspace
 ```
+
+> **为什么要有统一工作目录？** Agent 的工具会读写文件、执行代码。如果每个工具各自决定在哪读写，行为就不可控——尤其飞书/HTTP 是外部入口，用户可能诱导模型写到 `/etc` 这类系统路径。本项目把「工作目录」作为**唯一真相来源**（`WORKSPACE` 环境变量）：所有工具（`read_file`/`write_file`/`search_code`/`list_dir`/`run_python`）和所有子 Agent 的文件操作都限定在这个目录内，且禁止用 `../` 或绝对路径穿越到目录外。详见 0.4 的 `core/workspace.py` 和第 6 章工具实现。
 
 **关于 `.gitignore`**：
 
@@ -332,6 +337,10 @@ class Settings(BaseSettings):
     llm_model: str = "claude-sonnet-4-6"
     app_port: int = 8002
 
+    # 工作目录：所有工具（读/写/搜索/执行）和子 Agent 的文件操作都限定在此目录内，
+    # 且禁止路径穿越到目录外。启动时用环境变量 WORKSPACE 覆盖，默认当前目录。
+    workspace: str = "."
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
@@ -340,11 +349,68 @@ class Settings(BaseSettings):
 settings = Settings()
 ```
 
+**创建 `core/workspace.py`（统一工作目录 + 路径沙箱）：**
+
+这是「工作目录」这一概念的落地实现。它从 `settings.workspace` 读出唯一的工作目录，并提供带**路径穿越校验**的安全写入函数——所有工具都调它，而不是各自 `Path(...)` 直接读写：
+
+```python
+# core/workspace.py
+"""
+全项目统一的工作目录（工作区）。
+
+设计目标：所有工具（read_file / write_file / search_code / list_dir / run_python）
+和所有子 Agent 的文件操作，都限定在同一个工作目录内，且禁止路径穿越到目录外。
+
+工作目录的唯一来源是 core.config.settings.workspace（环境变量 WORKSPACE，默认当前目录）。
+启动服务时用 WORKSPACE=/path uvicorn main:app 指定，一处设置，全局生效。
+"""
+from pathlib import Path
+from core.config import settings
+
+
+class PathTraversalError(ValueError):
+    """请求路径解析后跑出了工作目录范围。"""
+
+
+def get_workspace() -> Path:
+    """返回工作目录的绝对路径（唯一来源：settings.workspace）。"""
+    return Path(settings.workspace).resolve()
+
+
+def resolve_safe_path(raw_path: str, workspace: Path | None = None) -> Path:
+    """把相对路径解析为工作目录内的绝对路径；跑出工作目录则抛 PathTraversalError。"""
+    workspace = (workspace or get_workspace()).resolve()
+    target = (workspace / raw_path).resolve()
+    if target != workspace and workspace not in target.parents:
+        raise PathTraversalError(f"路径 '{raw_path}' 解析后跑出了工作目录范围，拒绝访问")
+    return target
+
+
+def write_text_sandboxed(raw_path: str, content: str, workspace: Path | None = None) -> Path:
+    """在沙箱校验通过后写盘，自动创建缺失的父目录。返回写入的绝对路径。"""
+    target = resolve_safe_path(raw_path, workspace)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return target
+```
+
+> **为什么用 `workspace not in target.parents` 而不是字符串 `startswith`？** 字符串前缀判断会把 `/data/workspace-evil` 误判为在 `/data/workspace` 内（前缀相同但不是子目录）。`Path.parents` 是基于路径层级的判断，`.resolve()` 又会先把 `../` 展开成真实路径，两者配合才能严丝合缝地拦住穿越。
+
 **验证配置加载正常：**
 
 ```bash
 python -c "from core.config import settings; print('Provider:', settings.llm_provider)"
 # 应该输出：Provider: anthropic
+
+# 验证工作目录沙箱（穿越应被拦截）
+WORKSPACE=/tmp/ws python -c "
+from core.workspace import resolve_safe_path, PathTraversalError
+print('正常路径:', resolve_safe_path('a/b.py'))
+try:
+    resolve_safe_path('../evil.py')
+except PathTraversalError as e:
+    print('穿越已拦截:', e)
+"
 ```
 
 ---
@@ -3009,12 +3075,15 @@ Coding Agent 最常用的工具——让 Agent 能看到用户的代码文件。
 """
 from pathlib import Path
 from tools.base import BaseTool
+from core.workspace import get_workspace
 
 
 class ReadFileTool(BaseTool):
 
-    def __init__(self, workspace: str = "."):
-        self.workspace = Path(workspace).resolve()
+    def __init__(self, workspace: str | Path | None = None):
+        # 默认使用全局统一工作目录（环境变量 WORKSPACE）；传参仅用于测试/临时覆盖。
+        # 这样 sub_agents 里 ReadFileTool() 无参实例化就自动跟其他工具用同一个目录。
+        self.workspace = Path(workspace).resolve() if workspace is not None else get_workspace()
 
     @property
     def name(self) -> str:
@@ -3099,6 +3168,7 @@ import asyncio
 import sys
 import textwrap
 from tools.base import BaseTool
+from core.workspace import get_workspace
 
 # 危险模块黑名单（在代码字符串层面做简单检查）
 _BLOCKED_IMPORTS = [
@@ -3154,10 +3224,12 @@ class RunPythonTool(BaseTool):
                 return f"错误：代码包含被禁止的操作（{blocked}），出于安全考虑无法执行"
 
         # 用 asyncio.create_subprocess_exec 在子进程运行，隔离环境
+        # cwd 设为统一工作目录：代码里的相对路径都相对工作目录，和其他工具一致
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-c", textwrap.dedent(code),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=str(get_workspace()),
         )
 
         try:
@@ -3192,14 +3264,16 @@ class RunPythonTool(BaseTool):
 import re
 from pathlib import Path
 from tools.base import BaseTool
+from core.workspace import get_workspace
 
 _CODE_EXTENSIONS = {".py", ".js", ".ts", ".go", ".java", ".cpp", ".c", ".rs", ".md"}
 
 
 class SearchCodeTool(BaseTool):
 
-    def __init__(self, workspace: str = "."):
-        self.workspace = Path(workspace).resolve()
+    def __init__(self, workspace: str | Path | None = None):
+        # 默认使用全局统一工作目录（环境变量 WORKSPACE）；传参仅用于测试/临时覆盖。
+        self.workspace = Path(workspace).resolve() if workspace is not None else get_workspace()
 
     @property
     def name(self) -> str:
@@ -3382,32 +3456,48 @@ curl -X POST http://localhost:8002/ask \
 
 **写入文件工具 `tools/builtin/write_file.py`（让 Agent 能生成并保存代码）：**
 
+写入必须走 `core/workspace.py` 的 `write_text_sandboxed()`——它会把路径限定在工作目录内，
+拦截 `../` 穿越和绝对路径。**绝不要直接 `Path(inputs["path"]).write_text(...)`**，那样
+模型可以写到任意系统路径（尤其飞书/HTTP 是外部入口）：
+
 ```python
+from tools.base import BaseTool
+from core.workspace import write_text_sandboxed, PathTraversalError
+
+
 class WriteFileTool(BaseTool):
     @property
     def name(self): return "write_file"
     @property
-    def description(self): return "把生成的代码写入指定路径的文件。仅在用户明确要求保存时使用。"
+    def description(self): return "把生成的代码写入指定路径的文件（限定在工作目录内）。仅在用户明确要求保存时使用。"
     @property
     def input_schema(self):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "目标文件路径"},
+                "path": {"type": "string", "description": "目标文件路径，相对工作目录，如 'out/auth.py'"},
                 "content": {"type": "string", "description": "写入的文件内容"},
             },
             "required": ["path", "content"],
         }
     async def execute(self, inputs: dict) -> str:
-        path = Path(inputs["path"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(inputs["content"], encoding="utf-8")
-        return f"已写入 {path}（{len(inputs['content'])} 字符）"
+        # 限定在工作目录内，禁止写到工作目录之外（含绝对路径 / 路径穿越）
+        try:
+            target = write_text_sandboxed(inputs["path"], inputs["content"])
+        except PathTraversalError as e:
+            return f"错误：{e}"
+        return f"已写入 {target}（{len(inputs['content'])} 字符）"
 ```
 
 **列出目录工具 `tools/builtin/list_dir.py`（让 Agent 了解项目结构）：**
 
+同样限定在工作目录内，`path` 相对工作目录解析：
+
 ```python
+from tools.base import BaseTool
+from core.workspace import get_workspace, resolve_safe_path, PathTraversalError
+
+
 class ListDirTool(BaseTool):
     @property
     def name(self): return "list_dir"
@@ -3418,14 +3508,20 @@ class ListDirTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "目录路径，默认为当前目录", "default": "."},
+                "path": {"type": "string", "description": "目录路径，相对工作目录，默认为工作目录根", "default": "."},
                 "depth": {"type": "integer", "description": "显示深度（1=仅当前层，默认 2）", "default": 2},
             },
         }
     async def execute(self, inputs: dict) -> str:
-        base = Path(inputs.get("path", "."))
+        # 限定在工作目录内，禁止路径穿越
+        try:
+            base = resolve_safe_path(inputs.get("path", "."))
+        except PathTraversalError as e:
+            return f"错误：{e}"
+        if not base.exists():
+            return f"错误：目录不存在：{inputs.get('path', '.')}"
         depth = min(int(inputs.get("depth", 2)), 4)
-        lines = [str(base)]
+        lines = [str(base.relative_to(get_workspace())) or "."]
         for p in sorted(base.rglob("*")):
             rel = p.relative_to(base)
             if len(rel.parts) > depth: continue
@@ -5667,23 +5763,17 @@ curl -s http://127.0.0.1:8002/swarm/tasks/i9j0k1l2
 要么这段修复干脆就只停留在一次 HTTP 响应里，改完了等于没改。这一节补上"显式落地"
 这最后一步：新增一个接口，从任务结果里抽代码、写到调用方指定的路径。
 
-**为什么不复用 `tools/builtin/write_file.py`？** 看一眼它的 `execute()`：
+**apply 接口和 `write_file` 工具的关系？** 两者写盘时**共用同一套校验**——都调
+`core/workspace.py` 的 `write_text_sandboxed()`，都限定在统一工作目录（`WORKSPACE`）内、
+都拦截 `../` 穿越和绝对路径。`write_file` 是给 Agentic Loop 里的 LLM 主动调用的工具
+（第 5 章），apply 是给 HTTP 调用方用的接口，但只要涉及"把字符串路径写盘"，就绝不能
+不校验——否则调用方（或被诱导的 LLM）传一个 `"../../../etc/bad"` 就能往工作目录之外
+写文件，这是真实的路径穿越漏洞。
 
-```python
-# tools/builtin/write_file.py（现状）
-async def execute(self, inputs: dict) -> str:
-    path = Path(inputs["path"])          # 直接拿路径，没有任何校验
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(inputs["content"], encoding="utf-8")
-    return f"已写入 {path}（{len(inputs['content'])} 字符）"
-```
-
-这个工具的设计前提是"给 Agentic Loop 里的 LLM 主动调用"（第 5 章），路径由 LLM
-自己在推理过程中决定，风险模型是"LLM 会不会自己作妖写坑自己的代码"，本来就不是
-给"HTTP 请求体里任何人传来的字符串路径"设计的——`path` 不做任何校验，直接拼绝对
-路径就写，如果原样接到 `POST /swarm/tasks/{id}/apply` 上，调用方传一个
-`"../../../etc/bad"` 就能往工作目录之外的任意位置写文件，这是一个真实的路径穿越
-漏洞，不能图省事直接复用。新写一个 `swarm/sandbox.py` 专门做这一层校验。
+apply 之所以还单独存在、不是直接调 `write_file`，是因为它比"写盘"多了**前置一步**：
+Agent 的任务结果是"说明文字 + \`\`\`python 代码块"混在一起的自由文本，得先把代码块
+抽出来（下面的 `code_extractor.py`），再把**纯代码**交给 `write_text_sandboxed()` 落地。
+写盘这一层，apply 和 `write_file` 走的是同一个函数。
 
 ### 7.10.1 `swarm/code_extractor.py`：从任务结果里抽代码块
 
@@ -5730,75 +5820,37 @@ def extract_python_code(text: str) -> tuple[str | None, str]:
 取第一个通常就是我们要的那段；真要支持"抽取所有代码块"，教学上先不做，等真的
 遇到这种输出再加。
 
-### 7.10.2 `swarm/sandbox.py`：工作目录沙箱校验
+### 7.10.2 apply 接口的写盘校验：复用 `core/workspace.py`
 
-写法直接抄 `tools/builtin/read_file.py`（5.x 节）里现成的路径穿越检测，读文件和
-写文件的沙箱逻辑本质是同一件事——都是"确保解析后的绝对路径没有跑出工作目录"：
+apply 接口写文件同样要做路径穿越校验。这套逻辑已经在第 0 章的 `core/workspace.py`
+里实现（`resolve_safe_path` / `write_text_sandboxed`），并被所有工具共用——apply
+接口不单独维护一套，直接 `from core.workspace import ...` 复用同一个工作目录
+（环境变量 `WORKSPACE`），保证"read_file 读的目录"和"apply 写的目录"完全一致：
 
 ```python
-# swarm/sandbox.py
-"""
-apply 接口专用的工作目录沙箱：把调用方传来的相对路径解析成绝对路径，
-拒绝任何跑出工作目录范围的写入（路径穿越，如 "../../../etc/passwd"）。
-
-跟 tools/builtin/read_file.py 的穿越检测是同一套思路，这里单独抽出来，
-是因为"写文件"比"读文件"多一层需要独立配置的东西——写盘目标可能需要跟
-Agentic Loop 的工作目录（read_file 用的那个）不是同一个，所以用专门的
-SWARM_WORKSPACE 环境变量，不跟 read_file/write_file 工具共用配置。
-"""
-import os
-from pathlib import Path
-
-
-class PathTraversalError(ValueError):
-    """请求路径解析后跑出了工作目录范围。"""
-
-
-def get_workspace() -> Path:
-    return Path(os.environ.get("SWARM_WORKSPACE", ".")).resolve()
-
-
-def resolve_safe_path(raw_path: str, workspace: Path | None = None) -> Path:
-    """
-    把相对路径解析为工作目录内的绝对路径，穿越则抛 PathTraversalError。
-
-    典型攻击输入：raw_path = "../../../etc/bad" —— (workspace / raw_path).resolve()
-    会算出一个不以 workspace 为前缀的绝对路径，被下面的 startswith 检测拦下。
-    """
-    workspace = workspace or get_workspace()
-    target = (workspace / raw_path).resolve()
-    if not str(target).startswith(str(workspace)):
-        raise PathTraversalError(f"路径 '{raw_path}' 解析后跑出了工作目录范围，拒绝写入")
-    return target
-
-
-def write_text_sandboxed(raw_path: str, content: str, workspace: Path | None = None) -> Path:
-    """
-    在沙箱校验通过后写盘，自动创建缺失的父目录。返回写入的绝对路径。
-    """
-    target = resolve_safe_path(raw_path, workspace)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    return target
+# main.py 里 apply 接口直接从 core.workspace 引入
+from core.workspace import resolve_safe_path, PathTraversalError
 ```
 
-`str(target).startswith(str(workspace))` 这个检测跟 `read_file.py` 完全一样的写法，
-`resolve()` 是关键——它会把 `..` 这种相对片段真正计算掉，拿到的是操作系统层面
-"最终落到哪" 的绝对路径，再拿这个绝对路径去跟 `workspace` 比前缀，而不是直接
-对字符串里有没有出现 `".."` 做黑名单匹配（黑名单方式容易被 `....//` 之类的变形
-绕过，`resolve()` 从根上避免了这个问题）。
+> **一套沙箱，全项目共用。** 早期设计曾让 swarm 用独立的 `swarm/sandbox.py` + `SWARM_WORKSPACE` 环境变量，想着"写盘目录可能和读文件目录不同"。但实践下来，一个 Agent 读的、搜的、写的、执行的应该是**同一个工作区**才符合直觉——尤其飞书/HTTP 是外部入口，多套目录配置反而是隐患。所以工作目录统一收敛到 `core/workspace.py` 的单一来源（`WORKSPACE`），apply 接口、5 个工具都调它，不再有第二份实现。
+
+`core/workspace.py` 里的穿越检测（`workspace not in target.parents`）配合 `resolve()`
+是关键——`resolve()` 会把 `..` 这种相对片段真正计算掉，拿到操作系统层面"最终落到哪"
+的绝对路径，再用 `Path.parents` 做层级判断（比字符串 `startswith` 更严谨，不会把
+`/data/ws-evil` 误判成在 `/data/ws` 内），而不是对字符串里有没有 `".."` 做黑名单匹配
+（黑名单容易被 `....//` 之类变形绕过）。
 
 ### 7.10.3 `main.py`：`ApplyRequest`/`ApplyResponse` + 接口实现
 
 ```python
 # main.py 新增 import
 from swarm.code_extractor import extract_python_code
-from swarm.sandbox import resolve_safe_path, PathTraversalError
+from core.workspace import resolve_safe_path, PathTraversalError
 
 
 class ApplyRequest(BaseModel):
     """POST /swarm/tasks/{task_id}/apply 的请求体格式"""
-    path: str = Field(..., min_length=1, description="写入的目标路径，相对工作目录（SWARM_WORKSPACE），如 'out/auth.fixed.py'")
+    path: str = Field(..., min_length=1, description="写入的目标路径，相对工作目录（WORKSPACE），如 'out/auth.fixed.py'")
 
 
 class ApplyResponse(BaseModel):
@@ -5952,8 +6004,8 @@ curl -s http://127.0.0.1:8002/swarm/tasks
   1. swarm/code_extractor.py 的 extract_python_code() 对 ```python 代码块、无语言
      标记的裸代码块、纯审查意见（无代码块）三种输入分别返回预期的 (代码, 来源) /
      (None, "none")
-  2. swarm/sandbox.py 的 resolve_safe_path() 对 "../../../etc/bad" 这类穿越路径
-     抛 PathTraversalError，对正常相对路径能正确解析到 SWARM_WORKSPACE 内
+  2. core/workspace.py 的 resolve_safe_path() 对 "../../../etc/bad" 这类穿越路径
+     抛 PathTraversalError，对正常相对路径能正确解析到统一工作目录（WORKSPACE）内
   3. POST /swarm/tasks/{task_id}/apply 四种失败分支状态码分别正确：
      任务不存在 → 404；任务未完成（pending/claimed/failed）→ 409；
      无代码块可抽取（如拿 code_review 任务去调）→ 400；路径穿越 → 400
@@ -7910,6 +7962,10 @@ logger.info(
 {"event": "agent_loop_turn", "session_id": "user_001", "turn": 2, "provider": "claude-sonnet-4-6", "input_tokens": 1234, "output_tokens": 567, "tool_calls": ["calculator"], "stop_reason": "tool_use", "timestamp": "2025-01-01T12:00:00Z", "level": "info"}
 ```
 
+> **为什么 JSON 就叫"机器可解析"？** 每条日志是一个字段固定的 JSON 对象，机器不用写正则去猜，直接按 key 过滤和聚合：`session_id == "user_001"` 拉出一次请求的全部日志、`level == "error"` 筛所有错误、对 `elapsed_ms` 字段直接算平均/分位数。临时排查时命令行用 `jq` 就能拆（`... | jq 'select(.level=="warning")'`）；生产环境则交给日志聚合系统自动建索引。
+>
+> **本项目的日志聚合方案：Grafana Loki。** 服务只管把 JSON 日志打到标准输出（stdout），由采集器 **Promtail** 读取容器 stdout 推送给 **Loki** 存储，最后在 **Grafana** 里用 LogQL 查询——这样日志（Loki）、指标（Prometheus）、链路（Tempo）三样都在同一个 Grafana 界面，还能靠共同的 `session_id` 互相跳转。具体部署脚本见第 13 章，本章 11.3.1 先预拉镜像。
+
 ---
 
 ## 11.3 Prometheus 指标 `observability/metrics.py`
@@ -8060,20 +8116,32 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
 
 ---
 
-### 11.3.1 预拉取 Prometheus、Grafana 和 Tempo 镜像
+### 11.3.1 预拉取可观测性栈镜像
 
-Prometheus（指标）、Grafana（可视化）和 Tempo（链路追踪存储）需要独立部署。本章先拉取镜像（确保网络通畅、镜像可下载），具体 Docker 部署脚本统一放到第 13 章。
+可观测性三件套需要独立部署，本章先拉取镜像（确保网络通畅、镜像可下载），具体 Docker 部署脚本统一放到第 13 章。各镜像职责：
+
+| 镜像 | 维度 | 职责 |
+|------|------|------|
+| `prom/prometheus:latest` | 指标 | 定期拉取 `/metrics` 并存储 |
+| `grafana/tempo:latest` | 链路 | 接收 OTLP 链路并存储 |
+| `grafana/loki:latest` | 日志 | 存储 JSON 日志，供 LogQL 查询 |
+| `grafana/promtail:latest` | 日志 | 采集器：读容器 stdout 推给 Loki |
+| `grafana/grafana:latest` | 可视化 | 统一界面，同时连上以上三者 |
 
 ```bash
-# 预拉取镜像（约 600MB，首次下载需要几分钟）
+# 预拉取镜像（约 800MB，首次下载需要几分钟）
 docker pull prom/prometheus:latest
 docker pull grafana/grafana:latest
 docker pull grafana/tempo:latest
+docker pull grafana/loki:latest
+docker pull grafana/promtail:latest
 ```
 
 > **为什么用 Tempo 而不是 Jaeger？** 两者都能接收 OpenTelemetry（OTLP）链路数据，但 Tempo 是 Grafana 官方的链路存储后端，**不需要单独的 UI**——它直接作为 Grafana 的一个数据源，链路和指标（Prometheus）在同一个 Grafana 界面里查看，运维一套即可。Jaeger 则自带独立 UI（16686 端口），需要额外开一个页面。本指南统一到 Grafana，所以选 Tempo。
 >
-> 这三个镜像在第 13 章的 `docker-compose.yml` 里会和 PolyCoder 服务一起编排启动，这里先不写部署脚本，避免分散注意力。
+> **Loki 和 Promtail 为什么是两个镜像？** Loki 只负责存储和查询日志，本身不会主动去读日志文件；Promtail 是配套的**采集器（agent）**，它读取容器的 stdout 日志再推送给 Loki。这和 Prometheus「主动拉指标」相反——日志是「被推送」进来的，所以需要 Promtail 这个推送方。
+>
+> 这些镜像在第 13 章的 `docker-compose.yml` 里会和 PolyCoder 服务一起编排启动，这里先不写部署脚本，避免分散注意力。
 
 ---
 
@@ -8189,6 +8257,7 @@ class Settings(BaseSettings):
 from observability.logging import logger, setup_logging
 from observability.tracing import setup_tracing
 from core.config import settings
+from core.workspace import get_workspace
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -8197,7 +8266,13 @@ async def lifespan(app: FastAPI):
     setup_logging()
     setup_tracing(service_name="my-agent", otlp_endpoint=settings.otel_exporter_otlp_endpoint or None)
 
+    # 初始化统一工作目录：所有工具和子 Agent 的文件操作都限定在此目录内。
+    # 用 WORKSPACE=/path uvicorn main:app 指定，不设则用当前目录。
+    workspace = get_workspace()
+    workspace.mkdir(parents=True, exist_ok=True)
+
     logger.info("server_starting")
+    logger.info("workspace_ready", workspace=str(workspace))   # 启动即打印实际工作目录，方便确认
     logger.info("api_docs_url", url="http://localhost:8002/docs")
     logger.info("stream_test_hint", hint="curl -N 'http://localhost:8002/ask/stream?question=你好'")
 
@@ -8208,6 +8283,8 @@ async def lifespan(app: FastAPI):
     # ... 原有的收尾逻辑不变
     logger.info("server_shutdown")
 ```
+
+> **启动时确认工作目录**：服务起来后第一时间会打印一条 `{"event": "workspace_ready", "workspace": "/data/workspace", ...}` 日志。通过飞书或 HTTP 触发的任何文件操作，都落在这个目录里——排查"文件写到哪去了"时先看这条日志。
 
 **验证方式**：用 `TestClient` 触发一次完整的 `lifespan`（比直接跑 `uvicorn` 更快看到启动阶段的报错），确认没有异常且能拿到 `/metrics` 数据：
 
@@ -8246,6 +8323,9 @@ with TestClient(main.app) as c:
 
 □ Grafana 能连接到 Prometheus 并展示 agent_latency_seconds 的图表
 
+□ 日志输出到 stdout（不写死到文件），这样 Promtail 才能采集到并推给 Loki（部署见第 13 章）
+  验证：docker compose logs agent 能看到一行行 JSON 日志
+
 □ setup_tracing() 在 lifespan 里调用，且在 setup_logging() 之后（否则 Span 只在本地创建，不会导出）
 
 □ 工具 Span（tool_{name}）建在 ToolExecutor._execute_one 里，不要改成串行 for 循环
@@ -8258,7 +8338,7 @@ with TestClient(main.app) as c:
 
 # 第 12 章：阶段 12 —— 飞书机器人
 
-> **本章目标**：在飞书里 @ 机器人就能使用 Agent，支持私聊和群聊，显示"思考中"状态。
+> **本章目标**：在飞书里 @ 机器人就能使用 Agent，支持私聊和群聊，显示"处理中"状态。
 
 ---
 
@@ -8301,8 +8381,8 @@ client.py（调用飞书 API 发送回复）
 6. 左侧菜单 → **「凭证与基础信息」** → 复制 **App ID** 和 **App Secret**
 7. 在 `.env` 里填写：
    ```dotenv
-   FEISHU_APP_ID=cli_xxxxxxxx
-   FEISHU_APP_SECRET=xxxxxxxx
+   FEISHU_APP_ID=cli_aadee18ccc7c9cd8
+   FEISHU_APP_SECRET=RM0oosaFQBdtEHJzyYzC5bFqAaZLAAsf
    ```
 8. 回到应用首页 → 点击「发布版本」→ 「创建版本」→ 填写版本号 → 申请发布
 
@@ -8379,69 +8459,85 @@ class FeishuClient:
                 },
             )
 
-    async def add_reaction(self, message_id: str, emoji: str = "Thinking"):
+    async def add_reaction(self, message_id: str, emoji: str = "OnIt") -> dict:
         """
-        添加 Emoji 反应（显示"思考中"效果）。
+        添加 Emoji 反应（显示"处理中"效果），返回响应里的 data（含 reaction_id）。
 
-        emoji 参数：飞书支持的 Emoji 类型名称
-        "Thinking" = 💭 思考中
-        "THUMBSUP"  = 👍
+        emoji 参数：飞书支持的 emoji_type 枚举值，**大小写敏感**，必须用官方合法值：
+        "OnIt"     = 👌 处理中（本项目默认，表示"正在处理你的消息"）
+        "THUMBSUP" = 👍
+        非法值（如 "Thinking"）会返回 code=231001 reaction type is invalid。
+        完整枚举见：https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
         """
         async with httpx.AsyncClient() as client:
-            await client.post(
+            resp = await client.post(
                 f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reactions",
                 headers=await self._headers(),
                 json={
                     "reaction_type": {"emoji_type": emoji}
                 },
             )
+        data = resp.json()
+        if data.get("code") != 0:
+            # 暴露飞书的真实错误（reaction type 非法、权限不足等），不要静默吞掉
+            raise RuntimeError(f"add_reaction 失败：code={data.get('code')} msg={data.get('msg')}")
+        return data.get("data", {})
 
-    async def remove_reaction(self, message_id: str, reaction_id: str):
-        """移除 Emoji 反应（处理完成后移除"思考中"）。"""
+    async def remove_reaction(self, message_id: str, reaction_id: str) -> dict:
+        """移除 Emoji 反应（处理完成后移除"处理中"）。"""
         async with httpx.AsyncClient() as client:
-            await client.delete(
+            resp = await client.delete(
                 f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}",
                 headers=await self._headers(),
             )
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"remove_reaction 失败：code={data.get('code')} msg={data.get('msg')}")
+        return data.get("data", {})
 ```
+
+> **⚠️ emoji_type 是大小写敏感的固定枚举，别自己编。** 直觉上会写 `"Thinking"` 表示"思考中"，但它**不是**飞书的合法值，会返回 `code=231001 reaction type is invalid`——而且如果 `add_reaction` 不检查 `code`、不 `return data`（早期写法就是发完请求什么都不返回），这个错误会被上层的 `except` 静默吞掉，表现成「能回答但没有表情」，极难排查。本项目用 `OnIt`（👌 处理中），实测有效。
 
 ---
 
 ## 12.4 消息处理器 `feishu/handler.py`
 
+> **并发策略：latest-wins 防抖（debounce）。** 用户连发多条消息时，如果每条都并发处理，会出现两个 Bug：① 多条的「加表情 → 调 LLM → 回复 → 去表情」四步交错执行，**时序错乱**；② 配合飞书重推，还会**一条消息被回复多次**。本项目的策略是**只处理最新一条、丢弃中间的**——收到消息先进一个防抖窗口（0.8s），窗口内又来新消息就取消上一条的处理任务。
+
+> **去重放到哪里？** event_id 去重**不在这里做**，而在上游 `ws_manager` 的**同步回调**里做（见 12.5）——那里是 SDK 单线程串行调用，不会有并发穿透；如果放在 async 的 `handle_event` 里，原始推送和飞书重推的两个协程会并发穿过「检查-添加」，去重失效。
+
 ```python
 # feishu/handler.py
 """
 飞书消息事件处理器。
+
+并发策略：latest-wins 防抖（debounce）。同一会话连发多条消息时，只处理最新一条、
+丢弃中间的——收到消息先进入一个防抖窗口，窗口内若又来新消息，就取消上一条的处理任务。
+这样避免了「表情/回复时序错乱」和「一条消息被回复多次」的问题。
+（event_id 去重在上游 ws_manager 的同步回调里做，那里是单线程，不会有并发穿透。）
 """
+import asyncio
 import json
-import time
 from .client import FeishuClient
 from coordinator.agent import CoordinatorAgent, clear_session   # 传 session_id 就是带记忆的调用
 
 
 class MessageHandler:
 
+    # 防抖窗口：窗口内同一会话的新消息会取代旧消息。正常单条对话几乎无感。
+    _DEBOUNCE_SEC = 0.8
+
     def __init__(self, client: FeishuClient):
         self.client = client
         self._coordinator = CoordinatorAgent()
-        self._processed_events: set[str] = set()   # 消息去重
+        # 每个会话当前正在等待/处理的任务，新消息到来时取消它（latest-wins）
+        self._pending: dict[str, asyncio.Task] = {}
 
     async def handle_event(self, event_data: dict):
-        """处理飞书推送的事件。"""
+        """处理飞书推送的事件：解析消息，按会话做 latest-wins 防抖调度。"""
         # 只处理消息接收事件
         if event_data.get("header", {}).get("event_type") != "im.message.receive_v1":
             return
-
-        # 消息去重（飞书可能重复推送同一条消息）
-        event_id = event_data.get("header", {}).get("event_id", "")
-        if event_id in self._processed_events:
-            return
-        self._processed_events.add(event_id)
-
-        # 清理过期的去重记录（避免集合无限增长）
-        if len(self._processed_events) > 10000:
-            self._processed_events = set()
 
         event = event_data.get("event", {})
         message = event.get("message", {})
@@ -8482,6 +8578,30 @@ class MessageHandler:
         if not text:
             return
 
+        # latest-wins 防抖：同一会话已有待处理任务，先取消（丢弃旧消息，只回最新一条）
+        old = self._pending.get(session_key)
+        if old and not old.done():
+            old.cancel()
+
+        self._pending[session_key] = asyncio.create_task(
+            self._debounced_process(session_key, receive_id, receive_id_type, message_id, text)
+        )
+
+    async def _debounced_process(self, session_key, receive_id, receive_id_type, message_id, text):
+        """先等一个防抖窗口，窗口内若被新消息取消就直接退出，否则真正处理。"""
+        try:
+            await asyncio.sleep(self._DEBOUNCE_SEC)
+        except asyncio.CancelledError:
+            return   # 窗口内被更新的消息取代，直接放弃这条
+        try:
+            await self._process(session_key, receive_id, receive_id_type, message_id, text)
+        finally:
+            # 处理完清理自己（避免 _pending 无限增长）
+            if self._pending.get(session_key) is asyncio.current_task():
+                self._pending.pop(session_key, None)
+
+    async def _process(self, session_key, receive_id, receive_id_type, message_id, text):
+        """真正处理一条消息：命令 / 加表情 → 调 Agent → 回复 → 去表情。"""
         # 内置命令处理
         if text.strip() in ("/help", "帮助"):
             await self.client.send_text(
@@ -8496,13 +8616,15 @@ class MessageHandler:
             await self.client.send_text(receive_id, "对话历史已清除。", id_type=receive_id_type)
             return
 
-        # 添加"思考中"Emoji 反应
+        # 添加"处理中"Emoji 反应（OnIt 是飞书表示"正在处理"的合法枚举值，
+        # 大小写敏感；"Thinking" 不是合法值，会返回 231001 reaction type is invalid）
         reaction_id = None
         try:
-            reaction_resp = await self.client.add_reaction(message_id, "Thinking")
+            reaction_resp = await self.client.add_reaction(message_id, "OnIt")
             reaction_id = reaction_resp.get("reaction_id")
-        except Exception:
-            pass   # Emoji 反应失败不影响主流程
+        except Exception as e:
+            # Emoji 反应失败不影响主流程，但要打日志（别静默吞掉，否则「没表情」极难排查）
+            print(f"[Handler] 添加处理中 Emoji 失败：{e}")
 
         # 调用 Agent
         try:
@@ -8512,7 +8634,7 @@ class MessageHandler:
             await self.client.send_text(receive_id, f"处理时遇到错误，请稍后重试。", id_type=receive_id_type)
             print(f"[Handler] 错误：{e}")
         finally:
-            # 移除"思考中"Emoji
+            # 移除"处理中"Emoji
             if reaction_id:
                 try:
                     await self.client.remove_reaction(message_id, reaction_id)
@@ -8524,6 +8646,19 @@ class MessageHandler:
 
 ## 12.5 WebSocket 管理器 `feishu/ws_manager.py`
 
+> **⚠️ 这一节有三个非踩不可的坑，踩中任意一个都会导致「飞书能发消息，但后端完全收不到」。** 坑 1、坑 3 不报错、极难排查，坑 2 报一句 `This event loop is already running` 也很误导。直接抄下面的最终版本，别按直觉写。
+
+**坑 1：`ws.Client.start()` 是同步阻塞方法，不能 `await`。**
+lark SDK 的 `ws.Client.start()` 内部自己 `loop.run_until_complete(...)`，它是一个**同步函数**（返回 `None`）。如果写成 `await ws_client.start()`，等于 `await None` → `TypeError`，**WebSocket 连接根本没建立**。正确做法是放到独立线程里跑，不阻塞 FastAPI 主 loop。
+
+**坑 2：lark 用模块级全局 loop，会和 FastAPI 主 loop 撞车。**
+lark 在 `import` 时就执行了 `loop = asyncio.get_event_loop()`（`lark_oapi/ws/client.py` 模块级），在主线程 import 就**抓住了 FastAPI 的主 loop**。即使把 `start()` 丢到线程里，它内部 `loop.run_until_complete(...)` 用的还是这个主 loop，于是报 `This event loop is already running`。正确做法是在工作线程里**新建一个线程私有 loop**，并**覆盖 lark 的模块级 loop 变量**，让 SDK 跑在这个独立 loop 上。
+
+**坑 3：SDK 用同步方式调用事件回调，`async def` 回调会被丢弃。**
+SDK 内部是 `processor.do(data)` **同步**调用你的回调，拿到协程对象后**从不 `await`**。所以如果 `_on_message` 写成 `async def`，它的函数体（`handle_event`）**永远不会执行**。正确做法是把 `_on_message` 写成**同步函数**，内部用 `asyncio.run_coroutine_threadsafe(...)` 把异步的 `handle_event` 投递回**主 event loop**执行（handler 用的 Redis/httpx 等资源都绑在主 loop）。
+
+> **两个 loop 各司其职**：lark 的 WebSocket 连接跑在**工作线程的私有 loop**（坑 2），业务处理 `handle_event` 跑在 **FastAPI 主 loop**（坑 3），靠 `run_coroutine_threadsafe` 在两者之间投递。
+
 ```python
 # feishu/ws_manager.py
 """
@@ -8531,8 +8666,25 @@ class MessageHandler:
 
 飞书的长连接（Long Connection）模式：你的服务主动连接飞书的 WebSocket 服务器，
 飞书有新消息时通过这条连接推送过来。
+
+三个必须注意的坑（否则后端收不到消息）：
+1. lark SDK 的 ws.Client.start() 是**同步阻塞**方法（内部自己 run_until_complete），
+   不能 await，要放到独立线程里跑，否则会阻塞/破坏 FastAPI 主 loop。
+2. lark 在 import 时用**模块级全局 loop**（lark_oapi.ws.client.loop = get_event_loop()），
+   在主线程 import 就抓住了 FastAPI 的主 loop。直接在线程里跑 start() 会报
+   "This event loop is already running"。必须在工作线程里新建一个**线程私有 loop**，
+   并覆盖 lark 模块的全局 loop 变量，让 SDK 的 run_until_complete 跑在这个独立 loop 上。
+3. SDK 用**同步方式**调用事件回调（processor.do(data)，不会 await 协程）。而我们的
+   handle_event 是 async 的，所以回调里要用 run_coroutine_threadsafe 把协程投递回
+   主 event loop 执行——直接 async def 回调会被 SDK 丢弃，body 永不执行。
 """
+import asyncio
+import json
+
 import lark_oapi as lark
+import lark_oapi.ws.client as lark_ws_client
+from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+
 from .client import FeishuClient
 from .handler import MessageHandler
 from core.config import settings
@@ -8543,20 +8695,22 @@ class FeishuWSManager:
     def __init__(self):
         self._client_http = FeishuClient()
         self._handler = MessageHandler(self._client_http)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # event_id 去重：在同步回调里做（单线程，无并发穿透）。飞书会重推同一条消息，
+        # 尤其当回调 ACK 慢的时候——所以既要秒 ACK，也要在这里挡住重推。
+        self._seen_events: set[str] = set()
 
     async def start(self):
         """启动飞书 WebSocket 长连接，开始接收事件。"""
+        # 记住主 event loop：SDK 的回调跑在别的线程，要靠它把协程调度回来
+        self._loop = asyncio.get_running_loop()
 
-        # 使用飞书 SDK 创建 WebSocket 客户端
-        cli = lark.Client.builder() \
-            .app_id(settings.feishu_app_id) \
-            .app_secret(settings.feishu_app_secret) \
+        # 注册事件处理器（无加密：encrypt_key 和 verification_token 传空字符串）
+        event_dispatcher = (
+            lark.EventDispatcherHandler.builder("", "")
+            .register_p2_im_message_receive_v1(self._on_message)
             .build()
-
-        # 注册事件处理器
-        event_dispatcher = lark.EventDispatcherHandler.builder(
-            lark.ENCRYPT_KEY_SETTING_NO_ENCRYPTED, ""
-        ).register_p2_im_message_receive_v1(self._on_message).build()
+        )
 
         ws_client = lark.ws.Client(
             settings.feishu_app_id,
@@ -8564,46 +8718,111 @@ class FeishuWSManager:
             event_handler=event_dispatcher,
         )
 
-        print("[Feishu] WebSocket 连接已建立，等待消息...")
-        await ws_client.start()   # 阻塞，持续监听
+        print("[Feishu] WebSocket 连接建立中，等待消息...")
+        # 在独立线程里跑：线程内建一个私有 loop 并覆盖 lark 的模块级 loop，
+        # 避免和 FastAPI 主 loop 冲突（This event loop is already running）
+        await asyncio.to_thread(self._run_ws_blocking, ws_client)
 
-    async def _on_message(self, data):
-        """收到飞书消息事件时的回调。"""
+    def _run_ws_blocking(self, ws_client) -> None:
+        """在工作线程里以线程私有 loop 运行 lark 的同步阻塞 start()。"""
+        thread_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(thread_loop)
+        # 关键：覆盖 lark 模块级全局 loop，让 SDK 内部 run_until_complete 用这个私有 loop
+        lark_ws_client.loop = thread_loop
         try:
-            await self._handler.handle_event(data.to_dict())
+            ws_client.start()   # 同步阻塞，持续监听
+        finally:
+            thread_loop.close()
+
+    def _on_message(self, data: P2ImMessageReceiveV1) -> None:
+        """
+        收到飞书消息事件时的回调（SDK 在独立线程里同步调用）。
+
+        这里是同步函数——SDK 不会 await 协程。关键点：
+        - 必须**立刻返回**（不等 handle_event 跑完），否则 lark 迟迟不向飞书 ACK，
+          飞书判定推送失败会重推同一条消息 → 一条消息被处理多次。
+        - event_id 去重在这里做：本回调是 SDK 单线程串行调用，不会有并发穿透。
+        - 用 run_coroutine_threadsafe 把 handle_event 投递回主 loop，但**不 result()**（fire-and-forget）。
+        """
+        try:
+            # P2ImMessageReceiveV1 是对象，先 marshal 成 JSON 再转回 dict，
+            # 这样 handler 里 event_data.get("header", {}).get("event_type") 才拿得到值
+            payload = json.loads(lark.JSON.marshal(data))
+
+            # event_id 去重：挡住飞书的重推（同步单线程，安全）
+            event_id = payload.get("header", {}).get("event_id", "")
+            if event_id:
+                if event_id in self._seen_events:
+                    return
+                self._seen_events.add(event_id)
+                if len(self._seen_events) > 10000:
+                    self._seen_events.clear()
+
+            # fire-and-forget：投递到主 loop 后立刻返回，让 lark 秒 ACK
+            asyncio.run_coroutine_threadsafe(
+                self._handler.handle_event(payload),
+                self._loop,
+            )
         except Exception as e:
-            print(f"[Feishu] 事件处理失败：{e}")
+            print(f"[Feishu] 事件投递失败：{e}")
 ```
+
+> **为什么 `_on_message` 用 `lark.JSON.marshal(data)` 而不是 `data.to_dict()`？** 回调收到的是 `P2ImMessageReceiveV1` 对象，它的 `header` / `event` 是嵌套对象而非 dict。用 SDK 的 `lark.JSON.marshal()` 序列化成 JSON 字符串、再 `json.loads` 转回 dict，才能得到 `handler.py` 里 `event_data.get("header", {}).get("event_type")` 所依赖的标准结构。
+
+> **⚠️ 为什么回调不能 `future.result()`？** 早期写法在回调里 `future.result()` **阻塞等** `handle_event` 全跑完（调 LLM 可能好几秒）才返回。但 lark 要等回调返回才向飞书 ACK，而**飞书的 ACK 超时只有几秒**——等不到就判定推送失败、**重推同一条消息**，于是「发 1 条被回复 2 次」。所以回调必须 fire-and-forget 秒 ACK，重推则靠上面的 event_id 去重挡住。
 
 ---
 
 ## 12.6 在 FastAPI 启动时连接飞书
 
+飞书 WebSocket 不是单独的 lifespan，而是**融进第 11 章那个已有的 `lifespan`**——
+在 Redis 恢复、常驻 Swarm Agent、后台备份任务都启动之后再拉起，关闭时最先取消。
+只有配置了 `feishu_app_id` + `feishu_app_secret` 才启动，没配就整段跳过（不影响
+纯 HTTP / CLI 部署）：
+
 ```python
-# main.py 的 lifespan 里添加
+# main.py 的 lifespan（在第 11 章版本上补充飞书部分，其余逻辑不变）
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import asyncio
+    global _swarm_save_task
 
-    # 启动飞书 WebSocket（在后台任务里运行，不阻塞主服务）
+    setup_logging()
+    setup_tracing(service_name="my-agent", otlp_endpoint=settings.otel_exporter_otlp_endpoint or None)
+
+    workspace = get_workspace()
+    workspace.mkdir(parents=True, exist_ok=True)
+    logger.info("server_starting")
+    logger.info("workspace_ready", workspace=str(workspace))
+
+    # 1~3. Redis 恢复 / 常驻 Swarm Agent / 后台备份（第 11 章逻辑，此处省略）
+    ...
+
+    # 4. 启动飞书 WebSocket（配了 App ID/Secret 才启动），后台任务运行，不阻塞主服务
     feishu_task = None
     if settings.feishu_app_id and settings.feishu_app_secret:
         from feishu.ws_manager import FeishuWSManager
         ws_manager = FeishuWSManager()
         feishu_task = asyncio.create_task(ws_manager.start())
-        print("[Main] 飞书 WebSocket 已启动")
+        logger.info("feishu_ws_started")
 
     yield
 
-    # 关闭时取消飞书任务
+    # 5. 收尾：先取消飞书任务，再停 Swarm Agent / 备份任务 / 关闭连接（第 11 章逻辑）
     if feishu_task:
         feishu_task.cancel()
         try:
             await feishu_task
         except asyncio.CancelledError:
             pass
+
+    # ... 停 Swarm Agent、停备份、save_to_redis、close（第 11 章逻辑，此处省略）
+    logger.info("server_shutdown")
 ```
+
+> **两个提醒**：① `asyncio` 已在 `main.py` 顶部 import，不要在 lifespan 里再局部
+> `import asyncio`；② 日志用项目统一的 `logger.info("feishu_ws_started")`（结构化 JSON，
+> 能被 Loki 采集），不要用 `print`。
 
 ---
 
@@ -8614,19 +8833,33 @@ async def lifespan(app: FastAPI):
 
 □ 飞书应用已启用机器人功能，已申请 im:message 读写权限
 
-□ 服务启动时看到"飞书 WebSocket 已启动"的日志
+□ 服务启动时看到 {"event": "feishu_ws_started", ...} 和 [Feishu] WebSocket 连接建立中 的日志
 
 □ 私聊机器人能收到回复
 
+□ （排查「发消息后端完全收不到」）先自查 12.5 的三个坑：
+  - ws_client.start() 是否误写成 await（应放到独立线程跑，不 await）
+  - 启动是否报 "This event loop is already running"（应在工作线程建私有 loop
+    并覆盖 lark_ws_client.loop）
+  - _on_message 是否误写成 async def（应为同步函数 + run_coroutine_threadsafe）
+
 □ 群聊 @机器人能收到回复
 
-□ 发消息时出现"思考中"💭 Emoji，回复后消失
+□ 发消息时出现"处理中"👌 Emoji（OnIt），回复后消失
+  （如果没出现：看日志有没有 231001 reaction type is invalid——emoji_type 用错了；
+   emoji_type 是大小写敏感的固定枚举，见 12.3 的合法值说明）
 
 □ /help 命令返回帮助文字
 
 □ /clear 命令清除会话历史，下次对话 Agent 不再记得之前内容
 
-□ 消息去重生效（快速发两条同样的消息，只处理一次）
+□ event_id 去重生效（飞书重推同一条消息，只处理一次）——去重在 12.5 的同步回调里做
+
+□ 连发多条消息不乱序、不重复回复：
+  - 快速连发 3 条不同消息，只回复最新那一条（latest-wins 防抖，见 12.4 的 _DEBOUNCE_SEC）
+  - 不会出现「发 3 条回 4 条」（说明回调已 fire-and-forget、飞书不再因 ACK 超时重推）
+
+□ 回调不阻塞：_on_message 里没有 future.result()（否则 ACK 慢会触发飞书重推）
 ```
 
 ---
@@ -8645,10 +8878,11 @@ my-agent/
 ├── docker-compose.yml
 ├── prometheus.yml       ← Prometheus 抓取配置
 ├── tempo.yaml           ← Tempo 链路存储配置
+├── promtail-config.yaml ← Promtail 日志采集配置（推给 Loki）
 ├── grafana/
 │   └── provisioning/
 │       └── datasources/
-│           └── datasources.yaml   ← Grafana 数据源自动配置（Prometheus + Tempo）
+│           └── datasources.yaml   ← Grafana 数据源自动配置（Prometheus + Tempo + Loki）
 ├── entrypoint.sh
 ├── .env.shared          ← 所有环境共用的配置
 ├── .env.dev             ← 开发环境配置（热重载）
@@ -8810,7 +9044,7 @@ services:
       - "--storage.tsdb.path=/prometheus"
     restart: unless-stopped
 
-  # ── Grafana 可视化（同时看指标 Prometheus + 链路 Tempo）───────────
+  # ── Grafana 可视化（一处看齐：指标 Prometheus + 链路 Tempo + 日志 Loki）─
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
@@ -8823,12 +9057,13 @@ services:
       - GF_FEATURE_TOGGLES_ENABLE=traceToMetrics
     volumes:
       - grafana_data:/var/lib/grafana
-      # 数据源自动配置：容器启动时自动连好 Prometheus 和 Tempo，无需手动点界面
+      # 数据源自动配置：容器启动时自动连好 Prometheus / Tempo / Loki，无需手动点界面
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
     restart: unless-stopped
     depends_on:
       - prometheus
       - tempo
+      - loki
 
   # ── Tempo 链路追踪（存储后端，UI 走 Grafana）─────────────────────
   tempo:
@@ -8843,16 +9078,44 @@ services:
       - tempo_data:/var/tempo
     restart: unless-stopped
 
+  # ── Loki 日志存储（存储后端，UI 走 Grafana）─────────────────────
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]  # 用镜像自带默认配置即可
+    ports:
+      - "3100:3100"                  # Loki HTTP API（Promtail 推日志 + Grafana 查询都走这里）
+    volumes:
+      - loki_data:/loki
+    restart: unless-stopped
+
+  # ── Promtail 日志采集器（读容器 stdout，推给 Loki）──────────────
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    command: ["-config.file=/etc/promtail/config.yaml"]
+    volumes:
+      - ./promtail-config.yaml:/etc/promtail/config.yaml
+      # 读取宿主机上的容器日志（Docker 把每个容器 stdout 写成 json-file）
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+    depends_on:
+      - loki
+
 volumes:
   redis_data:
   prometheus_data:
   grafana_data:
   tempo_data:
+  loki_data:
 ```
 
-> **镜像清单**（共 5 个）：`python:3.11-slim`（Dockerfile FROM） + `redis:7-alpine`（会话缓存） + `prom/prometheus:latest`（指标抓取） + `grafana/grafana:latest`（指标 + 链路可视化） + `grafana/tempo:latest`（链路追踪存储）。其中 `my-agent:latest` 是通过 Dockerfile `build` 生成的，不是外部镜像。
+> **镜像清单**（共 7 个）：`python:3.11-slim`（Dockerfile FROM） + `redis:7-alpine`（会话缓存） + `prom/prometheus:latest`（指标抓取） + `grafana/grafana:latest`（统一可视化） + `grafana/tempo:latest`（链路存储） + `grafana/loki:latest`（日志存储） + `grafana/promtail:latest`（日志采集）。其中 `my-agent:latest` 是通过 Dockerfile `build` 生成的，不是外部镜像。
 >
-> **Tempo 没有独立 UI**：它只负责接收（4317）和存储（3200 供查询）链路数据，查看链路统一走 Grafana。所以对比第 11 章的 Jaeger 方案，这里少了一个 `16686` UI 端口，多了一个 `3200` 查询端口和 Grafana 数据源。
+> **Tempo / Loki 都没有独立 UI**：它们只是存储后端，查看统一走 Grafana。Tempo 收链路（4317）、供查询（3200）；Loki 收日志 + 供查询都走同一个端口（3100）。
+>
+> **Promtail 为什么要挂载 docker.sock 和 containers 目录？** Docker 默认把每个容器的 stdout 写成宿主机上的 json-file 日志文件，Promtail 需要读到这些文件、并通过 `docker.sock` 拿到容器名/标签，才能把日志打上 `container` 标签推给 Loki。两个挂载都是**只读（`:ro`）**，Promtail 不会改动它们。
 
 **项目根目录下创建 `prometheus.yml`**（与 `docker-compose.yml` 同级）：
 
@@ -8911,9 +9174,40 @@ storage:
 
 ---
 
-### 13.5.2 Grafana 数据源自动配置（免手动点界面）
+### 13.5.2 `promtail-config.yaml`（日志采集配置，与 `docker-compose.yml` 同级）
 
-第 11 章检查清单里「打开 Grafana 手动添加 Prometheus 数据源」这一步，可以用 Grafana 的 **provisioning** 机制自动完成——把数据源写进一个 YAML 文件，Grafana 启动时自动加载。这样 `docker compose up` 之后，Prometheus 和 Tempo 两个数据源就已经连好了。
+Loki 用镜像自带的默认配置就能跑，不需要额外文件。真正要配的是采集器 **Promtail**——告诉它「读哪里的日志」「推给谁」。下面这份配置用 Docker 服务发现，自动采集所有容器的 stdout：
+
+```yaml
+# promtail-config.yaml
+server:
+  http_listen_port: 9080
+
+positions:
+  filename: /tmp/positions.yaml   # 记录读到哪了，重启不重复采集
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push   # 推给 Loki（Docker 网络内用服务名）
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:              # 通过 docker.sock 自动发现所有容器
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # 把容器名提取成 container 标签，查询时可按容器过滤
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: container
+```
+
+> **验证日志被 JSON 解析**：本项目日志本身就是 JSON（第 11 章），进入 Grafana 后在 Loki 查询里加一个 `| json` 管道（见 13.7.1），就能把 `session_id`、`event`、`level` 等字段拆出来单独过滤。Promtail 这里不需要预先解析 JSON，交给查询时按需展开更灵活。
+
+---
+
+### 13.5.3 Grafana 数据源自动配置（免手动点界面）
+
+第 11 章检查清单里「打开 Grafana 手动添加 Prometheus 数据源」这一步，可以用 Grafana 的 **provisioning** 机制自动完成——把数据源写进一个 YAML 文件，Grafana 启动时自动加载。这样 `docker compose up` 之后，Prometheus、Tempo、Loki 三个数据源就已经连好了。
 
 **创建 `grafana/provisioning/datasources/datasources.yaml`**（注意目录层级，`docker-compose.yml` 里挂载的就是这个路径）：
 
@@ -8941,14 +9235,21 @@ datasources:
       # 服务依赖图需要的节点/边指标
       serviceMap:
         datasourceUid: prometheus
+
+  # ── 日志：Loki ────────────────────────────────────────────────
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100            # 连 Loki 的 HTTP 查询端口
 ```
 
-> **目录结构**：完成后项目根目录多出这样一个文件夹：
+> **目录结构**：完成后项目根目录多出这些配置文件：
 > ```
 > my-agent/
 > ├── docker-compose.yml
 > ├── prometheus.yml
 > ├── tempo.yaml
+> ├── promtail-config.yaml
 > └── grafana/
 >     └── provisioning/
 >         └── datasources/
@@ -8970,9 +9271,14 @@ LLM_PROVIDER=anthropic
 LLM_MODEL=claude-sonnet-4-6
 APP_PORT=8002
 
+# 工作目录（第 0 章）——容器内所有工具/子 Agent 的文件操作都限定在此目录内
+WORKSPACE=/app/workspace
+
 # OpenTelemetry 链路追踪导出地址（第 11 章）——推送到 Tempo 的 OTLP gRPC 端口
 OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
 ```
+
+> **Docker 里的工作目录**：容器 `WORKDIR` 是 `/app`（第 13.3 节 Dockerfile），这里把工作区设为 `/app/workspace` 与代码目录分开。如果希望工作区数据在容器重建后不丢失，可以在 `docker-compose.yml` 的 agent 服务里加一个卷映射 `./workspace:/app/workspace`（和已有的 `./sessions:/app/sessions` 同理）。
 
 **`.env.dev`（开发环境）：**
 
@@ -9044,15 +9350,16 @@ curl -X POST http://localhost:8002/ask \
 
 ---
 
-## 13.7.1 在 Grafana 里查看指标和链路
+## 13.7.1 在 Grafana 里查看指标、链路和日志
 
 启动后所有可观测性数据都在一个 Grafana 界面查看，登录信息：`http://localhost:3000`，账号密码都是 `admin`（首次登录会要求改密码，本地可跳过）。
 
 **① 确认数据源已自动连好**
 
-`Connections → Data Sources`，应该看到 provisioning 自动创建的两个数据源：
+`Connections → Data Sources`，应该看到 provisioning 自动创建的三个数据源：
 - **Prometheus**（`http://prometheus:9090`）——指标
 - **Tempo**（`http://tempo:3200`）——链路
+- **Loki**（`http://loki:3100`）——日志
 
 各自点进去拉到底 `Save & test`，看到绿色 "successfully" 即连接正常。如果这里是空的，说明 `grafana/provisioning/datasources/datasources.yaml` 没挂载进去，检查 `docker-compose.yml` 的 volumes 路径和文件是否存在，然后 `docker compose restart grafana`。
 
@@ -9075,6 +9382,28 @@ curl -X POST http://localhost:8002/ask \
 - `active_requests` —— 当前活跃请求数
 
 需要长期看板可以在 `Dashboards → New` 里把这些指标做成图表面板。
+
+**④ 查看日志（Loki）**
+
+同样在 `Explore`，数据源切到 **Loki**，用 LogQL 查询。因为本项目日志是 JSON，加 `| json` 就能把字段拆出来精确过滤：
+
+```logql
+# 只看 agent 容器的日志
+{container="agent"}
+
+# 拆出 JSON 字段后，只看 warning 及以上级别
+{container="agent"} | json | level=~"warning|error"
+
+# 追踪某一次请求的完整日志（就是上一个问题里排查时间线的做法）
+{container="agent"} | json | session_id="49da725d-176f-4e35-8f6c-e2cb3bfa379a"
+
+# 只看 Redis 连接失败
+{container="agent"} | json | event=~"session_store_redis.*"
+```
+
+> **三件套联动**：因为日志、链路、指标都在同一个 Grafana，排查问题时可以从一条指标异常（Prometheus 看到延迟飙高）→ 跳到对应时间段的日志（Loki 按 `session_id` 过滤）→ 再跳到那次请求的链路火焰图（Tempo 看哪个 Span 最慢），一条龙定位根因。
+
+需要长期看板可以在 `Dashboards → New` 里把指标图表和日志面板放到同一个 dashboard。
 
 ---
 
@@ -9111,6 +9440,18 @@ A：按顺序排查：
 3. `docker compose logs tempo` 看 Tempo 是否正常启动、有没有报 `tempo.yaml` 配置错误。
 4. Tempo 有几秒的 ingester 缓冲，发完请求稍等几秒再刷新查询。
 
+**Q：Grafana Loki 里查不到任何日志？**
+
+A：日志链路是 `agent 打到 stdout → Promtail 采集 → 推给 Loki`，逐段排查：
+1. `docker compose logs agent` 本身能看到 JSON 日志吗？看不到说明 agent 没往 stdout 打日志（检查 `setup_logging()` 是否调用）。
+2. `docker compose logs promtail` 有没有报错？常见是挂载路径不对——确认 `/var/lib/docker/containers` 和 `/var/run/docker.sock` 都挂进去了。
+3. Loki 数据源 URL 要填 `http://loki:3100`；LogQL 至少要有一个标签选择器，直接输 `| json` 会报错，正确写法是 `{container="agent"} | json`。
+4. 容器名标签可能不是 `agent` 而是 `my-agent-agent-1` 之类，先用 `{container=~".+"}` 列出全部，确认实际标签值再精确过滤。
+
+**Q：Promtail 挂载 docker.sock 报权限错误？**
+
+A：宿主机上 `/var/run/docker.sock` 属于 root/docker 组。本指南容器以默认用户跑、且用户是 root，通常能读；如果宿主机做了严格权限隔离，可给 promtail 服务加 `user: root` 或把当前用户加入 docker 组。
+
 ---
 
 ## 13.9 本章检查清单
@@ -9118,7 +9459,8 @@ A：按顺序排查：
 ```
 □ Dockerfile 构建成功（docker build -t my-agent . 无报错）
 
-□ docker compose up 能正常启动（5 个服务都变成 running：agent + redis + prometheus + grafana + tempo）
+□ docker compose up 能正常启动（7 个服务都变成 running：
+  agent + redis + prometheus + grafana + tempo + loki + promtail）
 
 □ redis 服务健康检查通过（docker compose ps 显示 healthy）
 
@@ -9128,11 +9470,14 @@ A：按顺序排查：
 
 □ 打开 http://localhost:9090 → Status → Targets，polycoder 状态为 UP
 
-□ 打开 http://localhost:3000 → Connections → Data Sources，Prometheus 和 Tempo 两个数据源
+□ 打开 http://localhost:3000 → Connections → Data Sources，Prometheus / Tempo / Loki 三个数据源
   已自动出现（provisioning 生效），各自点 "Test" 均通过
 
 □ 打开 http://localhost:3000 → Explore → 选择 Tempo 数据源 → Search，能搜到链路数据
   （需先发几次 /ask 请求；Tempo 没有独立 UI，链路只在 Grafana 里看）
+
+□ 打开 http://localhost:3000 → Explore → 选择 Loki 数据源 → 输入 {container="agent"} | json，
+  能看到结构化日志，且可按 session_id / level / event 字段过滤
 
 □ 发送问题能得到回答（end-to-end 验证）
 

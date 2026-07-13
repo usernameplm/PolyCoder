@@ -23,9 +23,17 @@ class Settings(BaseSettings):
     redis_host: str = "localhost"
     redis_port: int = 6379
 
+    # 飞书机器人（第 12 章）
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+
     # 通用
     llm_model: str = "claude-sonnet-4-6"
     app_port: int = 8002
+
+    # 工作目录：所有工具（读/写/搜索/执行）和子 Agent 的文件操作都限定在此目录内，
+    # 且禁止路径穿越到目录外。启动时用环境变量 WORKSPACE 覆盖，默认当前目录。
+    workspace: str = "."
 
     # 可观测性：OpenTelemetry 链路追踪导出地址（Jaeger/Tempo 等），不填则不导出
     otel_exporter_otlp_endpoint: str = ""
