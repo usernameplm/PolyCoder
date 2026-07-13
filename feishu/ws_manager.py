@@ -26,6 +26,7 @@ from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 from .client import FeishuClient
 from .handler import MessageHandler
 from core.config import settings
+from observability.logging import logger
 
 
 class FeishuWSManager:
@@ -56,7 +57,7 @@ class FeishuWSManager:
             event_handler=event_dispatcher,
         )
 
-        print("[Feishu] WebSocket 连接建立中，等待消息...")
+        logger.info("feishu_ws_connecting")
         # 在独立线程里跑：线程内建一个私有 loop 并覆盖 lark 的模块级 loop，
         # 避免和 FastAPI 主 loop 冲突（This event loop is already running）
         await asyncio.to_thread(self._run_ws_blocking, ws_client)
@@ -102,4 +103,4 @@ class FeishuWSManager:
                 self._loop,
             )
         except Exception as e:
-            print(f"[Feishu] 事件投递失败：{e}")
+            logger.error("feishu_event_dispatch_failed", error=str(e))

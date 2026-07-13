@@ -8163,6 +8163,8 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.resources import Resource
 
+from observability.logging import logger   # setup_logging 先于 setup_tracing 调用，此时 logger 已配置
+
 
 def setup_tracing(service_name: str = "my-agent", otlp_endpoint: str | None = None):
     """
@@ -8179,9 +8181,9 @@ def setup_tracing(service_name: str = "my-agent", otlp_endpoint: str | None = No
             from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
             exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
             provider.add_span_processor(BatchSpanProcessor(exporter))
-            print(f"[Tracing] 链路追踪已启动，导出到：{otlp_endpoint}")
+            logger.info("tracing_enabled", otlp_endpoint=otlp_endpoint)
         except ImportError:
-            print("[Tracing] 未安装 opentelemetry-exporter-otlp，链路数据不导出")
+            logger.warning("tracing_exporter_missing", hint="未安装 opentelemetry-exporter-otlp，链路数据不导出")
 
     trace.set_tracer_provider(provider)
 
@@ -8550,6 +8552,7 @@ import asyncio
 import json
 from .client import FeishuClient
 from coordinator.agent import CoordinatorAgent, clear_session   # 传 session_id 就是带记忆的调用
+from observability.logging import logger
 
 
 class MessageHandler:
@@ -8654,7 +8657,7 @@ class MessageHandler:
             reaction_id = reaction_resp.get("reaction_id")
         except Exception as e:
             # Emoji 反应失败不影响主流程，但要打日志（别静默吞掉，否则「没表情」极难排查）
-            print(f"[Handler] 添加处理中 Emoji 失败：{e}")
+            logger.warning("feishu_add_reaction_failed", session_id=session_key, error=str(e))
 
         # 调用 Agent
         try:
@@ -8663,7 +8666,7 @@ class MessageHandler:
             await self.client.send_markdown(receive_id, result.text, id_type=receive_id_type)
         except Exception as e:
             await self.client.send_text(receive_id, f"处理时遇到错误，请稍后重试。", id_type=receive_id_type)
-            print(f"[Handler] 错误：{e}")
+            logger.error("feishu_handle_message_failed", session_id=session_key, error=str(e))
         finally:
             # 移除"处理中"Emoji
             if reaction_id:
@@ -8719,6 +8722,7 @@ from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 from .client import FeishuClient
 from .handler import MessageHandler
 from core.config import settings
+from observability.logging import logger
 
 
 class FeishuWSManager:
@@ -8749,7 +8753,7 @@ class FeishuWSManager:
             event_handler=event_dispatcher,
         )
 
-        print("[Feishu] WebSocket 连接建立中，等待消息...")
+        logger.info("feishu_ws_connecting")
         # 在独立线程里跑：线程内建一个私有 loop 并覆盖 lark 的模块级 loop，
         # 避免和 FastAPI 主 loop 冲突（This event loop is already running）
         await asyncio.to_thread(self._run_ws_blocking, ws_client)
@@ -8795,7 +8799,7 @@ class FeishuWSManager:
                 self._loop,
             )
         except Exception as e:
-            print(f"[Feishu] 事件投递失败：{e}")
+            logger.error("feishu_event_dispatch_failed", error=str(e))
 ```
 
 > **为什么 `_on_message` 用 `lark.JSON.marshal(data)` 而不是 `data.to_dict()`？** 回调收到的是 `P2ImMessageReceiveV1` 对象，它的 `header` / `event` 是嵌套对象而非 dict。用 SDK 的 `lark.JSON.marshal()` 序列化成 JSON 字符串、再 `json.loads` 转回 dict，才能得到 `handler.py` 里 `event_data.get("header", {}).get("event_type")` 所依赖的标准结构。
@@ -8864,7 +8868,7 @@ async def lifespan(app: FastAPI):
 
 □ 飞书应用已启用机器人功能，已申请 im:message 读写权限
 
-□ 服务启动时看到 {"event": "feishu_ws_started", ...} 和 [Feishu] WebSocket 连接建立中 的日志
+□ 服务启动时看到 {"event": "feishu_ws_started", ...} 和 {"event": "feishu_ws_connecting", ...} 的日志
 
 □ 私聊机器人能收到回复
 
@@ -12072,6 +12076,7 @@ touch tools/document_loaders/__init__.py          # macOS/Linux
 
 from tools.base import BaseTool
 from providers.types import ToolDefinition
+from observability.logging import logger
 
 
 class ToolRegistry:
@@ -12082,7 +12087,7 @@ class ToolRegistry:
     def register(self, tool: BaseTool) -> None:
         """注册一个工具。工具名重复时会覆盖旧的。"""
         self._tools[tool.name] = tool
-        print(f"  [Registry] 注册工具：{tool.name}")
+        logger.info("tool_registered", tool_name=tool.name)
 
     def get(self, name: str) -> BaseTool | None:
         """按名字查找工具，找不到返回 None。"""
@@ -12952,7 +12957,8 @@ async def run_agent_loop(
 把执行过程改成逐个计时：
 
 ```python
-        print(f"  [Loop] 第 {state.turn_count} 轮，执行 {len(tool_calls)} 个工具调用")
+        # loop.py 顶部已 from observability.logging import logger
+        logger.info("loop_turn_tools", turn=state.turn_count, tool_count=len(tool_calls))
 
         # 逐个执行工具并记录耗时（并发执行，各自计时）
         import asyncio as _asyncio

@@ -11,6 +11,7 @@ import asyncio
 import json
 from .client import FeishuClient
 from coordinator.agent import CoordinatorAgent, clear_session   # 传 session_id 就是带记忆的调用
+from observability.logging import logger
 
 
 class MessageHandler:
@@ -115,7 +116,7 @@ class MessageHandler:
             reaction_id = reaction_resp.get("reaction_id")
         except Exception as e:
             # Emoji 反应失败不影响主流程，但要打日志（常见原因：没申请 im:message.reaction 权限）
-            print(f"[Handler] 添加处理中 Emoji 失败：{e}")
+            logger.warning("feishu_add_reaction_failed", session_id=session_key, error=str(e))
 
         # 调用 Agent
         try:
@@ -124,7 +125,7 @@ class MessageHandler:
             await self.client.send_markdown(receive_id, result.text, id_type=receive_id_type)
         except Exception as e:
             await self.client.send_text(receive_id, f"处理时遇到错误，请稍后重试。", id_type=receive_id_type)
-            print(f"[Handler] 错误：{e}")
+            logger.error("feishu_handle_message_failed", session_id=session_key, error=str(e))
         finally:
             # 移除"处理中"Emoji
             if reaction_id:

@@ -13,6 +13,8 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.resources import Resource
 
+from observability.logging import logger
+
 
 def setup_tracing(service_name: str = "my-agent", otlp_endpoint: str | None = None):
     """
@@ -29,9 +31,9 @@ def setup_tracing(service_name: str = "my-agent", otlp_endpoint: str | None = No
             from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
             exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
             provider.add_span_processor(BatchSpanProcessor(exporter))
-            print(f"[Tracing] 链路追踪已启动，导出到：{otlp_endpoint}")
+            logger.info("tracing_enabled", otlp_endpoint=otlp_endpoint)
         except ImportError:
-            print("[Tracing] 未安装 opentelemetry-exporter-otlp，链路数据不导出")
+            logger.warning("tracing_exporter_missing", hint="未安装 opentelemetry-exporter-otlp，链路数据不导出")
 
     trace.set_tracer_provider(provider)
 
