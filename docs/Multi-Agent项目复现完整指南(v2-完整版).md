@@ -8913,6 +8913,7 @@ async def lifespan(app: FastAPI):
 ```
 my-agent/
 ├── Dockerfile
+├── .dockerignore        ← 构建时排除 .venv / 缓存等，避免污染镜像、加快构建
 ├── docker-compose.yml
 ├── prometheus.yml       ← Prometheus 抓取配置
 ├── tempo.yaml           ← Tempo 链路存储配置
@@ -8922,9 +8923,7 @@ my-agent/
 │       └── datasources/
 │           └── datasources.yaml   ← Grafana 数据源自动配置（Prometheus + Tempo + Loki）
 ├── entrypoint.sh
-├── .env.shared          ← 所有环境共用的配置
-├── .env.dev             ← 开发环境配置（热重载）
-└── .env.prod            ← 生产环境配置（多 worker）
+└── .env.docker          ← Docker 部署用的唯一环境配置（本地开发用 .env）
 ```
 
 ---
@@ -8948,28 +8947,35 @@ my-agent/
 
 ## 13.3 `Dockerfile`
 
+本项目用 **uv** 管理依赖（`pyproject.toml` + `uv.lock`），所以 Dockerfile 基于 uv 官方镜像、用 `uv sync` 按锁文件精确安装，而不是 `pip install requirements.txt`。这样容器里装的依赖版本和本地 `uv.lock` 完全一致，也不用再单独维护 `requirements.txt`。
+
 ```dockerfile
 # Dockerfile
 
-# 使用官方 Python 3.11 slim 镜像（slim 是最小版本，去掉了不需要的工具）
-FROM python:3.11-slim
+# 使用 uv 官方镜像（自带 uv + Python 3.14，和 .python-version / pyproject 的 requires-python 一致）
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim
 
 # 设置工作目录
 WORKDIR /app
 
-# 设置 Python 不生成 .pyc 文件（容器里不需要）
+# 设置 Python 不生成 .pyc 文件（容器里不需要）；输出不缓冲（日志实时可见）
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+# 用国内镜像加速依赖下载
+ENV UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 先复制依赖文件（利用 Docker 层缓存：依赖没变时不重新安装）
-COPY requirements.txt .
+# 先只复制依赖清单，利用 Docker 层缓存（依赖没变时不重装）
+COPY pyproject.toml uv.lock ./
 
-# 安装依赖（--no-cache-dir 减小镜像大小）
-RUN pip install --no-cache-dir -r requirements.txt \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 按 uv.lock 精确安装依赖到 .venv（--frozen 不改锁文件；--no-install-project 此时还没复制项目代码；
+# --no-dev 不装 dev 依赖组，如 pytest）
+RUN uv sync --frozen --no-install-project --no-dev
 
 # 再复制应用代码（代码改动时只需重新构建这一层，依赖层缓存有效）
 COPY . .
+
+# 把项目本身也装进环境（此时代码已就位）
+RUN uv sync --frozen --no-dev
 
 # 暴露服务端口（声明意图，实际映射在 docker-compose.yml 里）
 EXPOSE 8002
@@ -8980,6 +8986,32 @@ RUN chmod +x entrypoint.sh
 # 启动命令
 ENTRYPOINT ["./entrypoint.sh"]
 ```
+
+> **两次 `uv sync` 是为了层缓存**：第一次只装第三方依赖（代码没复制，改代码不会让这层失效）；第二次在复制代码后把项目本身装进环境。依赖没变时，第一次那层直接命中缓存，重建镜像很快。
+>
+> **`uv run` 前缀**：依赖装在 `.venv` 里，所以 `entrypoint.sh` 启动命令要用 `uv run uvicorn ...`（见 13.4），让 uv 用虚拟环境里的 uvicorn；直接 `uvicorn ...` 会找不到命令。
+
+### 13.3.1 `.dockerignore`
+
+`COPY . .` 会把整个项目目录复制进镜像。本地的 `.venv/`（可能几百 MB，且是为本机 Python 构建的，进容器无用甚至冲突）、`__pycache__`、`.git` 等都不该进镜像——用 `.dockerignore` 排除，既加快构建又减小镜像：
+
+```gitignore
+# .dockerignore
+.venv/
+__pycache__/
+*.pyc
+.git/
+.pytest_cache/
+sessions/
+workspace/
+logs/
+.env
+.env.*
+*.md
+.vscode/
+```
+
+> **关键是排除 `.venv/`**：uv 在容器内会用 `uv sync` 重新创建 `.venv`，本地那份必须挡在镜像外，否则可能覆盖容器内正确的依赖。`.env*` 也排除——密钥通过 docker-compose 的 `env_file` 注入，不打进镜像。
 
 ---
 
@@ -8992,14 +9024,14 @@ ENTRYPOINT ["./entrypoint.sh"]
 set -e   # 任何命令失败就退出
 
 echo "=== My Agent 服务启动 ==="
-echo "环境：${ENV:-dev}"
 echo "Provider：${LLM_PROVIDER:-anthropic}"
 
 # 等待 Redis 就绪（最多等 30 秒）
+# 用 uv run python + redis 库探活，不依赖 redis-cli（uv slim 镜像没装它）
 if [ -n "${REDIS_HOST}" ]; then
     echo "等待 Redis 就绪..."
     for i in $(seq 1 30); do
-        if redis-cli -h "${REDIS_HOST:-redis}" -p "${REDIS_PORT:-6379}" ping > /dev/null 2>&1; then
+        if uv run python -c "import redis, sys; sys.exit(0 if redis.Redis(host='${REDIS_HOST:-redis}', port=${REDIS_PORT:-6379}).ping() else 1)" > /dev/null 2>&1; then
             echo "Redis 已就绪"
             break
         fi
@@ -9007,22 +9039,16 @@ if [ -n "${REDIS_HOST}" ]; then
     done
 fi
 
-# 根据环境启动不同配置
-if [ "${ENV}" = "prod" ]; then
-    echo "生产模式：4 个 Worker，无热重载"
-    exec uvicorn main:app \
-        --host 0.0.0.0 \
-        --port 8002 \
-        --workers 4 \
-        --no-access-log
-else
-    echo "开发模式：单 Worker，热重载开启"
-    exec uvicorn main:app \
-        --host 0.0.0.0 \
-        --port 8002 \
-        --reload
-fi
+# 单 Worker + 热重载启动（uv run 会用 .venv 里的 uvicorn）
+# 单 worker 也避免了飞书 WebSocket 在多 worker 下各连一次导致的重复处理
+echo "启动：单 Worker，热重载开启"
+exec uv run uvicorn main:app \
+    --host 0.0.0.0 \
+    --port 8002 \
+    --reload
 ```
+
+> **为什么 Redis 探活不用 `redis-cli`？** uv 的 slim 镜像里没有 `redis-cli` 这个命令行工具，而项目依赖里本来就有 `redis` 库，所以直接 `uv run python -c "...redis.Redis(...).ping()"` 探活，不用额外 `apt install redis-tools`。
 
 ---
 
@@ -9044,16 +9070,14 @@ services:
     ports:
       - "${APP_PORT:-8002}:8002"    # 主机端口:容器端口
     env_file:
-      - .env.shared
-      - .env.${ENV:-dev}            # 根据 ENV 变量加载对应的 .env 文件
-    environment:
-      - REDIS_HOST=redis            # 覆盖：在 Docker 网络里用服务名访问 Redis
+      - .env.docker                 # 唯一的容器环境配置（不再分 dev/prod）
     depends_on:
       redis:
         condition: service_healthy  # 等 Redis 健康检查通过后才启动 agent
     restart: unless-stopped         # 除非手动停止，否则崩溃后自动重启
     volumes:
       - ./sessions:/app/sessions    # 把会话文件映射到主机，重建容器不丢失
+      - ./workspace:/app/workspace  # 工作目录（WORKSPACE）映射到主机，工具产出不丢失
 
   # ── Redis 服务 ────────────────────────────────────────────────────
   redis:
@@ -9149,7 +9173,7 @@ volumes:
   loki_data:
 ```
 
-> **镜像清单**（共 7 个）：`python:3.11-slim`（Dockerfile FROM） + `redis:7-alpine`（会话缓存） + `prom/prometheus:latest`（指标抓取） + `grafana/grafana:latest`（统一可视化） + `grafana/tempo:latest`（链路存储） + `grafana/loki:latest`（日志存储） + `grafana/promtail:latest`（日志采集）。其中 `my-agent:latest` 是通过 Dockerfile `build` 生成的，不是外部镜像。
+> **镜像清单**（共 7 个）：`ghcr.io/astral-sh/uv:python3.14-bookworm-slim`（Dockerfile FROM，uv + Python 3.14） + `redis:7-alpine`（会话缓存） + `prom/prometheus:latest`（指标抓取） + `grafana/grafana:latest`（统一可视化） + `grafana/tempo:latest`（链路存储） + `grafana/loki:latest`（日志存储） + `grafana/promtail:latest`（日志采集）。其中 `my-agent:latest` 是通过 Dockerfile `build` 生成的，不是外部镜像。
 >
 > **Tempo / Loki 都没有独立 UI**：它们只是存储后端，查看统一走 Grafana。Tempo 收链路（4317）、供查询（3200）；Loki 收日志 + 供查询都走同一个端口（3100）。
 >
@@ -9208,7 +9232,7 @@ storage:
       path: /var/tempo/wal
 ```
 
-> **端口对应关系**：你的服务把 Span 推到 `tempo:4317`（OTLP gRPC，见 `.env.shared` 里的 `OTEL_EXPORTER_OTLP_ENDPOINT`），Grafana 查询链路时连的是 `tempo:3200`（HTTP API）。两个端口各司其职，别搞混。
+> **端口对应关系**：你的服务把 Span 推到 `tempo:4317`（OTLP gRPC，见 `.env.docker` 里的 `OTEL_EXPORTER_OTLP_ENDPOINT`），Grafana 查询链路时连的是 `tempo:3200`（HTTP API）。两个端口各司其职，别搞混。
 
 ---
 
@@ -9297,54 +9321,47 @@ datasources:
 
 ---
 
-## 13.6 拆分环境变量文件
+## 13.6 环境变量文件
 
-**`.env.shared`（所有环境共用）：**
+Docker 部署只用**一个** `.env.docker`（不再分 dev/prod）。本地开发仍用 `.env`，两者互不干扰。
 
 ```dotenv
-# .env.shared — 所有环境共用的配置
+# .env.docker — Docker 部署用的唯一环境配置（本地开发用 .env）
 
-ANTHROPIC_API_KEY=sk-ant-...
-LLM_PROVIDER=anthropic
-LLM_MODEL=claude-sonnet-4-6
+# ── LLM Provider（示例用 DeepSeek，走 openai 兼容接口；用 Claude 就填 anthropic）─
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+OPENAI_MODEL=deepseek-v4-pro
+LLM_MODEL=claude-sonnet-4-6   # 仅 anthropic provider 时生效
+
 APP_PORT=8002
 
-# 工作目录（第 0 章）——容器内所有工具/子 Agent 的文件操作都限定在此目录内
+# ── 飞书机器人（第 12 章）──────────────────────────────────────────
+FEISHU_APP_ID=cli_...
+FEISHU_APP_SECRET=...
+
+# ── Redis（Docker 网络内用服务名 redis 访问）──────────────────────
+REDIS_HOST=redis
+REDIS_PORT=6379
+# 如需密码，取消注释并给 docker-compose.yml 的 redis 服务加 --requirepass
+# REDIS_PASSWORD=your_strong_password_here
+
+# ── 工作目录（第 0 章）——容器内所有工具/子 Agent 的文件操作都限定在此目录内 ─
 WORKSPACE=/app/workspace
 
-# OpenTelemetry 链路追踪导出地址（第 11 章）——推送到 Tempo 的 OTLP gRPC 端口
+# ── OpenTelemetry 链路追踪导出地址（第 11 章）——推送到 Tempo 的 OTLP gRPC 端口 ─
 OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
 ```
 
-> **Docker 里的工作目录**：容器 `WORKDIR` 是 `/app`（第 13.3 节 Dockerfile），这里把工作区设为 `/app/workspace` 与代码目录分开。如果希望工作区数据在容器重建后不丢失，可以在 `docker-compose.yml` 的 agent 服务里加一个卷映射 `./workspace:/app/workspace`（和已有的 `./sessions:/app/sessions` 同理）。
+> **Docker 里的工作目录**：容器 `WORKDIR` 是 `/app`（第 13.3 节 Dockerfile），这里把工作区设为 `/app/workspace` 与代码目录分开。13.5 的 agent 服务已加卷映射 `./workspace:/app/workspace`（和 `./sessions:/app/sessions` 同理），工具产出的文件会落到主机的 `./workspace`，容器重建也不丢失。
+>
+> **`REDIS_HOST=redis`**：容器间用 compose 里的服务名 `redis` 互访，不是 `localhost`（那是本地 `.env` 的写法）。
 
-**`.env.dev`（开发环境）：**
-
-```dotenv
-# .env.dev — 开发环境
-ENV=dev
-REDIS_HOST=redis
-REDIS_PORT=6379
-```
-
-**`.env.prod`（生产环境）：**
-
-```dotenv
-# .env.prod — 生产环境
-ENV=prod
-REDIS_HOST=redis
-REDIS_PORT=6379
-
-# 生产环境建议设置 Redis 密码
-REDIS_PASSWORD=your_strong_password_here
-```
-
-**在 `.gitignore` 里排除这些文件：**
+**在 `.gitignore` 里排除这个文件：**
 
 ```
-.env.shared
-.env.dev
-.env.prod
+.env.docker
 ```
 
 ---
@@ -9352,14 +9369,11 @@ REDIS_PASSWORD=your_strong_password_here
 ## 13.7 构建和启动命令
 
 ```bash
-# 开发模式启动（热重载，方便调试）
-ENV=dev docker compose up --build
+# 启动（前台，看日志）
+docker compose up --build
 
 # 后台启动
-ENV=dev docker compose up -d --build
-
-# 生产模式启动
-ENV=prod docker compose up -d --build
+docker compose up -d --build
 
 # 查看实时日志
 docker compose logs -f agent
@@ -9462,7 +9476,7 @@ A：Redis 还没有就绪。检查：
 
 **Q：API Key 配置了但服务返回认证错误？**
 
-A：检查 `.env.shared` 文件是否在 docker compose 的 `env_file` 里，以及 Key 格式是否正确（没有额外空格）。
+A：检查 `.env.docker` 文件是否在 docker compose 的 `env_file` 里，以及 Key 格式是否正确（没有额外空格）。
 
 **Q：Grafana 里 Tempo 数据源没有自动出现 / 测试连接失败？**
 
@@ -9473,7 +9487,7 @@ A：分两种情况：
 **Q：发了请求但 Grafana Explore 里搜不到链路？**
 
 A：按顺序排查：
-1. `.env.shared` 里 `OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317` 是否配置（不配就不导出，见第 11 章）。
+1. `.env.docker` 里 `OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317` 是否配置（不配就不导出，见第 11 章）。
 2. 依赖 `opentelemetry-exporter-otlp-proto-grpc` 是否装了（没装的话 `tracing.py` 会打印 "未安装...链路数据不导出"）。
 3. `docker compose logs tempo` 看 Tempo 是否正常启动、有没有报 `tempo.yaml` 配置错误。
 4. Tempo 有几秒的 ingester 缓冲，发完请求稍等几秒再刷新查询。
@@ -9521,7 +9535,7 @@ A：宿主机上 `/var/run/docker.sock` 属于 root/docker 组。本指南容器
 
 □ docker compose down 然后再 up，会话历史仍然存在（volumes 持久化有效）
 
-□ ENV=prod 模式下看到 4 个 uvicorn worker
+□ 启动日志出现「启动：单 Worker，热重载开启」（单一环境，单 worker + reload）
 ```
 
 ---
@@ -9842,7 +9856,7 @@ def _get_sub_agents() -> dict:
 
 ```
 my-agent/
-├── .env / .env.shared / .env.dev / .env.prod
+├── .env（本地开发） / .env.docker（Docker 部署）
 ├── .gitignore
 ├── requirements.txt
 ├── Dockerfile
@@ -9950,7 +9964,7 @@ my-agent/
 | 报错信息 | 原因 | 解决方法 |
 |---------|------|---------|
 | `AuthenticationError: 401` | API Key 不正确或未设置 | 检查 `.env` 中对应 Provider 的 Key |
-| `ModuleNotFoundError: anthropic` | 依赖未安装 | `pip install -r requirements.txt` |
+| `ModuleNotFoundError: anthropic` | 依赖未安装 | `uv sync`（本地开发）或重建镜像（容器） |
 | `context_length_exceeded` | 对话历史超出 Token 限制 | 启用第 8 章的历史压缩 |
 | `Connection refused (6379)` | Redis 未启动 | Windows/Docker：`docker start redis-dev`；Mac：`brew services start redis`（见 7.6 节） |
 | `Connection refused (11434)` | Ollama 未启动 | `ollama serve` |

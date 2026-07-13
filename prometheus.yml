@@ -1,0 +1,12 @@
+# prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "polycoder"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["agent:8002"]       # Docker 网络内用服务名访问
+        labels:
+          service: "polycoder"

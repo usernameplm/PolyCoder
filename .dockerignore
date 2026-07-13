@@ -1,0 +1,13 @@
+# .dockerignore
+.venv/
+__pycache__/
+*.pyc
+.git/
+.pytest_cache/
+sessions/
+workspace/
+logs/
+.env
+.env.*
+*.md
+.vscode/
