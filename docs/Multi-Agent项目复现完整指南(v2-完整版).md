@@ -11507,9 +11507,17 @@ tools/
 
 修改文件：
 providers/types.py                ← 新增 ImageBlock 类型
-providers/anthropic.py            ← _to_sdk_messages() 支持 ImageBlock
+providers/base.py                 ← 新增 supports_vision 能力声明
+providers/anthropic.py            ← _to_sdk_messages() 支持 ImageBlock；supports_vision = True
+providers/openai.py               ← _to_openai_messages() 支持 ImageBlock；按模型名判断 supports_vision
+providers/gemini.py               ← _to_gemini_messages() 支持 inline_data 图片 Part；supports_vision = True
+providers/router.py               ← 新增 get_vision_provider()：视觉调用可配置成独立于对话的 Provider
+core/config.py                    ← 新增 VISION_PROVIDER / VISION_MODEL 配置项
 pyproject.toml                    ← 新增 pymupdf、pillow 依赖
 ```
+
+> **为什么要新增 `get_vision_provider()`，而不是直接用对话用的 `get_provider()`？**
+> 15.3.1 会展开讲：多模态能力是"模型级"的，不是"Provider 级"的。同一个 `openai` Provider，backend 换成 `gpt-4o` 就支持图片，换成 `deepseek-chat` 或本地 `qwen2.5:7b`（纯文本）就不支持。如果图片描述调用硬编码复用 `LLM_PROVIDER`，一旦主对话配置成了不支持视觉的模型，图片会在适配器里被静默丢弃——不报错，只是描述结果变得毫无意义，很难排查。本章让"视觉调用用哪个 Provider/模型"成为一个独立的、可选的配置项，默认回退到对话 Provider，但可以单独指向一个明确支持视觉的模型。
 
 ---
 
@@ -11532,7 +11540,25 @@ pyproject.toml                    ← 新增 pymupdf、pillow 依赖
 ```
 
 Anthropic SDK 原生支持这种格式，我们只需要在 `providers/types.py` 加一个 `ImageBlock` 类型，
-然后在 `providers/anthropic.py` 里告诉适配器如何把它转成 SDK 所需的字典即可。
+然后在各 Provider 适配器里告诉它如何把这个类型转成对应 SDK 所需的格式即可。
+
+### 15.3.1b 视觉能力是"模型级"的，不是"Provider 级"的
+
+本项目的 `LLM_PROVIDER` 选的是**适配器**（anthropic / openai / gemini），但 `openai` 这个适配器
+背后可能接的是 GPT-4o（支持图片），也可能接的是 DeepSeek、Ollama 跑的 Qwen2.5（纯文本，不支持图片）。
+也就是说，同一个 Provider 名字，换一个模型名，视觉能力就可能完全不同。
+
+如果图片描述功能（`caption_image()`）直接复用对话用的 `get_provider()`：
+- 用户在 `.env` 里配置 `LLM_PROVIDER=openai` + `OPENAI_MODEL=deepseek-chat`（纯文本模型）跑对话，
+- 知识库加载 PDF 时，图片会被转成 `ImageBlock` 发给这个 Provider，
+- 但 `deepseek-chat` 根本不支持图片输入，请求实际发出的是一条"图片被丢弃、只剩空文本"的消息，
+- LLM 不会报错，只会基于空输入编一段不相关的描述——知识库检索质量下降，且没有任何报错线索。
+
+**解决方案：让"视觉调用用哪个 Provider/模型"成为独立、可选的配置**（`VISION_PROVIDER` /
+`VISION_MODEL`，见 15.6.5），未设置时才回退到对话 Provider；同时给 `BaseProvider` 加一个
+`supports_vision` 能力声明（15.6.1），在真正发起视觉调用前做一次显式校验——不支持就直接抛错，
+而不是让图片被静默吃掉。这样即使主对话跑在本地纯文本模型上，也能单独指定一个支持视觉的 Provider
+（比如 Anthropic 或 GPT-4o）专门处理图片描述，两者互不影响。
 
 ### 15.3.2 PDF 里有什么
 
@@ -11621,9 +11647,36 @@ ContentBlock = Union[TextBlock, ToolUseBlock, ToolResultBlock, ImageBlock]
 
 ---
 
-## 15.6 更新 Anthropic 适配器支持图片 `providers/anthropic.py`
+## 15.6 更新 Provider 层：图片支持 + 独立的视觉 Provider 配置
 
-打开 `providers/anthropic.py`，做两处修改：
+上一节说过，视觉能力是"模型级"的。这一节要做三件事：
+1. 给 `BaseProvider` 加一个 `supports_vision` 能力声明；
+2. 让三个适配器（Anthropic / OpenAI / Gemini）都能把 `ImageBlock` 转成各自 SDK 需要的格式，
+   并按各自的方式判断自己是否真的支持视觉；
+3. 在 `core/config.py` 和 `providers/router.py` 里新增 `get_vision_provider()`，
+   让图片相关的调用可以配置成一个和对话**完全独立**的 Provider/模型。
+
+### 15.6.1 能力声明 `providers/base.py`
+
+打开 `providers/base.py`（对应 3.4 节），在已有的 `supports_tool_use` 属性后面加一个新属性：
+
+```python
+# providers/base.py（在 supports_tool_use 属性后面追加）
+
+    @property
+    def supports_vision(self) -> bool:
+        """
+        是否支持图片输入。
+
+        默认返回 False——多模态是模型级能力而不是 Provider 级能力，
+        必须由具体子类根据自己接的模型显式声明，不能笼统地假设"这家厂商都支持"。
+        """
+        return False
+```
+
+### 15.6.2 Anthropic 适配器 `providers/anthropic.py`
+
+做两处修改：
 
 **修改 1：顶部导入加入 ImageBlock（约第 11-15 行）**
 
@@ -11643,7 +11696,8 @@ from .types import (
 )
 ```
 
-**修改 2：`_to_sdk_messages()` 方法里，在 `else: # TextBlock` 之前加入 ImageBlock 处理**
+**修改 2：`_to_sdk_messages()` 方法里，在 `else: # TextBlock` 之前加入 ImageBlock 处理，
+并加上 `supports_vision` 属性**
 
 找到下面这段（约第 40-56 行），在 `else:` 之前插入 ImageBlock 的处理分支：
 
@@ -11675,6 +11729,302 @@ from .types import (
                 else:  # TextBlock
                     blocks.append({"type": "text", "text": block.text})
 ```
+
+再在类里新增 `supports_vision`（放在 `model_name` 属性后面即可）：
+
+```python
+    @property
+    def supports_vision(self) -> bool:
+        # Claude 3 及之后的全系列模型（含本项目默认的 claude-sonnet-4-6）原生支持图片输入。
+        return True
+```
+
+### 15.6.3 OpenAI 适配器 `providers/openai.py`
+
+`OpenAIProvider` 比较特殊：它是"一个适配器，接多种后端"（GPT-4o、DeepSeek、Ollama 本地模型……），
+同一份代码背后的模型是否支持图片完全不确定，不能像 Anthropic 那样写死 `True`。
+这里用一个尽力而为的模型名匹配，并允许用 `.env` 显式覆盖，避免匹配不到时死板地拒绝。
+
+**修改 1：`_to_openai_messages()` 加入 ImageBlock 处理**
+
+OpenAI 的图片格式是在 `content` 数组里插入 `{"type": "image_url", ...}`，需要把已有的纯文本
+`content` 也改成数组形式：
+
+```python
+# providers/openai.py
+# 顶部导入加入 ImageBlock：
+from .types import (
+    Message, ToolDefinition, ProviderResponse,
+    StreamChunk, TextBlock, ToolUseBlock, ToolResultBlock, ImageBlock,
+    Usage, TextDelta, MessageStart, MessageStop,
+)
+```
+
+```python
+    def _to_openai_messages(self, messages: list[Message], system: str) -> list[dict]:
+        result = []
+        if system:
+            result.append({"role": "system", "content": system})
+
+        for msg in messages:
+            text_content = ""
+            image_parts = []          # ← 新增：收集图片块
+            tool_calls = []
+            tool_results = []
+
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    text_content = block.text
+                elif isinstance(block, ImageBlock):           # ← 新增这一段
+                    image_parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{block.media_type};base64,{block.data}",
+                        },
+                    })
+                elif isinstance(block, ToolUseBlock):
+                    tool_calls.append({
+                        "id": block.id,
+                        "type": "function",
+                        "function": {
+                            "name": block.name,
+                            "arguments": json.dumps(block.input, ensure_ascii=False),
+                        },
+                    })
+                elif isinstance(block, ToolResultBlock):
+                    tool_results.append(block)
+
+            if tool_results:
+                for tr in tool_results:
+                    result.append({
+                        "role": "tool",
+                        "tool_call_id": tr.tool_use_id,
+                        "content": tr.content,
+                    })
+            elif tool_calls:
+                m = {"role": "assistant", "content": text_content or None, "tool_calls": tool_calls}
+                result.append(m)
+            elif image_parts:
+                # 有图片：content 必须是数组，文字块和图片块混在一起
+                content = image_parts
+                if text_content:
+                    content = [{"type": "text", "text": text_content}] + image_parts
+                result.append({"role": msg.role, "content": content})
+            else:
+                result.append({"role": msg.role, "content": text_content})
+
+        return result
+```
+
+> 对比原来的实现：`ImageBlock` 之前完全没有对应分支，会直接落进 `for` 循环末尾什么都不做——
+> 图片被静默丢弃，`text_content` 还是空字符串，最终发出去的是一条空文本消息，不会有任何报错。
+> 这正是 15.3.1b 提到的问题，这里把它补上。
+
+**修改 2：新增 `supports_vision`，按模型名判断**
+
+```python
+    # 已知支持视觉输入的模型名关键词（按需扩充）。
+    # 这是"尽力而为"的启发式判断，不是 OpenAI 官方能力查询接口——
+    # 如果你接的是一个不在列表里、但实际支持视觉的模型，用 VISION_CAPABLE=true 显式覆盖（见 15.6.5）。
+    _VISION_MODEL_HINTS = ("gpt-4o", "gpt-4.1", "gpt-4-vision", "gpt-5", "o1", "o3", "-vl", "vision")
+
+    def __init__(self, api_key: str, model: str, base_url: str | None = None,
+                 supports_vision: bool | None = None):
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._model = model
+        # 显式传入优先；否则按模型名做启发式匹配
+        self._supports_vision = (
+            supports_vision if supports_vision is not None
+            else any(hint in model.lower() for hint in self._VISION_MODEL_HINTS)
+        )
+
+    @property
+    def supports_vision(self) -> bool:
+        return self._supports_vision
+```
+
+### 15.6.4 Gemini 适配器 `providers/gemini.py`
+
+Gemini 用 `inline_data` Part 传图片，而不是 `image_url`：
+
+**修改 1：`_to_gemini_messages()` 加入 ImageBlock 处理**
+
+```python
+# 顶部导入加入 ImageBlock：
+from .types import (
+    Message, ToolDefinition, ProviderResponse,
+    StreamChunk, TextBlock, ToolUseBlock, ToolResultBlock, ImageBlock,
+    Usage, TextDelta, MessageStart, MessageStop,
+)
+```
+
+```python
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    parts.append({"text": block.text})
+                elif isinstance(block, ImageBlock):           # ← 新增这一段
+                    parts.append({
+                        "inline_data": {
+                            "mime_type": block.media_type,
+                            "data": block.data,
+                        }
+                    })
+                elif isinstance(block, ToolUseBlock):
+                    parts.append({
+                        "function_call": {
+                            "name": block.name,
+                            "args": block.input,
+                        }
+                    })
+                elif isinstance(block, ToolResultBlock):
+                    parts.append({
+                        "function_response": {
+                            "name": block.tool_use_id,
+                            "response": {
+                                "result": block.content,
+                                "is_error": block.is_error,
+                            },
+                        }
+                    })
+```
+
+**修改 2：新增 `supports_vision`**
+
+```python
+    @property
+    def supports_vision(self) -> bool:
+        # Gemini 1.5 / 2.0 系列（含本项目默认的 gemini-2.0-flash）原生支持图片输入。
+        return True
+```
+
+### 15.6.5 新增配置项 `core/config.py`
+
+```python
+# core/config.py（在 Settings 类里新增，放在 llm_model 字段附近）
+
+    # 视觉调用专用的 Provider/模型（可选）。
+    # 留空时回退到对话用的 llm_provider/对应模型，见 providers/router.py 的 get_vision_provider()。
+    vision_provider: str = ""
+    vision_model: str = ""
+    # 当模型名不在 OpenAIProvider 的启发式列表里，但实际支持视觉时，用这个显式声明。
+    vision_capable: bool = False
+```
+
+对应 `.env` 里新增（放在 15.2 节列出的通用配置区域，全部留空/False 表示"跟对话 Provider 走"）：
+
+```dotenv
+# ── 视觉调用专用 Provider（可选，留空则和对话共用同一个 Provider）─────
+VISION_PROVIDER=              # 留空 | anthropic | openai | gemini
+VISION_MODEL=                 # 留空则用该 Provider 的默认模型
+VISION_CAPABLE=false           # 如果 VISION_PROVIDER=openai 且模型不在内置视觉模型名单里，改成 true
+```
+
+> 典型用法：对话走本地 Ollama（`LLM_PROVIDER=openai` + `OPENAI_MODEL=qwen2.5:7b`，省 Token、
+> 响应快），但知识库里有带图表的 PDF，单独配 `VISION_PROVIDER=anthropic`，图片描述改走 Claude。
+> 两条调用链互不干扰，换任意一边都不用动代码。
+
+### 15.6.6 视觉 Provider 路由 `providers/router.py`
+
+把原来 `get_provider()` 里"按名字 + 模型创建实例"的逻辑拆成一个可复用的内部函数，
+再加一个 `get_vision_provider()`：
+
+```python
+# providers/router.py
+"""
+根据 .env 配置选择并返回 Provider 实例。
+
+对话用的 Provider 和图片理解用的 Provider 是分开路由的：
+  get_provider()        → 对话/工具调用，看 LLM_PROVIDER
+  get_vision_provider()  → 图片描述，看 VISION_PROVIDER（留空则回退到 LLM_PROVIDER）
+两者可以指向完全不同的后端，互不影响。
+"""
+from functools import lru_cache
+from .base import BaseProvider
+from core.config import settings
+
+
+def _default_model(name: str) -> str:
+    """某个 Provider 名字在没有单独指定模型时，用哪个默认模型。"""
+    return {
+        "anthropic": settings.llm_model,
+        "openai": settings.openai_model,
+        "ollama": settings.openai_model,
+        "deepseek": settings.openai_model,
+        "azure": settings.openai_model,
+        "gemini": settings.gemini_model,
+    }.get(name, settings.llm_model)
+
+
+@lru_cache(maxsize=8)
+def _build_provider(name: str, model: str) -> BaseProvider:
+    """
+    按 (Provider 名, 模型名) 创建并缓存一个 Provider 实例。
+
+    用 (name, model) 联合做缓存 key，是因为对话 Provider 和视觉 Provider
+    可能是同一个适配器（如都用 openai）但配了不同模型，不能共用一个实例。
+    """
+    if name == "anthropic":
+        from .anthropic import AnthropicProvider
+        return AnthropicProvider(api_key=settings.anthropic_api_key, model=model)
+
+    elif name in ("openai", "ollama", "deepseek", "azure"):
+        from .openai import OpenAIProvider
+        return OpenAIProvider(
+            api_key=settings.openai_api_key,
+            model=model,
+            base_url=settings.openai_base_url or None,
+            supports_vision=settings.vision_capable or None,
+        )
+
+    elif name == "gemini":
+        from .gemini import GeminiProvider
+        return GeminiProvider(api_key=settings.gemini_api_key, model=model)
+
+    else:
+        raise ValueError(
+            f"不支持的 Provider: '{name}'。"
+            f"可选值：anthropic / openai / gemini。"
+            f"检查 .env 里的 LLM_PROVIDER 配置。"
+        )
+
+
+def get_provider() -> BaseProvider:
+    """获取对话用的 Provider（看 LLM_PROVIDER）。"""
+    name = settings.llm_provider.lower()
+    return _build_provider(name, _default_model(name))
+
+
+def get_vision_provider() -> BaseProvider:
+    """
+    获取图片理解用的 Provider。
+
+    - 配置了 VISION_PROVIDER：用它（可以和对话 Provider 完全不同）。
+    - 没配置：回退到对话 Provider（get_provider()）。
+    - 选中的 Provider 必须 supports_vision=True，否则直接报错——
+      宁可在调用前就失败，也不要让图片被适配器悄悄丢弃却拿到一段无意义的描述。
+    """
+    name = (settings.vision_provider or settings.llm_provider).lower()
+    model = settings.vision_model or _default_model(name)
+    provider = _build_provider(name, model)
+
+    if not provider.supports_vision:
+        raise ValueError(
+            f"用于视觉调用的 Provider '{name}'（模型 '{model}'）不支持图片输入。\n"
+            f"请设置 VISION_PROVIDER / VISION_MODEL 指向一个支持视觉的模型"
+            f"（如 anthropic + claude-sonnet-4-6，或 openai + gpt-4o）；"
+            f"如果确认该模型其实支持视觉，设置 VISION_CAPABLE=true。"
+        )
+    return provider
+
+
+def clear_provider_cache() -> None:
+    """测试/切换配置后清空缓存，让下次调用按新配置重新创建实例。"""
+    _build_provider.cache_clear()
+```
+
+> `get_provider()` 原来用 `@lru_cache(maxsize=1)` 直接包住自己；现在缓存下沉到 `_build_provider`，
+> `get_provider()`/`get_vision_provider()` 变成薄封装。行为不变（同名同模型只创建一次客户端），
+> 但多了一条路由：`(anthropic, claude-sonnet-4-6)` 和 `(openai, gpt-4o)` 可以同时存在两个实例。
 
 ---
 
@@ -11741,7 +12091,7 @@ class DocumentChunk:
 
 import base64
 from providers.types import Message, TextBlock, ImageBlock
-from providers.router import get_provider
+from providers.router import get_vision_provider
 
 
 _CAPTION_SYSTEM = "你是一个文档图片分析专家，擅长从各种图片中提取关键信息。"
@@ -11783,12 +12133,17 @@ async def caption_image(image_bytes: bytes, media_type: str = "image/jpeg") -> s
     工作原理：
         1. 把二进制图片数据用 base64 编码，变成文字字符串
         2. 构造一条包含图片块和文字指令的消息
-        3. 发给 LLM，等待描述文字
+        3. 发给视觉 Provider，等待描述文字
+
+    这里用 get_vision_provider()而不是 get_provider()：图片理解可以配置成和主对话
+    完全独立的 Provider/模型（见 15.6.5、15.6.6），不受 LLM_PROVIDER 配的是否支持视觉影响。
+    如果没配 VISION_PROVIDER，也没配 VISION_CAPABLE，选中的模型又确实不支持视觉，
+    get_vision_provider() 会在这里直接抛 ValueError，而不是把图片悄悄丢掉再返回一段乱猜的描述。
     """
     if not image_bytes:
         return ""
 
-    provider = get_provider()
+    provider = get_vision_provider()
     b64_data = base64.b64encode(image_bytes).decode("utf-8")
 
     messages = [
@@ -12577,6 +12932,9 @@ Agent：根据公司退货政策，购买后 7 天内可无理由退货，但商
 □ cli.py 问退货政策，Agent 日志显示执行了 search_knowledge_base 工具
 □ （可选）在 knowledge_base/ 放一个 PDF，重跑加载，确认提取了图片描述
 □ （可选）在 knowledge_base/ 放一张 PNG 图片，确认生成了文字描述
+□ 验证视觉 Provider 独立配置生效：临时设 VISION_PROVIDER=openai + OPENAI_MODEL=deepseek-chat
+  （纯文本模型），重跑图片加载，应看到 get_vision_provider() 抛出 ValueError 而不是静默返回空描述；
+  改回 VISION_PROVIDER=（留空）或指向支持视觉的模型后恢复正常
 ```
 
 ---
