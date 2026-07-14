@@ -14,6 +14,7 @@ dependencies = [
     "jieba>=0.42.1",
     "lark-oapi>=1.6.0",
     "openai>=1.40.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.25.0",
     "opentelemetry-sdk>=1.25.0",
     "pillow>=12.3.0",
     "prometheus-client>=0.21.0",

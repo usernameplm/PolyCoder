@@ -9,6 +9,13 @@ distributor:
         grpc:
           endpoint: "0.0.0.0:4317"
 
+ingester:
+  trace_idle_period: 10s       # 空闲 10s 后 flush 到存储
+  max_block_bytes: 1_048_576   # 1MB 就 flush
+  max_block_duration: 30s      # 最多 30s 必须 flush
+
+search_enabled: true
+
 storage:
   trace:
     backend: local
@@ -16,3 +23,9 @@ storage:
       path: /var/tempo/blocks
     wal:
       path: /var/tempo/wal
+    block:
+      version: vParquet4
+    search:
+      v2_index_downsample_bytes: 100
+      v2_index_page_size_bytes: 100
+      v2_encoding: zstd
