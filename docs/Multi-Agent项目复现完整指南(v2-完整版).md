@@ -8338,6 +8338,103 @@ with TestClient(main.app) as c:
 
 ---
 
+## 11.6 可观测性整体架构（三大支柱：Metrics / Traces / Logs）
+
+```
+                        ┌────────────────────────┐
+                        │       Grafana :3000     │ ← 唯一的浏览器入口
+                        │  (数据源自动配置好了)     │
+                        └───┬─────────┬───────┬───┘
+                            │         │       │
+                  Prometheus│    Tempo│  Loki │
+                     :9090  │   :3200 │ :3100 │
+                            │         │       │
+```
+
+三条数据各自独立采集、存储，最后都汇总到 Grafana 展示。
+
+### 11.6.1 流程图 1：Metrics（指标）—— Prometheus 拉取模式
+
+```
+agent 服务(:8002)
+  └─ observability/metrics.py 定义 Counter/Histogram/Gauge
+       (agent_requests_total, tool_calls_total,
+        agent_latency_seconds, active_requests, token_usage_total)
+  └─ main.py 暴露 GET /metrics 端点 (generate_latest)
+             │
+             │ 每 15s 主动 pull (scrape_interval: 15s)
+             ▼
+        Prometheus (prometheus.yml → targets: agent:8002)
+             │ 存储时序数据到 prometheus_data volume
+             ▼
+        Grafana 数据源 "Prometheus" (isDefault) 查询展示
+```
+
+特点：**拉模式**，Prometheus 主动去 agent 的 `/metrics` 抓取，指标值是代码里手动 `.inc()` / `.observe()` 累加的。
+
+### 11.6.2 流程图 2：Traces（链路追踪）—— OTLP 推送模式
+
+```
+agent 服务
+  └─ observability/tracing.py setup_tracing()
+       创建 TracerProvider，若配置了 otel_exporter_otlp_endpoint
+       → OTLPSpanExporter + BatchSpanProcessor
+             │
+             │ gRPC 推送 span (批量)
+             ▼
+        Tempo :4317 (OTLP 接收端口)
+             │ 落盘存储 (tempo_data volume, local backend)
+             ▼
+        Tempo :3200 HTTP API
+             │
+             ▼
+        Grafana 数据源 "Tempo" 查询 TraceID
+        (jsonData.tracesToMetrics / serviceMap → 可跳转到 Prometheus 指标)
+```
+
+特点：**推模式**，agent 主动把 span 推给 Tempo；一次请求会产生一串 span（一条 Trace），用来看这次请求慢在哪一步。
+
+这里用的是 **OpenTelemetry（OTel）**：
+
+- **OpenTelemetry**：标准 + SDK 层。负责在代码里定义 `TracerProvider`、生成 `tracer`、创建 `Span`，并用 **OTLP（OpenTelemetry Protocol）** 协议把 span 批量导出（`BatchSpanProcessor` + `OTLPSpanExporter`，走 gRPC）。厂商中立，换 Jaeger/Zipkin/Tempo 只需要换 exporter 的 endpoint。
+- **Tempo**：只是接收端 + 存储后端。`tempo.yaml` 里 `receivers.otlp.protocols.grpc: 0.0.0.0:4317` 就是专门接收 OTel SDK 推来的 OTLP 数据的端口，对应 `docker-compose.yml` 里 tempo 服务暴露的 `4317` 端口。
+- **Grafana**：只是查询/展示层，通过 Tempo 数据源的 HTTP API（`3200` 端口）读 Tempo 存的 trace 数据，本身不涉及 OTel 协议。
+
+**注意**：`main.py` 的 `lifespan` 里只有传了 `otlp_endpoint`（即环境变量 `OTEL_EXPORTER_OTLP_ENDPOINT`，一般设为 `http://tempo:4317`），span 才会真正导出到 Tempo；不配置的话，`tracer.start_as_current_span()` 仍然能正常创建 Span、代码不报错，但链路数据不会离开进程，Grafana 里也就看不到任何 trace。
+
+### 11.6.3 流程图 3：Logs（日志）—— 容器日志采集模式
+
+```
+agent 服务（以及其他容器）
+  └─ observability/logging.py setup_logging()
+       structlog → JSONRenderer → 输出到 stdout
+             │
+             │ Docker 把每个容器 stdout 写成 json-file
+             ▼
+        /var/lib/docker/containers/*/*.log (宿主机文件)
+             │
+             │ Promtail 通过 docker_sd_configs 自动发现容器
+             │ 挂载 docker.sock + containers 目录（只读）
+             ▼
+        Promtail 推送 (relabel: 容器名 → container 标签)
+             │
+             ▼
+        Loki :3100 (/loki/api/v1/push 接收)
+             │ 存储到 loki_data volume
+             ▼
+        Grafana 数据源 "Loki" 用 LogQL 查询
+```
+
+特点：日志不用改代码埋点，只要容器往 stdout 打 JSON 日志，Promtail 自动采集，靠 `container` 标签区分是哪个容器的日志。
+
+### 11.6.4 三者关联
+
+- 日志里可以带 `trace_id` 字段（如果代码里把当前 span 的 trace_id 写进 structlog 上下文），这样能从 Loki 日志跳到 Tempo 对应链路。
+- Tempo 数据源配置了 `tracesToMetrics`，可以从一条 trace 跳转到 Prometheus 对应指标（比如该 service 的延迟直方图）。
+- 三者共同点：**Grafana 是唯一 UI**，Prometheus/Tempo/Loki 只是存储+查询后端，不直接暴露给用户看。
+
+---
+
 # 第 12 章：阶段 12 —— 飞书机器人
 
 > **本章目标**：在飞书里 @ 机器人就能使用 Agent，支持私聊和群聊，显示"处理中"状态。
