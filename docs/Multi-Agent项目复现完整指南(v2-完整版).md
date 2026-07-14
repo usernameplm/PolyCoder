@@ -8435,6 +8435,77 @@ agent 服务（以及其他容器）
 
 ---
 
+## 11.7 在 Grafana UI 里怎么查这些数据
+
+访问 `http://localhost:3000`，用 `docker-compose.yml` 里配的 `admin` / `admin` 登录。三条数据都走左侧导航栏的 **Explore**（指南针图标），顶部下拉框切换数据源即可，不需要为了临时查数据专门建 Dashboard。
+
+### 11.7.1 查 Metrics（选数据源 "Prometheus"）
+
+Explore → 数据源选 `Prometheus` → 在查询框写 PromQL：
+
+```promql
+# 每个 provider 的请求总量
+agent_requests_total
+
+# 按 status 拆分的成功/失败请求速率（最近 5 分钟）
+sum by (status) (rate(agent_requests_total[5m]))
+
+# 请求延迟的 P95（分位数），衡量"慢请求"
+histogram_quantile(0.95, rate(agent_latency_seconds_bucket[5m]))
+
+# 当前活跃请求数
+active_requests
+
+# 累计 token 用量，按 type 拆分
+sum by (type) (token_usage_total)
+```
+查完点右上角 **Add to dashboard** 可以固化成图表面板，长期盯着看就建一个 Dashboard；临时排查用 Explore 就够。
+
+### 11.7.2 查 Traces（选数据源 "Tempo"）
+
+Explore → 数据源选 `Tempo`，有两种查法：
+
+- **按 TraceID 查**：如果日志里打印过 trace_id（或者从别处拿到了），直接粘贴进查询框，点查询就能看到那一条完整链路的瀑布图（`agent_loop` → `turn_N` → `tool_xxx` 逐层展开，每个 Span 的耗时一目了然）。
+- **按服务名搜索（TraceQL）**：不知道 TraceID 时，用查询构建器（Search 标签页）按 `service.name = "my-agent"` 搜最近的链路列表，再点进去看瀑布图；也可以直接写 TraceQL，比如：
+
+```traceql
+{ .service.name = "my-agent" && duration > 2s }
+```
+这条查最近 service 名为 `my-agent` 且总耗时超过 2 秒的慢请求链路，点进某条结果就能看到具体是哪个 `turn_N` 或 `tool_xxx` Span 拖慢的。
+
+> 前提：`.env.docker` 里配了 `OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317` 且 agent 至少处理过一次 `/ask` 请求，否则 Tempo 里没有数据可查。
+
+### 11.7.3 查 Logs（选数据源 "Loki"）
+
+Explore → 数据源选 `Loki` → 用 LogQL：
+
+```logql
+# 看 agent 容器的全部日志
+{container="agent"}
+
+# 只看错误级别日志
+{container="agent"} | json | level="error"
+
+# 按 session_id 串起一次会话的所有日志（对应 11.2 节的打点习惯）
+{container="agent"} | json | session_id="user_001"
+
+# 统计最近 5 分钟错误日志的速率（配合面板画图）
+sum(rate({container="agent"} | json | level="error" [5m]))
+```
+因为日志是 `structlog.processors.JSONRenderer` 输出的 JSON，`| json` 之后就能按字段（`session_id`、`level`、`event` 等）精确过滤，不用写正则猜格式。
+
+### 11.7.4 三者联动查一次完整请求
+
+排查一次慢请求/报错的典型顺序：
+
+1. 先在 **Loki** 里按 `session_id` 或 `level="error"` 定位到出问题的那条日志，拿到 `session_id`（或日志里带的 `trace_id`，如果代码里加了的话）。
+2. 如果日志里有 `trace_id`，直接去 **Tempo** 粘贴该 ID 查瀑布图，看请求卡在哪个 Span；没有的话就按时间窗口 + `service.name` 在 Tempo 里缩小范围找。
+3. 确认是个别请求慢还是整体退化，去 **Prometheus** 看 `agent_latency_seconds` 的 P95/P99 曲线和 `agent_requests_total{status="error"}` 的速率，判断影响面。
+
+三个数据源都在同一个 Grafana 里，来回切换不用跳出页面。
+
+---
+
 # 第 12 章：阶段 12 —— 飞书机器人
 
 > **本章目标**：在飞书里 @ 机器人就能使用 Agent，支持私聊和群聊，显示"处理中"状态。
