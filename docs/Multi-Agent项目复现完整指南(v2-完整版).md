@@ -14666,3 +14666,939 @@ if result.metrics:
 □ 运行全部集成测试 pytest tests/ -v，无错误（或仅有预期的 skip）
 □ 修改 cli.py 加入 metrics.print_report()，对话后能看到统计报告
 ```
+
+---
+
+# 第 17 章：阶段 17 —— 用强化学习训练本地路由子 Agent（SFT + GRPO）
+
+> 本章参考 hello-agents 第十一章 Agentic-RL，把「强化学习训练一个小模型」这件事，落到 PolyCoder 真实可用的场景上。
+> **前置**：至少一块 ≥8GB 显存的 GPU；已完成第 3 章（Provider 抽象层）和第 6 章（Coordinator）。
+> **产出**：一个用 SFT + GRPO 训练出来的 Qwen3-0.6B「请求路由模型」，通过 OpenAI-compat 端点接入现有 Coordinator，**不改动主框架代码**。
+> 每一小节都有独立的验证命令，跑通即算通过。
+
+---
+
+## 17.1 先想清楚：RL 能给 PolyCoder 加什么、不能加什么
+
+在写任何代码之前，必须先破除一个常见误解。
+
+**你不能对 Claude / GPT / Gemini 做强化学习训练。** 它们的权重在云端，你只能通过 API 调用，改不了一个参数。所以「用 RL 增强 agent」在 PolyCoder 这种**基于 API 的编排系统**里，唯一现实的落地方式是：
+
+> **自己训练一个能跑在本地的小模型（Qwen3-0.6B），让它承担某个"专项、可自动评判"的任务，然后作为一个子 Agent 接进 Coordinator。**
+
+这正好是第 11 章教的全套方法（SFT → GRPO → LoRA → 评估）的一次真实应用。
+
+**为什么选「请求路由分类」作为训练任务？** 对比第 11 章的 GSM8K 数学题，好的 RL 训练任务需要满足三个条件，路由任务全部满足：
+
+| 条件 | GSM8K（第 11 章） | 请求路由（本章） |
+|------|------------------|-----------------|
+| 答案可自动验证 | 数字对不对 | 路由的子 Agent label 对不对 |
+| 有明确 ground truth | `#### 72` | `code_reviewer` |
+| 小模型能学会 | 0.6B 够用 | 分类任务，0.6B 绰绰有余 |
+| **在本项目里有用** | ❌（只是练手） | ✅ 真的能替代/辅助第 6 章的 planner 路由 |
+
+**本章的数据流**（和第 11 章完全同构，只是把数学题换成路由）：
+
+```
+用户请求  ──►  路由模型  ──►  "Final Answer: code_reviewer"
+   │                                    │
+   │            奖励函数：label 命中 +1，格式正确 +0.2
+   └────────────────────────────────────┘
+                   GRPO 用这个奖励优化模型
+```
+
+训练完成后，它在 PolyCoder 里的位置：
+
+```
+用户 → Coordinator → [RouterAgent(本地Qwen)]  ← 本章新增
+                        ↓ 输出路由标签
+                     code_writer / code_reviewer / debugger / ...
+```
+
+> **一句话总结**：第 11 章教你"怎么训一个数学模型"，本章教你"把同一套方法用来训一个对 PolyCoder 有用的路由模型，并接回系统"。理论完全一致，只换了数据集和奖励的语义。
+
+### 17.1 验证
+
+无需代码，回答清楚以下三个问题即算理解到位（写进你自己的笔记）：
+
+- [ ] 为什么不能直接对 Claude 做 GRPO？（答：权重在云端，无法反向传播）
+- [ ] 路由任务的 ground truth 是什么？（答：正确的子 Agent 名字）
+- [ ] 训练好的模型通过什么机制接回 PolyCoder？（答：OpenAI-compat 端点 + 第 3 章的 OpenAI Provider）
+
+---
+
+## 17.2 环境与依赖
+
+第 11 章用的是 `hello_agents.tools.RLTrainingTool`（一个封装好的黑箱）。**本章不用它**——延续 v2「去掉黑箱、自实现」的理念，我们直接用 TRL 原生 API，每一步都看得见。
+
+### 新增依赖
+
+在项目根目录新建 `requirements-rl.txt`（和主 `requirements.txt` 分开，因为这些包很重，只在训练机上装）：
+
+```txt
+# requirements-rl.txt —— RL 训练专用依赖（只在有 GPU 的训练机安装）
+
+torch>=2.3.0                # 深度学习框架（按你的 CUDA 版本装对应轮子）
+transformers>=4.51.0        # Qwen3 需要 4.51+
+trl>=0.17.0                 # SFTTrainer / GRPOTrainer（本章核心）
+peft>=0.13.0                # LoRA 参数高效微调
+datasets>=3.0.0             # 数据集加载与格式转换
+accelerate>=1.0.0           # 训练加速与多卡支持
+tensorboard>=2.17.0         # 离线训练曲线可视化（本章用它监控，不依赖 wandb）
+```
+
+安装（先激活主项目的虚拟环境）：
+
+```bash
+# CUDA 12.1 的 torch 示例；请按 https://pytorch.org 选择你的 CUDA 版本
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements-rl.txt
+```
+
+### 训练目录骨架
+
+在项目里新建一个 `rl/` 目录，专门放训练相关代码，和主框架隔离：
+
+```
+PolyCoder/
+├── rl/
+│   ├── __init__.py
+│   ├── build_dataset.py    ← 17.3 构造路由数据集
+│   ├── rewards.py          ← 17.4 奖励函数（纯函数，可单测）
+│   ├── train_sft.py        ← 17.5 SFT 训练
+│   ├── train_grpo.py       ← 17.7 GRPO 训练
+│   ├── evaluate.py         ← 17.6 / 17.9 评估
+│   ├── merge_lora.py       ← 17.8 合并导出
+│   └── data/               ← 数据集 JSONL 存这里
+└── sub_agents/
+    └── router_agent.py     ← 17.10 接回 Coordinator
+```
+
+### 17.2 验证
+
+```bash
+# 1. 确认 GPU 可用（必须输出 True，以及你的显卡型号）
+python -c "import torch; print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"
+
+# 2. 确认 TRL 两个 Trainer 都能导入
+python -c "from trl import SFTTrainer, GRPOTrainer, SFTConfig, GRPOConfig; print('TRL OK')"
+
+# 3. 确认能下载并加载基础模型（第一次会下载约 1.2GB）
+python -c "from transformers import AutoTokenizer; t = AutoTokenizer.from_pretrained('Qwen/Qwen3-0.6B'); print('tokenizer OK, vocab=', t.vocab_size)"
+```
+
+预期：第 1 条输出 `CUDA: True` 和显卡名；第 2、3 条分别打印 `TRL OK` 和 `tokenizer OK`。三条全过才继续。
+
+---
+
+## 17.3 定义任务与构造数据集
+
+第 11 章用的是现成的 GSM8K；我们要自己造一份「请求路由」数据集。因为是分类任务，几十条高质量样本就足够跑通并学到东西（0.6B 模型 + LoRA 很容易过拟合小数据，这对演示反而友好）。
+
+### 路由标签体系
+
+对应第 6 章你已有的子 Agent：
+
+| 标签 | 触发场景 |
+|------|---------|
+| `code_writer` | 从零写代码、实现某功能 |
+| `code_reviewer` | 审查已有代码、找问题、评估质量 |
+| `debugger` | 报错了、修 bug、代码跑不通 |
+| `test_writer` | 写测试、补充用例、覆盖率 |
+| `knowledge_agent` | 问项目规范、API 文档、内部约定 |
+
+### 数据集构造脚本 `rl/build_dataset.py`
+
+我们造两种格式，和第 11 章的 SFT 格式 / RL 格式一一对应：
+
+- **SFT 格式**：`messages` 对话（含完整推理和答案），教模型输出格式。
+- **RL 格式**：只有 `prompt` + `ground_truth`（正确标签），让模型自己生成推理。
+
+```python
+# rl/build_dataset.py
+"""构造 PolyCoder 请求路由数据集（SFT 格式 + RL 格式）。
+对应第 11 章的 GSM8K，只是把数学题换成路由分类。"""
+import json
+import os
+from pathlib import Path
+
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+LABELS = ["code_writer", "code_reviewer", "debugger", "test_writer", "knowledge_agent"]
+
+SYSTEM_PROMPT = (
+    "你是 PolyCoder 的请求路由器。阅读用户请求，判断应该交给哪个子 Agent 处理。"
+    "可选标签：code_writer（写新代码）、code_reviewer（审查代码）、"
+    "debugger（修 bug/报错）、test_writer（写测试）、knowledge_agent（问规范/文档）。"
+    "先简短说明理由，最后一行必须是 `Final Answer: <标签>`。"
+)
+
+# 原始训练样本：(用户请求, 正确标签, 一句理由)
+RAW = [
+    ("帮我实现一个二分查找函数", "code_writer", "从零编写新功能，属于代码生成"),
+    ("写一个读取 CSV 并求和的脚本", "code_writer", "需要产出新代码"),
+    ("给我一个 FastAPI 的登录接口", "code_writer", "实现新接口，属于写代码"),
+    ("实现一个 LRU 缓存类", "code_writer", "编写新的数据结构实现"),
+    ("用 Python 画一个正弦曲线", "code_writer", "生成绘图代码"),
+    ("帮我把这个函数写出来：计算阶乘", "code_writer", "编写新函数"),
+    ("看看我这段代码有没有问题", "code_reviewer", "评估已有代码质量"),
+    ("这个函数的可读性怎么样，帮我评审", "code_reviewer", "代码审查诉求"),
+    ("检查这段代码是否符合最佳实践", "code_reviewer", "审查代码规范性"),
+    ("我的实现有没有性能隐患？", "code_reviewer", "评估已有代码"),
+    ("帮我 review 一下这个 PR", "code_reviewer", "典型的代码审查"),
+    ("这段代码风格上有什么可以改进的", "code_reviewer", "审查代码风格"),
+    ("运行报错 KeyError，帮我看看哪里错了", "debugger", "运行时报错，需要调试"),
+    ("这段代码跑不通，一直死循环", "debugger", "代码无法正常运行"),
+    ("为什么我的函数返回 None？", "debugger", "行为异常需排查"),
+    ("修一下这个 IndexError", "debugger", "明确的报错修复"),
+    ("程序崩溃了，栈里是 NullPointer", "debugger", "崩溃排查"),
+    ("我的测试挂了，帮我定位原因", "debugger", "定位失败原因属于调试"),
+    ("给这个函数补充单元测试", "test_writer", "编写测试用例"),
+    ("帮我写 pytest 覆盖边界情况", "test_writer", "补充测试"),
+    ("这个模块的测试覆盖率太低，加点用例", "test_writer", "提升测试覆盖"),
+    ("为登录接口写一组集成测试", "test_writer", "编写测试"),
+    ("给我几个针对这个类的测试样例", "test_writer", "生成测试用例"),
+    ("补充异常路径的测试", "test_writer", "编写测试"),
+    ("我们内部 API 请求怎么封装的？", "knowledge_agent", "询问项目规范"),
+    ("项目的错误码约定是什么", "knowledge_agent", "查内部约定文档"),
+    ("命名规范里驼峰还是下划线？", "knowledge_agent", "查编码规范"),
+    ("统一响应结构长什么样", "knowledge_agent", "查 API 规范"),
+    ("分页参数按什么约定传", "knowledge_agent", "查接口约定"),
+    ("异步代码有什么规范要求", "knowledge_agent", "查编码规范"),
+]
+
+# 留几条做验证集（模型没见过，用来测泛化）
+VAL_RAW = [
+    ("帮我实现一个快速排序", "code_writer", "编写新算法"),
+    ("审查一下这个类的设计合理吗", "code_reviewer", "代码审查"),
+    ("抛了 TypeError，帮我排查", "debugger", "报错调试"),
+    ("给这个工具函数加测试", "test_writer", "编写测试"),
+    ("项目里日志规范是怎样的", "knowledge_agent", "查规范"),
+]
+
+
+def build_prompt(question: str):
+    """构造 chat 格式的 prompt（system + user）。"""
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+
+
+def build_completion(reason: str, label: str) -> str:
+    return f"理由：{reason}。\nFinal Answer: {label}"
+
+
+def dump_sft(raw, path):
+    """SFT 格式：messages 含完整答案，教模型输出格式。"""
+    with open(path, "w", encoding="utf-8") as f:
+        for q, label, reason in raw:
+            messages = build_prompt(q) + [
+                {"role": "assistant", "content": build_completion(reason, label)}
+            ]
+            f.write(json.dumps({"messages": messages}, ensure_ascii=False) + "\n")
+
+
+def dump_rl(raw, path):
+    """RL 格式：只给 prompt + ground_truth，模型自己生成推理。"""
+    with open(path, "w", encoding="utf-8") as f:
+        for q, label, reason in raw:
+            f.write(json.dumps({
+                "prompt": build_prompt(q),
+                "ground_truth": label,
+            }, ensure_ascii=False) + "\n")
+
+
+if __name__ == "__main__":
+    dump_sft(RAW, DATA_DIR / "sft_train.jsonl")
+    dump_rl(RAW, DATA_DIR / "rl_train.jsonl")
+    dump_rl(VAL_RAW, DATA_DIR / "val.jsonl")
+    print(f"✓ SFT 训练集: {len(RAW)} 条 -> {DATA_DIR/'sft_train.jsonl'}")
+    print(f"✓ RL  训练集: {len(RAW)} 条 -> {DATA_DIR/'rl_train.jsonl'}")
+    print(f"✓ 验证集   : {len(VAL_RAW)} 条 -> {DATA_DIR/'val.jsonl'}")
+```
+
+### 17.3 验证
+
+```bash
+python rl/build_dataset.py
+
+# 查看生成的样本（确认 messages 结构和 ground_truth 都在）
+head -n 1 rl/data/sft_train.jsonl | python -m json.tool
+head -n 1 rl/data/rl_train.jsonl | python -m json.tool
+```
+
+预期：打印三行 `✓`；`sft_train.jsonl` 第一条含 `messages`（3 条：system/user/assistant）；`rl_train.jsonl` 第一条含 `prompt` 和 `ground_truth: "code_writer"`。
+
+---
+
+## 17.4 奖励函数（纯函数，无需 GPU 即可验证）
+
+奖励函数是 RL 的灵魂（第 11 章 11.2.2）。它是**纯 Python 函数**——不碰模型、不碰 GPU，所以可以先写单元测试验证逻辑正确，再拿去训练。这是最应该先做扎实的一步。
+
+TRL 的 GRPO 奖励函数签名固定为 `reward(completions, **kwargs) -> list[float]`，其中 `completions` 是模型生成的文本列表，数据集里的其它列（如 `ground_truth`）通过 `kwargs` 传入——和第 11 章的自定义奖励函数签名完全一致。
+
+```python
+# rl/rewards.py
+"""路由任务的奖励函数。对应第 11 章 11.2.2 的准确率/格式奖励。
+纯函数，可脱离 GPU 单元测试。"""
+import re
+from typing import List
+
+LABELS = {"code_writer", "code_reviewer", "debugger", "test_writer", "knowledge_agent"}
+
+
+def extract_label(text: str) -> str:
+    """从模型输出里提取路由标签。
+    优先取 `Final Answer: xxx`，否则回退为文中出现的最后一个合法标签。"""
+    m = re.search(r"Final Answer:\s*([a-z_]+)", text)
+    if m and m.group(1) in LABELS:
+        return m.group(1)
+    # 回退：找文本里出现的最后一个合法标签
+    found = [w for w in re.findall(r"[a-z_]+", text) if w in LABELS]
+    return found[-1] if found else ""
+
+
+def accuracy_reward(completions: List[str], ground_truth: List[str], **kwargs) -> List[float]:
+    """准确率奖励：标签命中 +1，否则 0。对应 11.2.2(1)。"""
+    return [1.0 if extract_label(c) == gt else 0.0
+            for c, gt in zip(completions, ground_truth)]
+
+
+def format_reward(completions: List[str], **kwargs) -> List[float]:
+    """格式奖励：输出里有规范的 `Final Answer: <合法标签>` 就给 +0.2。
+    对应 11.2.2(3) 步骤奖励的思路——鼓励可解析的结构化输出。"""
+    out = []
+    for c in completions:
+        m = re.search(r"Final Answer:\s*([a-z_]+)", c)
+        out.append(0.2 if (m and m.group(1) in LABELS) else 0.0)
+    return out
+```
+
+> **为什么拆成两个奖励函数？** TRL 的 GRPOTrainer 接受 `reward_funcs=[fn1, fn2, ...]` 一个列表，会把每个函数的分数相加。这天然实现了第 11 章 11.2.2 结尾说的「组合奖励」（准确率 + 格式），而且比手写加权更清晰。
+
+### 17.4 验证
+
+新建 `rl/test_rewards.py`：
+
+```python
+# rl/test_rewards.py —— 运行：pytest rl/test_rewards.py -v（不需要 GPU）
+from rl.rewards import extract_label, accuracy_reward, format_reward
+
+
+def test_extract_from_final_answer():
+    assert extract_label("理由：xxx。\nFinal Answer: debugger") == "debugger"
+
+def test_extract_fallback():
+    assert extract_label("我觉得应该是 code_reviewer 来处理") == "code_reviewer"
+
+def test_extract_empty_on_garbage():
+    assert extract_label("不知道") == ""
+
+def test_accuracy_reward():
+    comps = ["Final Answer: code_writer", "Final Answer: debugger"]
+    gts = ["code_writer", "code_reviewer"]
+    assert accuracy_reward(comps, ground_truth=gts) == [1.0, 0.0]
+
+def test_format_reward():
+    assert format_reward(["Final Answer: test_writer"]) == [0.2]
+    assert format_reward(["随便瞎写"]) == [0.0]
+```
+
+```bash
+pytest rl/test_rewards.py -v
+```
+
+预期：5 个测试全部 `PASSED`。奖励逻辑正确后，才值得花 GPU 时间去训练。
+
+---
+
+## 17.5 SFT 训练（LoRA + TRL SFTTrainer）
+
+第 11 章 11.3 讲了为什么必须先 SFT：预训练模型不知道输出格式，直接上 GRPO 会失败。我们先用 SFT 让模型学会「先说理由，最后一行 `Final Answer: <标签>`」这个格式。
+
+```python
+# rl/train_sft.py
+"""SFT 训练：教会模型路由任务的输出格式。对应第 11 章 11.3。"""
+from datasets import load_dataset
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTConfig, SFTTrainer
+
+BASE_MODEL = "Qwen/Qwen3-0.6B"
+OUTPUT_DIR = "./models/router_sft"
+
+
+def main():
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    model = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype="bfloat16")
+
+    # messages 格式的数据集，SFTTrainer 会自动套用 Qwen 的 chat template
+    dataset = load_dataset("json", data_files="rl/data/sft_train.jsonl", split="train")
+
+    # LoRA 配置（第 11 章 11.3.2）：只训练注意力层的低秩矩阵
+    peft_config = LoraConfig(
+        r=16,                # rank
+        lora_alpha=32,       # 通常是 rank 的 2 倍
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        task_type="CAUSAL_LM",
+    )
+
+    args = SFTConfig(
+        output_dir=OUTPUT_DIR,
+        num_train_epochs=8,          # 小数据集，多训几轮让格式学扎实
+        per_device_train_batch_size=4,
+        learning_rate=1e-4,          # LoRA 可以用比全量微调更大的学习率
+        logging_steps=5,
+        save_strategy="epoch",
+        bf16=True,
+        report_to="tensorboard",     # 离线监控，见 17.5 验证
+        max_length=512,
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        args=args,
+        train_dataset=dataset,
+        peft_config=peft_config,
+        processing_class=tokenizer,
+    )
+    trainer.train()
+    trainer.save_model(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
+    print(f"✓ SFT 完成，LoRA 适配器保存在: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 17.5 验证
+
+```bash
+# 1. 开始训练（0.6B + LoRA + 30 条数据，单卡几分钟内跑完）
+python rl/train_sft.py
+
+# 2. 训练时/后，另开终端看 loss 曲线（第 11 章 11.3.3 的训练监控）
+tensorboard --logdir ./models/router_sft
+# 浏览器打开 http://localhost:6006，看 train/loss 是否逐步下降
+
+# 3. 确认 LoRA 适配器文件已生成
+ls ./models/router_sft/adapter_model.safetensors
+```
+
+预期：训练日志里 `loss` 从 ~2 逐步下降到 <0.5；TensorBoard 里 `train/loss` 曲线单调向下；第 3 条能看到 `adapter_model.safetensors`。**loss 不降**说明学习率或数据有问题（见第 11 章 11.3.3 排查表）。
+
+---
+
+## 17.6 SFT 评估（对比 base 模型）
+
+训练完要验证效果（第 11 章 11.3.4）。我们写一个通用评估脚本，既能评 SFT 模型也能评后面的 GRPO 模型和 base 模型。
+
+```python
+# rl/evaluate.py
+"""在验证集上评估路由准确率。对应第 11 章 11.3.4 / 11.5。"""
+import argparse
+import json
+
+import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from rl.rewards import extract_label
+
+BASE_MODEL = "Qwen/Qwen3-0.6B"
+
+
+def load_model(model_path: str, use_lora: bool):
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    model = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype="bfloat16",
+                                                 device_map="auto")
+    if use_lora:
+        model = PeftModel.from_pretrained(model, model_path)
+    model.eval()
+    return model, tokenizer
+
+
+def evaluate(model_path: str, use_lora: bool, val_file="rl/data/val.jsonl"):
+    model, tokenizer = load_model(model_path, use_lora)
+    samples = [json.loads(l) for l in open(val_file, encoding="utf-8")]
+
+    correct = 0
+    for s in samples:
+        text = tokenizer.apply_chat_template(s["prompt"], tokenize=False,
+                                             add_generation_prompt=True)
+        inputs = tokenizer(text, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=64, do_sample=False)
+        gen = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:],
+                               skip_special_tokens=True)
+        pred = extract_label(gen)
+        ok = pred == s["ground_truth"]
+        correct += ok
+        print(f"[{'✓' if ok else '✗'}] 预测={pred:<16} 真实={s['ground_truth']}")
+
+    acc = correct / len(samples)
+    print(f"\n准确率: {acc:.1%} ({correct}/{len(samples)})")
+    return acc
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--model_path", required=True)
+    p.add_argument("--use_lora", action="store_true")
+    args = p.parse_args()
+    evaluate(args.model_path, args.use_lora)
+```
+
+### 17.6 验证
+
+```bash
+# 1. 评估 base 模型（未训练，通常格式混乱、准确率低）
+python -m rl.evaluate --model_path Qwen/Qwen3-0.6B
+
+# 2. 评估 SFT 模型（应显著优于 base）
+python -m rl.evaluate --model_path ./models/router_sft --use_lora
+```
+
+预期：SFT 模型的准确率明显高于 base（base 可能 <40%，SFT 后通常能到 60–100%，因为任务简单且已过拟合小数据）。关键是**每条都能解析出合法标签**（说明格式学会了），这是 GRPO 的前提。
+
+---
+
+## 17.7 GRPO 训练（强化学习，接入奖励函数）
+
+现在进入核心（第 11 章 11.4）。SFT 让模型「会输出格式」，GRPO 通过试错让它「路由得更准」。GRPO 相比 PPO 不需要 Value Model，用组内相对奖励（第 11 章 11.4.1），非常适合小显存。
+
+关键约束（第 11 章 11.1.5 提到过）：`per_device_train_batch_size` 必须能被 `num_generations` 整除。
+
+```python
+# rl/train_grpo.py
+"""GRPO 训练：用奖励函数优化路由准确率。对应第 11 章 11.4。
+从 SFT 模型继续训练（GRPO 需要一个会输出格式的初始策略）。"""
+from datasets import load_dataset
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import GRPOConfig, GRPOTrainer
+
+from rl.rewards import accuracy_reward, format_reward
+
+BASE_MODEL = "Qwen/Qwen3-0.6B"
+SFT_ADAPTER = "./models/router_sft"      # 从 SFT 学到的格式出发
+OUTPUT_DIR = "./models/router_grpo"
+
+
+def main():
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    # 先加载 base，再把 SFT 的 LoRA 合并进去作为 GRPO 的起点
+    from peft import PeftModel
+    base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype="bfloat16")
+    model = PeftModel.from_pretrained(base, SFT_ADAPTER).merge_and_unload()
+
+    # RL 格式数据集：含 prompt 和 ground_truth
+    dataset = load_dataset("json", data_files="rl/data/rl_train.jsonl", split="train")
+
+    peft_config = LoraConfig(
+        r=16, lora_alpha=32,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        task_type="CAUSAL_LM",
+    )
+
+    args = GRPOConfig(
+        output_dir=OUTPUT_DIR,
+        num_train_epochs=5,
+        per_device_train_batch_size=8,   # 必须能被 num_generations 整除
+        num_generations=8,               # 每个请求生成 8 个答案算组内相对奖励
+        max_completion_length=128,
+        learning_rate=1e-5,              # GRPO 学习率比 SFT 小（第 11 章 11.4.2）
+        beta=0.05,                       # KL 惩罚系数 kl_coef（第 11 章 11.4.2）
+        temperature=0.9,                 # 保持探索性
+        logging_steps=2,
+        bf16=True,
+        report_to="tensorboard",
+    )
+
+    trainer = GRPOTrainer(
+        model=model,
+        reward_funcs=[accuracy_reward, format_reward],   # 组合奖励，分数相加
+        args=args,
+        train_dataset=dataset,
+        peft_config=peft_config,
+    )
+    trainer.train()
+    trainer.save_model(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
+    print(f"✓ GRPO 完成，模型保存在: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 17.7 验证
+
+```bash
+# 1. 开始 GRPO 训练
+python rl/train_grpo.py
+
+# 2. 看 reward 是否上升、KL 是否在合理范围（第 11 章 11.4.3 训练监控）
+tensorboard --logdir ./models/router_grpo
+# 关注 train/reward（应逐步上升）和 train/kl（应保持在 0.01–0.1，不爆炸）
+```
+
+预期：TensorBoard 里 `train/reward` 整体趋势上升（趋近 1.2 = 准确率 1.0 + 格式 0.2）；`train/kl` 保持在合理区间不爆炸。若 reward 不升 / KL 爆炸，按第 11 章 11.4.3 结尾的排查表调 `learning_rate` 和 `beta`。
+
+---
+
+## 17.8 合并 LoRA 并导出可部署模型
+
+第 11 章 11.6.4：为了方便部署，把 LoRA 权重合并回基础模型，得到一个独立的完整模型。
+
+```python
+# rl/merge_lora.py
+"""把 GRPO 训练的 LoRA 合并进基础模型，导出可直接部署的完整模型。
+对应第 11 章 11.6.4(1)。"""
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+BASE_MODEL = "Qwen/Qwen3-0.6B"
+ADAPTER = "./models/router_grpo"
+MERGED = "./models/router_merged"
+
+
+def main():
+    base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype="bfloat16")
+    model = PeftModel.from_pretrained(base, ADAPTER)
+    merged = model.merge_and_unload()
+    merged.save_pretrained(MERGED)
+    AutoTokenizer.from_pretrained(BASE_MODEL).save_pretrained(MERGED)
+    print(f"✓ 已导出合并模型到: {MERGED}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 17.8 验证
+
+```bash
+python rl/merge_lora.py
+
+# 确认导出的是完整模型（有 model.safetensors 和 config.json，不再是 adapter）
+ls ./models/router_merged/
+
+# 直接用合并模型评估（注意：不再加 --use_lora，因为已经是完整模型）
+python -m rl.evaluate --model_path ./models/router_merged
+# 评估脚本里 use_lora=False 时会加载 BASE_MODEL；要评合并模型需临时把
+# load_model 的 BASE_MODEL 改成 MERGED 路径，或直接进入 17.9 用服务化方式验证
+```
+
+预期：`router_merged/` 下有 `model.safetensors`、`config.json`、`tokenizer.json` 等完整模型文件。
+
+> **提示**：`rl/evaluate.py` 里 base 路径写死为 `Qwen/Qwen3-0.6B`，评估合并模型时最省事的方式是下一节起服务后用 API 验证，避免改评估脚本。
+
+---
+
+## 17.9 部署为 OpenAI-compat 端点
+
+这一步是把训练成果接回 PolyCoder 的桥梁。回顾第 0 章、第 3 章：PolyCoder 的 OpenAI Provider 只认一个 `base_url`。所以只要让本地模型暴露成 OpenAI 兼容的 `/v1/chat/completions` 接口，就能无缝接入。
+
+推荐用 **vLLM**（吞吐高、原生 OpenAI-compat）；显存紧张也可以用 Ollama。
+
+```bash
+# 方式 A：vLLM（推荐）
+pip install vllm
+python -m vllm.entrypoints.openai.api_server \
+    --model ./models/router_merged \
+    --served-model-name polycoder-router \
+    --port 8010
+
+# 方式 B：Ollama（需先把模型转成 GGUF，步骤较多，此处从略）
+```
+
+### 17.9 验证
+
+```bash
+# 起服务后，用 curl 走 OpenAI 兼容接口测一条路由请求
+curl http://localhost:8010/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "polycoder-router",
+    "messages": [
+      {"role": "system", "content": "你是 PolyCoder 的请求路由器。可选标签：code_writer、code_reviewer、debugger、test_writer、knowledge_agent。先说理由，最后一行必须是 `Final Answer: <标签>`。"},
+      {"role": "user", "content": "报错 KeyError，帮我看看哪里错了"}
+    ],
+    "max_tokens": 64
+  }'
+```
+
+预期：返回的 JSON 里 `choices[0].message.content` 以 `Final Answer: debugger` 结尾。能通过 HTTP 拿到正确路由，就说明训练成果已经「服务化」，可以接回主框架了。
+
+---
+
+## 17.10 接入 PolyCoder：新建 RouterAgent 子 Agent
+
+最后一步，把本地路由模型包成一个子 Agent。**关键在于：它只是换了个 base_url 的 OpenAI Provider**——完全复用第 3 章的抽象层，不动主框架任何代码。
+
+### 给 `.env` 增加路由模型配置
+
+```dotenv
+# ── 本地路由模型（第 17 章 RL 训练产物）──────────────────
+ROUTER_BASE_URL=http://localhost:8010/v1
+ROUTER_MODEL=polycoder-router
+```
+
+在 `core/config.py` 的 `Settings` 里加两个字段：
+
+```python
+    router_base_url: str = "http://localhost:8010/v1"
+    router_model: str = "polycoder-router"
+```
+
+### 子 Agent 实现 `sub_agents/router_agent.py`
+
+```python
+# sub_agents/router_agent.py
+"""用本地 RL 训练的模型做请求路由。复用第 3 章 OpenAI Provider，
+只是 base_url 指向本地 vLLM 服务。不改动主框架。"""
+import re
+
+from core.config import settings
+from providers.openai import OpenAIProvider   # 第 3 章已有
+from providers.types import Message, TextBlock
+
+LABELS = {"code_writer", "code_reviewer", "debugger", "test_writer", "knowledge_agent"}
+SYSTEM_PROMPT = (
+    "你是 PolyCoder 的请求路由器。可选标签：code_writer、code_reviewer、"
+    "debugger、test_writer、knowledge_agent。先说理由，"
+    "最后一行必须是 `Final Answer: <标签>`。"
+)
+
+
+class RouterAgent:
+    def __init__(self):
+        # 复用第 3 章的 OpenAIProvider，只是换 base_url / model
+        self.provider = OpenAIProvider(
+            api_key="not-needed",             # 本地服务无需真实 key
+            base_url=settings.router_base_url,
+            model=settings.router_model,
+        )
+
+    async def route(self, user_request: str) -> str:
+        """返回路由标签；解析失败时回退到 code_writer。"""
+        messages = [
+            Message(role="system", content=[TextBlock(text=SYSTEM_PROMPT)]),
+            Message(role="user", content=[TextBlock(text=user_request)]),
+        ]
+        resp = await self.provider.complete(messages, max_tokens=64)
+        text = resp.text if hasattr(resp, "text") else str(resp)
+        m = re.search(r"Final Answer:\s*([a-z_]+)", text)
+        if m and m.group(1) in LABELS:
+            return m.group(1)
+        found = [w for w in re.findall(r"[a-z_]+", text) if w in LABELS]
+        return found[-1] if found else "code_writer"
+```
+
+> **注意**：上面 `OpenAIProvider` 的构造参数（`api_key/base_url/model`）和 `complete()` 的返回结构，请对齐你在第 3 章的实际实现签名——如果字段名不同，改这里的调用即可，逻辑不变。
+
+### 17.10 验证
+
+新建 `rl/test_router_integration.py`：
+
+```python
+# rl/test_router_integration.py —— 需要 17.9 的 vLLM 服务在跑
+import asyncio
+from sub_agents.router_agent import RouterAgent
+
+
+async def main():
+    router = RouterAgent()
+    cases = [
+        ("帮我实现一个快速排序", "code_writer"),
+        ("审查一下这段代码", "code_reviewer"),
+        ("抛了 TypeError 帮我排查", "debugger"),
+        ("给这个函数加测试", "test_writer"),
+        ("项目日志规范是什么", "knowledge_agent"),
+    ]
+    ok = 0
+    for req, expect in cases:
+        got = await router.route(req)
+        hit = got == expect
+        ok += hit
+        print(f"[{'✓' if hit else '✗'}] {req!r:<30} -> {got} (期望 {expect})")
+    print(f"\n端到端路由准确率: {ok}/{len(cases)}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```bash
+# 确保 17.9 的 vLLM 服务在跑，然后：
+python -m rl.test_router_integration
+```
+
+预期：多数用例 `✓`，路由准确率接近验证集水平。至此，一个用 SFT+GRPO 训练出来的本地模型，已经作为子 Agent 真正跑在 PolyCoder 里了。
+
+> **接入 Coordinator（可选下一步）**：在第 6 章的 `coordinator/planner.py` 里，可以先调用 `RouterAgent.route()` 拿到标签，再决定分发给哪个专家子 Agent——把「LLM 靠 prompt 猜路由」换成「专门训练过的小模型判路由」，更快、更便宜、更可控。
+
+---
+
+## 17.11 本章检查清单
+
+```
+□ 理解架构错配：不能训 Claude，只能训本地小模型当子 Agent（17.1）
+□ GPU 可用，TRL/transformers/peft 均可导入（17.2 验证三条全过）
+□ 运行 build_dataset.py，生成 sft/rl/val 三个 JSONL（17.3）
+□ pytest rl/test_rewards.py -v 全部通过（奖励逻辑正确，17.4）
+□ 运行 train_sft.py，TensorBoard 里 loss 下降，生成 adapter（17.5）
+□ SFT 模型评估准确率明显高于 base，且都能解析出合法标签（17.6）
+□ 运行 train_grpo.py，reward 上升、KL 不爆炸（17.7）
+□ merge_lora.py 导出完整合并模型（17.8）
+□ vLLM 起服务，curl 能拿到 `Final Answer: <标签>`（17.9）
+□ RouterAgent 端到端路由测试多数通过（17.10）
+```
+
+> **学习路径提醒**（呼应第 11 章章末）：本章只训了「分类型」任务，奖励是稀疏的准确率。真正的 Agentic RL 进阶方向是**多步工具调用**的奖励设计（每步给中间奖励）——那需要把整条 agent 轨迹作为训练样本，复杂度高很多。建议先把本章这条"单步、可自动验证"的链路彻底跑通、理解每个超参数的作用，再去啃多步轨迹的 RL。
+
+---
+
+## 17.12 Apple Silicon（M 系列芯片）适配指南
+
+> 前面 17.2–17.10 的代码是按 **NVIDIA CUDA** 写的。如果你在 **Mac（M1/M2/M3/M4）** 上跑，PyTorch 走的是 **MPS**（Metal Performance Shaders）后端，有几处硬冲突必须改。本节把改动集中列出，照着改即可。
+>
+> **好消息**：Qwen3-0.6B 很小，M 系列的统一内存（模型权重和"显存"共用同一块内存）足够跑 SFT 甚至 GRPO。**真正的拦路虎只有一个——vLLM 在 Apple Silicon 上跑不起来，必须换 Ollama。**
+
+### 各步骤在 M4 上的可行性
+
+| 步骤 | 能跑吗 | 说明 |
+|------|--------|------|
+| 17.3 数据集 / 17.4 奖励单测 | ✅ 完全能 | 纯 CPU，与芯片无关 |
+| 17.5 SFT 训练 | ✅ 能（比 CUDA 慢） | 0.6B 小模型走 MPS 可行 |
+| 17.6 评估 / 17.8 合并 | ✅ 能 | |
+| 17.7 GRPO 训练 | ⚠️ 能但吃力 | 要生成多个答案，比 SFT 重；需调小参数 |
+| 17.9 vLLM 部署 | ❌ 不行 | vLLM 基本只支持 CUDA → **改用 Ollama** |
+
+### 改动 1：安装 MPS 版 torch（替代 17.2 的 CUDA 轮子）
+
+```bash
+# ❌ 不要用 17.2 里的 CUDA 命令（--index-url .../cu121）
+# ✅ M 系列直接装默认 torch，自带 MPS 支持
+pip install torch
+pip install -r requirements-rl.txt   # vLLM 那行可跳过，M 芯片装不了
+
+# 验证 MPS 可用（必须输出 True）
+python -c "import torch; print('MPS available:', torch.backends.mps.is_available())"
+```
+
+> **注意**：`requirements-rl.txt` 里不需要也装不上 vLLM；17.9 会用 Ollama 替代。
+
+### 改动 2：训练脚本改 fp16、手动搬到 mps（改 17.5 / 17.7）
+
+MPS 对 `bfloat16` 支持不稳定，且 `device_map="auto"`（依赖 accelerate 的 CUDA 分配逻辑）在 MPS 上行为不可靠。三处统一改：
+
+**在 `rl/train_sft.py` 里：**
+
+```python
+# 加载模型：bfloat16 → float16
+model = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype="float16")
+model = model.to("mps")          # 手动搬到 MPS，别用 device_map
+
+# SFTConfig 里：bf16=True → fp16=True
+args = SFTConfig(
+    ...
+    fp16=True,                   # 原来是 bf16=True
+    ...
+)
+```
+
+**在 `rl/train_grpo.py` 里，除了上面同样的 fp16/mps 改动，再把 GRPO 的重负载参数调小：**
+
+```python
+base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype="float16")
+model = PeftModel.from_pretrained(base, SFT_ADAPTER).merge_and_unload().to("mps")
+
+args = GRPOConfig(
+    ...
+    per_device_train_batch_size=4,   # 8 → 4
+    num_generations=4,               # 8 → 4（必须能整除 batch_size）
+    max_completion_length=128,
+    fp16=True,                       # 原来是 bf16=True
+    ...
+)
+```
+
+> 若 fp16 训练出现 NaN loss，退一步：去掉 `fp16=True`（用 fp32），M 芯片内存够，只是慢一点，最稳。
+
+### 改动 3：评估脚本改 mps（改 17.6）
+
+`rl/evaluate.py` 的 `load_model` 里：
+
+```python
+model = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype="float16")
+model = model.to("mps")          # 替换掉 device_map="auto"
+```
+
+`inputs = tokenizer(...).to(model.device)` 这行不用改——`model.device` 会自动是 `mps`。
+
+### 改动 4：用 Ollama 替代 vLLM 部署（替代 17.9）
+
+这是 M 芯片和 CUDA 路线最大的分叉。Ollama 是 Apple Silicon 上最顺的本地 OpenAI-compat 服务，自带 `http://localhost:11434/v1` 兼容接口——正好对上第 3 章的 OpenAI Provider。
+
+需要先把 17.8 合并出的 HuggingFace 模型转成 **GGUF** 格式再导入 Ollama：
+
+```bash
+# 1. 安装 Ollama（若未装）
+brew install ollama
+ollama serve &                    # 后台起服务
+
+# 2. 把合并模型转成 GGUF（用 llama.cpp 的转换脚本）
+pip install llama-cpp-python      # 或 git clone llama.cpp 自行编译
+git clone https://github.com/ggerganov/llama.cpp
+python llama.cpp/convert_hf_to_gguf.py ./models/router_merged \
+    --outfile ./models/router.gguf --outtype f16
+
+# 3. 写 Modelfile 导入 Ollama
+cat > Modelfile << 'EOF'
+FROM ./models/router.gguf
+EOF
+ollama create polycoder-router -f Modelfile
+```
+
+### 17.12 验证
+
+```bash
+# 1. MPS 可用
+python -c "import torch; print(torch.backends.mps.is_available())"   # True
+
+# 2. 改完后跑 SFT，确认能在 MPS 上训练（活动监视器能看到 GPU 占用）
+python rl/train_sft.py
+
+# 3. Ollama 服务化后，走 OpenAI 兼容接口测一条路由（注意端口 11434）
+curl http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "polycoder-router",
+    "messages": [
+      {"role": "system", "content": "你是 PolyCoder 的请求路由器。可选标签：code_writer、code_reviewer、debugger、test_writer、knowledge_agent。先说理由，最后一行必须是 `Final Answer: <标签>`。"},
+      {"role": "user", "content": "报错 KeyError，帮我看看哪里错了"}
+    ],
+    "max_tokens": 64
+  }'
+```
+
+预期：第 1 条输出 `True`；第 2 条训练日志 loss 正常下降（比 CUDA 慢，属正常）；第 3 条返回内容以 `Final Answer: debugger` 结尾。
+
+### 改动 5：RouterAgent 指向 Ollama 端口（改 17.10）
+
+`.env` 里把路由服务地址改成 Ollama 的端口：
+
+```dotenv
+# M 芯片用 Ollama，端口是 11434（vLLM 才是 8010）
+ROUTER_BASE_URL=http://localhost:11434/v1
+ROUTER_MODEL=polycoder-router
+```
+
+其余 `sub_agents/router_agent.py` 和 17.10 的端到端测试**完全不用改**——这正是第 3 章 OpenAI Provider 抽象层的价值：换后端只改一行 `base_url`。
+
+---
