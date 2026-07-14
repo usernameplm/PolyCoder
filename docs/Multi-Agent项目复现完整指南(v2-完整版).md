@@ -14672,7 +14672,7 @@ if result.metrics:
 # 第 17 章：阶段 17 —— 用强化学习训练本地路由子 Agent（SFT + GRPO）
 
 > 本章参考 hello-agents 第十一章 Agentic-RL，把「强化学习训练一个小模型」这件事，落到 PolyCoder 真实可用的场景上。
-> **前置**：至少一块 ≥8GB 显存的 GPU；已完成第 3 章（Provider 抽象层）和第 6 章（Coordinator）。
+> **前置**：一块 ≥8GB 显存的 NVIDIA GPU——本地没有也没关系，**本章默认路线是租一台按量计费的 GPU 服务器**（见 17.2，成本个位数人民币）；坚持用 Mac 本地训练见章末 17.12。此外已完成第 3 章（Provider 抽象层）和第 6 章（Coordinator）。
 > **产出**：一个用 SFT + GRPO 训练出来的 Qwen3-0.6B「请求路由模型」，通过 OpenAI-compat 端点接入现有 Coordinator，**不改动主框架代码**。
 > 每一小节都有独立的验证命令，跑通即算通过。
 
@@ -14731,6 +14731,41 @@ if result.metrics:
 
 第 11 章用的是 `hello_agents.tools.RLTrainingTool`（一个封装好的黑箱）。**本章不用它**——延续 v2「去掉黑箱、自实现」的理念，我们直接用 TRL 原生 API，每一步都看得见。
 
+### 先租一台 GPU 服务器（本章默认路线）
+
+本章的训练需要一块 NVIDIA 显卡。**如果你本地没有 N 卡（比如只有 Mac 或核显笔记本），最省事的做法是租一台按量计费的 GPU 服务器**——它天然是 Linux + CUDA 环境，下面 17.2–17.10 的代码一行都不用改。训练是「一次性」的：跑通、导出模型就结束，按小时租、跑完即关，成本极低。
+
+> 本地就有 N 卡的读者可跳过本小节，直接在本地按同样步骤操作。用 Mac 的读者若坚持本地训练，见章末 17.12 的 Apple Silicon 适配（要改 5 处，较麻烦，不推荐）。
+
+**租什么档次**：本章模型是 Qwen3-0.6B + LoRA，极小。SFT「几分钟内跑完」（17.5），GRPO 也就几十分钟，**任何一张消费级卡都绰绰有余，不需要 A100 这类高端卡**。
+
+| 需求 | 推荐卡 | 说明 |
+|------|--------|------|
+| 推荐 | RTX 3090 / 4090（24GB） | AutoDL、恒源云、vast.ai 上最便宜的一档，约 1–2 元/小时 |
+| 最低 | T4 / RTX 3060（12–16GB） | 也能跑，只是略慢；前置要求的 ≥8GB 显存指的就是这一档 |
+
+> **成本预估**：整章从头跑通约 1–2 小时机时，按量计费总花费个位数人民币。**跑完务必释放/关闭实例**，否则空转也计费。
+
+**关键思路：训练在云端，推理拉回本地。** 你不需要把整个 PolyCoder 搬上服务器。训练机只干「训练 + 导出模型」这一件事，17.9/17.10 的推理和接回主框架可以放回本地做（推理只跑 0.6B 模型，本地 Ollama / CPU 就够）：
+
+```
+云 GPU 服务器（临时）              本地开发机（长期）
+┌─────────────────────┐         ┌──────────────────────┐
+│ 上传 rl/ 目录         │         │  下载 router_merged/  │
+│ 装 requirements-rl   │         │  接回 Coordinator      │
+│ build→sft→grpo→merge │  ──►    │  （17.9 / 17.10）      │
+└─────────────────────┘  权重~1.2GB └────────────────────┘
+```
+
+**上传训练文件到服务器**（用 `scp`，或 AutoDL 等平台自带的网页上传更省事）：
+
+```bash
+# 从本地把 rl/ 目录同步到服务器（按你的实例 IP / 端口改）
+scp -P <端口> -r ./rl/ requirements-rl.txt <用户名>@<服务器IP>:~/polycoder-rl/
+```
+
+后续 17.3–17.8 都在这台服务器上执行；17.8 导出模型后再拉回本地（见 17.8 末尾）。
+
 ### 新增依赖
 
 在项目根目录新建 `requirements-rl.txt`（和主 `requirements.txt` 分开，因为这些包很重，只在训练机上装）：
@@ -14747,12 +14782,19 @@ accelerate>=1.0.0           # 训练加速与多卡支持
 tensorboard>=2.17.0         # 离线训练曲线可视化（本章用它监控，不依赖 wandb）
 ```
 
-安装（先激活主项目的虚拟环境）：
+在服务器上安装（本地有 N 卡则在本地虚拟环境安装）：
 
 ```bash
-# CUDA 12.1 的 torch 示例；请按 https://pytorch.org 选择你的 CUDA 版本
+# 登录服务器后，在上传的目录里建虚拟环境
+cd ~/polycoder-rl
+python -m venv .venv && source .venv/bin/activate
+
+# CUDA 12.1 的 torch 示例；云平台镜像通常已带对应 CUDA 的 torch，可先验证再决定是否重装
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements-rl.txt
+
+# 国内服务器建议设 HuggingFace 镜像，否则下载基础模型会卡住
+export HF_ENDPOINT=https://hf-mirror.com
 ```
 
 ### 训练目录骨架
@@ -15297,23 +15339,37 @@ python -m rl.evaluate --model_path ./models/router_merged
 
 > **提示**：`rl/evaluate.py` 里 base 路径写死为 `Qwen/Qwen3-0.6B`，评估合并模型时最省事的方式是下一节起服务后用 API 验证，避免改评估脚本。
 
+### 把模型拉回本地（服务器路线）
+
+训练到此结束。如果你是在租用的 GPU 服务器上跑的，现在把合并后的完整模型下载回本地，之后的 17.9/17.10（推理 + 接回主框架）都在本地做，**服务器就可以释放、停止计费了**：
+
+```bash
+# 在本地执行，把合并后的完整模型下载回来（约 1.2GB）
+scp -P <端口> -r <用户名>@<服务器IP>:~/polycoder-rl/models/router_merged ./models/
+```
+
+> 若想在释放实例前先确认服务化没问题，也可以留着服务器跑完下一节 17.9 的 vLLM 验证再释放——二选一即可。
+
 ---
 
 ## 17.9 部署为 OpenAI-compat 端点
 
 这一步是把训练成果接回 PolyCoder 的桥梁。回顾第 0 章、第 3 章：PolyCoder 的 OpenAI Provider 只认一个 `base_url`。所以只要让本地模型暴露成 OpenAI 兼容的 `/v1/chat/completions` 接口，就能无缝接入。
 
-推荐用 **vLLM**（吞吐高、原生 OpenAI-compat）；显存紧张也可以用 Ollama。
+**推理只跑 0.6B 模型，本地就够，不必为此长期租着 GPU。** 两种起服务方式：
+
+- **方式 A：vLLM**（吞吐高、原生 OpenAI-compat，需要 CUDA）——适合你还留着 GPU 服务器、想在释放前一并验证的情况。
+- **方式 B：Ollama**（本地 CPU / Mac 统一内存即可跑）——把模型拉回本地后的推荐方式，转 GGUF 导入的完整步骤见章末 17.12 改动 4。
 
 ```bash
-# 方式 A：vLLM（推荐）
+# 方式 A：vLLM（在带 CUDA 的机器上，如尚未释放的服务器）
 pip install vllm
 python -m vllm.entrypoints.openai.api_server \
     --model ./models/router_merged \
     --served-model-name polycoder-router \
     --port 8010
 
-# 方式 B：Ollama（需先把模型转成 GGUF，步骤较多，此处从略）
+# 方式 B：Ollama（本地推理推荐；转 GGUF + ollama create 的完整命令见 17.12 改动 4）
 ```
 
 ### 17.9 验证
@@ -15465,7 +15521,9 @@ python -m rl.test_router_integration
 
 ## 17.12 Apple Silicon（M 系列芯片）适配指南
 
-> 前面 17.2–17.10 的代码是按 **NVIDIA CUDA** 写的。如果你在 **Mac（M1/M2/M3/M4）** 上跑，PyTorch 走的是 **MPS**（Metal Performance Shaders）后端，有几处硬冲突必须改。本节把改动集中列出，照着改即可。
+> 本章主线是「租 GPU 服务器训练、模型拉回本地推理」（见 17.2）。本节针对两种情况：
+> 1. **坚持在 Mac 上本地训练**（不想租服务器）——17.2–17.10 的代码按 CUDA 写，Mac 走 MPS 后端有几处硬冲突必须改，下面的改动 1–3、5 集中列出。
+> 2. **走主线、把模型拉回 Mac 做本地推理**——这时只需要下面的**改动 4**（用 Ollama 起服务），训练部分的改动可忽略。
 >
 > **好消息**：Qwen3-0.6B 很小，M 系列的统一内存（模型权重和"显存"共用同一块内存）足够跑 SFT 甚至 GRPO。**真正的拦路虎只有一个——vLLM 在 Apple Silicon 上跑不起来，必须换 Ollama。**
 
