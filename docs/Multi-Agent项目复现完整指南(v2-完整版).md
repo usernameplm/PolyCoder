@@ -27,7 +27,7 @@ Provider 层（3-4）：★ 新增，取代 claude-agent-sdk
 
 工程层（8-10）：
   阶段 8  → 上下文管理（Token 预算 + 压缩 + 缓存）
-  阶段 9  → Skills 系统（SKILL.md 按需加载 + TF-IDF 工具搜索）
+  阶段 9  → Skills 系统（索引表常驻 + LLM 用 get_skill_guide 工具按需加载 SKILL.md）
   阶段 10 → 会话持久化（JSONL + Redis 缓存 + 断点续传）
 
 集成层（11-14）：
@@ -98,8 +98,10 @@ lark-oapi>=1.6.0
 python-dotenv>=1.0.0
 httpx>=0.27.0
 tenacity>=9.0.0             # 重试（指数退避）
-jieba>=0.42.1               # 中文分词（Skill TF-IDF 搜索用，见 9.4 节）
 ```
+
+> 第 9 章的 Skills 系统改为"LLM 通过 `get_skill_guide` 工具按需加载"，不再做 TF-IDF 分词搜索，
+> 因此**无需 jieba**。（旧版本这里列过 `jieba`，现已移除。）
 
 ### 0.3 .env 配置（多 Provider 支持）
 
@@ -6222,8 +6224,10 @@ kwargs["system"] = [
 
 # 第 9 章：阶段 9 —— Skills 系统
 
-> **本章目标**：用 SKILL.md 文件按需加载专业知识，而不是把所有知识塞进 system prompt。
+> **本章目标**：让 LLM 通过工具调用**按需加载**专业知识，而不是把所有知识塞进 system prompt。
 > 解决"system prompt 越来越长"的根本问题。
+> 核心机制：**system prompt 常驻一张极短的「技能索引表」，LLM 语义匹配后自主调用
+> `get_skill_guide(skill_name)` 工具加载对应 SKILL.md 全文。**
 
 ---
 
@@ -6239,17 +6243,43 @@ kwargs["system"] = [
 | 多领域知识混杂 | LLM 可能把 A 领域的规则用到 B 领域 |
 | 更新困难 | 改一处可能影响全局行为 |
 
-**Skills 系统的解法**：把每个专业领域写成独立的 SKILL.md 文件，根据当前任务动态选择并加载相关 Skill。
+**Skills 系统的解法**：把每个专业领域写成独立的 SKILL.md 文件，**由 LLM 自己决定何时加载哪一个**。
+
+具体做法分两层：
+
+1. **常驻的技能索引表**：把每个 Skill 的 `name + 一句话描述`（不是全文！）渲染成一张很短的表，
+   拼进 system prompt。LLM 因此始终"知道有哪些技能可用、各自管什么"，但不占用多少 token。
+2. **按需加载工具 `get_skill_guide`**：LLM 判断当前任务需要某个 Skill 时，**主动发起一次工具调用**
+   `get_skill_guide(skill_name)`，工具读取该 SKILL.md 全文，作为 `tool_result` 注入对话历史。
+   之后 LLM 就带着这份完整指南继续工作。
 
 ```
 用户请求："帮我审查这段 Python 代码"
   ↓
-SkillSearcher 搜索：找到 code-review.md（相关度最高）
+system prompt 里常驻的索引表告诉 LLM：有个 code-review 技能，管代码审查
   ↓
-加载 code-review.md 的内容，注入 system prompt
+LLM 自主决定：这个任务该用 code-review → 发起工具调用 get_skill_guide("code-review")
   ↓
-Agent 带着代码审查专业知识执行任务
+工具读取 code-review.md 全文 → 作为 tool_result 回填进对话
+  ↓
+Agent 带着代码审查专业知识（含审查流程、输出格式）继续执行任务
 ```
+
+### 两种哲学的对比：预注入 vs 按需加载
+
+早期实现（本章的旧版本）是**代码预注入**：每次 `run()` 时用 TF-IDF 之类的算法搜出相关 Skill，
+把全文强行拼进 system prompt。这一版改成**LLM 自主按需加载**，差异如下：
+
+| 维度 | 预注入（旧） | 按需加载（本章） |
+|------|-------------|-----------------|
+| 谁决定加载哪个 Skill | 代码里的检索算法（TF-IDF/关键词） | LLM 自己按语义判断 |
+| 加载时机 | 每次调用**无条件**搜索并拼接 | 仅当 LLM 认为需要时才发起工具调用 |
+| system prompt 体积 | 塞进 top-N 全文，越来越大 | 只常驻极短索引表 |
+| 不需要 Skill 的任务 | 照样塞一堆无关规范，稀释注意力 | LLM 不调工具，零额外开销 |
+| 能否加载多个 / 追加加载 | 固定 top-N，一次性 | LLM 可在推理中多次、按需追加加载 |
+
+> 这正是 Claude Code、以及本项目参考的 DDH-main-agent 等成熟 Agent 采用的模式：
+> **把"要不要用某个能力、什么时候用"的决策权交还给模型**，代码只负责提供索引和加载工具。
 
 ---
 
@@ -6258,14 +6288,7 @@ Agent 带着代码审查专业知识执行任务
 ```markdown
 ---
 name: code-review
-description: 代码审查专家，负责发现代码中的 Bug、安全漏洞和性能问题
-triggers:
-  - 代码审查
-  - code review
-  - 检查代码
-  - review
-  - 有没有问题
-  - 安全漏洞
+description: 代码审查专家——发现代码中的 Bug、安全漏洞和性能问题。当需要审查代码、检查安全漏洞、评估代码质量时加载。
 ---
 
 ## 你的角色
@@ -6297,6 +6320,12 @@ triggers:
 - 用户输入必须验证和清洁，不能直接用于系统调用
 ```
 
+> **frontmatter 只需要 `name` 和 `description` 两个字段。**
+> 旧版本还有一个 `triggers`（关键词列表），是给 TF-IDF/关键词匹配用的——现在触发判断交给
+> LLM 的语义理解，**不再需要 `triggers`**。`description` 要写清两件事：**这个 Skill 是干什么的**、
+> **什么时候该加载它**（触发场景）。因为 `description` 会进入索引表和 `get_skill_guide` 的工具描述，
+> 是 LLM 判断"要不要加载"的唯一依据，务必写得具体、可区分。
+
 ---
 
 ## 9.3 Skill 加载器 `skills/loader.py`
@@ -6314,9 +6343,8 @@ from dataclasses import dataclass
 @dataclass
 class Skill:
     name: str
-    description: str
-    triggers: list[str]   # 触发关键词列表
-    content: str          # Skill 的主体内容（注入到 system prompt 的部分）
+    description: str      # 一句话说明"是什么 + 何时加载"——进索引表和工具描述
+    content: str          # Skill 的主体内容（被 get_skill_guide 按需读取的全文）
     path: str
 
 
@@ -6352,135 +6380,137 @@ def _parse_skill_file(path: Path) -> Skill | None:
     frontmatter_text = frontmatter_match.group(1)
     body = content[frontmatter_match.end():]
 
-    # 简单解析 YAML（不用 PyYAML 避免额外依赖）
+    # 简单解析 YAML（不用 PyYAML 避免额外依赖）。
+    # 现在 frontmatter 只有 name / description 两个标量键，不再有 triggers 列表，
+    # 所以解析逻辑简化为纯键值对。
     meta = {}
-    current_key = None
-    current_list = None
-
     for line in frontmatter_text.split("\n"):
-        if line.startswith("  - "):   # 列表项
-            if current_list is not None:
-                current_list.append(line[4:].strip())
-        elif ": " in line:           # 普通键值对
+        if ": " in line:
             key, _, value = line.partition(": ")
-            key = key.strip()
-            value = value.strip()
-            if not value:            # 空值表示后面是列表
-                current_list = []
-                meta[key] = current_list
-                current_key = key
-            else:
-                meta[key] = value
-                current_list = None
+            meta[key.strip()] = value.strip()
 
     return Skill(
         name=meta.get("name", path.stem),
         description=meta.get("description", ""),
-        triggers=meta.get("triggers", []),
         content=body.strip(),
         path=str(path),
     )
+
+
+def build_skill_index(skills: list[Skill]) -> str:
+    """把所有 Skill 渲染成一张「技能索引表」（只含 name + description），供常驻 system prompt。
+
+    这是"按需加载"机制的第一层：LLM 靠这张表知道"有哪些技能、各自何时用"，
+    但**不加载任何全文**——全文由 LLM 自主调用 get_skill_guide(name) 时才读取（第二层）。
+    索引表只有几行，token 开销极小，和把 Skill 全文预注入 system prompt 是本质区别。
+    """
+    if not skills:
+        return ""
+
+    rows = "\n".join(f"| `{s.name}` | {s.description} |" for s in skills)
+    return (
+        "## 可用技能（Skills）\n\n"
+        "以下技能提供各领域的团队规范和操作指南。"
+        "**当任务匹配某个技能的适用场景时，先调用 `get_skill_guide(skill_name)` 工具"
+        "获取它的完整指南，再据此执行**；任务用不到任何技能时，不必调用。\n\n"
+        "| skill_name | 适用场景 |\n"
+        "|------------|----------|\n"
+        f"{rows}"
+    )
 ```
+
+> **索引表长什么样**：`build_skill_index()` 输出的就是一张 Markdown 表格，例如
+>
+> ```
+> | skill_name | 适用场景 |
+> |------------|----------|
+> | `code-review` | 代码审查专家……当需要审查代码、检查安全漏洞时加载。 |
+> | `async-patterns` | 本项目的 asyncio 规范……审查/修改异步代码时加载。 |
+> ```
+>
+> LLM 读到这张表，就知道"有 code-review 这个技能、什么时候该用它"，但此刻还没加载任何全文。
 
 ---
 
-## 9.4 TF-IDF 工具搜索 `skills/searcher.py`
+## 9.4 按需加载工具 `skills/skill_tool.py`
+
+这一节把旧版本的"TF-IDF 搜索 + 预注入"整个替换掉。不再有 `searcher.py`（连同它依赖的 `jieba`），
+取而代之的是一个标准工具 `GetSkillGuideTool`——它继承第 5 章的 `BaseTool`，注册进 `ToolRegistry`，
+由 LLM 在 Agentic Loop 里**自主调用**。
 
 ```python
-# skills/searcher.py
+# skills/skill_tool.py
 """
-基于 TF-IDF 的 Skill 相关性搜索。
+get_skill_guide 工具：LLM 按需加载某个 Skill 的完整指南。
 
-TF-IDF 是一种简单的文本相关性算法：
-  - TF（词频）：词在查询中出现的频率
-  - IDF（逆文档频率）：词在所有 Skill 中的"稀有程度"（越稀有越有区分度）
+工作方式（对齐 DDH-main-agent 的 get_skill_guide）：
+  1. system prompt 里常驻 build_skill_index() 生成的技能索引表（只有 name + description）；
+  2. LLM 判断任务需要某技能 → 发起工具调用 get_skill_guide(skill_name="code-review")；
+  3. 本工具读取 skills/code-review.md 全文，作为 tool_result 返回；
+  4. LLM 带着完整指南继续工作。
 
-分词用 jieba：中文没有空格分隔单词，简单按正则切分会把一整段连续汉字
-当成一个词（比如"帮我写一个"整体算一个 token），导致中文 query 命中率很差。
-jieba 是成熟的中文分词库，能正确识别词边界，同时也兼容英文/数字分词。
+这样每个 Skill 的全文只在"真正需要时"进入上下文，且由模型自己决定，而不是每次无条件预注入。
 """
-import math
-import re
-
-import jieba
-
-from .loader import Skill, load_skills
+from tools.base import BaseTool
+from skills.loader import Skill, load_skills
 
 
-class SkillSearcher:
+class GetSkillGuideTool(BaseTool):
 
     def __init__(self, skills: list[Skill] | None = None, skills_dir: str = "skills/"):
-        self.skills = skills if skills is not None else load_skills(skills_dir)
-        self._idf = self._compute_idf()
+        # 进程内缓存已加载的 Skill（name → Skill），避免每次调用都重扫磁盘。
+        self._skills = skills if skills is not None else load_skills(skills_dir)
+        self._by_name = {s.name: s for s in self._skills}
 
-    def _compute_idf(self) -> dict[str, float]:
-        """计算每个词的 IDF 值（预计算，提升搜索速度）。"""
-        n = len(self.skills)
-        if n == 0:
-            return {}
+    @property
+    def name(self) -> str:
+        return "get_skill_guide"
 
-        # 统计每个词出现在几个 Skill 里
-        doc_freq: dict[str, int] = {}
-        for skill in self.skills:
-            # 用 Skill 全文参与 IDF 统计，不截断——只看前 500 字会漏掉正文靠后的
-            # 关键术语，导致这些词永远匹配不到，Skill 命中率下降。必须和 search()
-            # 里的分词口径保持一致，否则 IDF 表和打分用的词集对不上。
-            words = self._tokenize(f"{skill.description} {' '.join(skill.triggers)} {skill.content}")
-            for word in set(words):
-                doc_freq[word] = doc_freq.get(word, 0) + 1
+    @property
+    def description(self) -> str:
+        # 把可用技能内嵌进工具描述——这样即使不看 system prompt 的索引表，
+        # LLM 在决定调用本工具时也能从参数说明里看到有哪些合法的 skill_name。
+        available = "、".join(f"{s.name}（{s.description}）" for s in self._skills)
+        return (
+            "按需获取某个子技能的完整操作指南。当任务匹配某技能的适用场景时，"
+            "先调用本工具拿到详细规范，再据此执行。\n"
+            f"可用技能：{available}"
+        )
 
-        # IDF = log(总文档数 / 出现该词的文档数)
-        return {word: math.log(n / freq) for word, freq in doc_freq.items()}
+    @property
+    def input_schema(self) -> dict:
+        valid_names = [s.name for s in self._skills]
+        return {
+            "type": "object",
+            "properties": {
+                "skill_name": {
+                    "type": "string",
+                    "description": f"要加载的技能名称，必须是以下之一：{', '.join(valid_names)}",
+                }
+            },
+            "required": ["skill_name"],
+        }
 
-    def _tokenize(self, text: str) -> list[str]:
-        """用 jieba 分词（中文按词切分，英文/数字按单词切分），转小写并过滤标点和空白。"""
-        raw_tokens = jieba.cut(text.lower())
-        return [t for t in raw_tokens if re.match(r'^[\w一-鿿]+$', t)]
+    async def execute(self, inputs: dict) -> str:
+        skill_name = (inputs.get("skill_name") or "").strip()
+        skill = self._by_name.get(skill_name)
 
-    def search(self, query: str, top_k: int = 3) -> list[Skill]:
-        """
-        搜索与 query 最相关的 top_k 个 Skill。
+        if skill is None:
+            # 找不到时不报错，而是返回可用列表，帮 LLM 纠正到合法的 skill_name。
+            available = ", ".join(self._by_name.keys())
+            return f"未找到技能 '{skill_name}'。可用技能：{available}"
 
-        搜索优先级：
-        1. 精确关键词匹配（triggers）→ 高权重
-        2. TF-IDF 相关性评分
-        """
-        if not self.skills:
-            return []
-
-        query_lower = query.lower()
-        scores: list[tuple[float, Skill]] = []
-
-        for skill in self.skills:
-            score = 0.0
-
-            # 1. 触发词精确匹配（最高权重）
-            for trigger in skill.triggers:
-                if trigger.lower() in query_lower:
-                    score += 10.0
-                    break
-
-            # 2. TF-IDF 评分（用 Skill 全文，和 _compute_idf 保持一致，不截断）
-            query_words = self._tokenize(query)
-            skill_words = self._tokenize(f"{skill.description} {skill.content}")
-            skill_word_set = set(skill_words)
-
-            for word in query_words:
-                if word in skill_word_set:
-                    tf = skill_words.count(word) / (len(skill_words) + 1)
-                    idf = self._idf.get(word, 0.0)
-                    score += tf * idf
-
-            scores.append((score, skill))
-
-        # 按分数降序，取 top_k
-        scores.sort(key=lambda x: x[0], reverse=True)
-        return [skill for score, skill in scores[:top_k] if score > 0]
+        # 返回 SKILL.md 全文，供 LLM 遵循其中的流程、规范和输出格式。
+        return f"【技能指南 - {skill.name}】\n\n{skill.content}"
 ```
+
+> **和 DDH 的差异**：DDH 的 skill 是 `skill/<name>/SKILL.md` 的目录结构，还支持"大技能下的子技能"；
+> 本项目的 skill 是扁平的 `skills/<name>.md`（见 9.6），所以 `execute` 只需按 `name` 直接查缓存即可，
+> 不用像 DDH 那样做多级路径查找。机制内核是一样的：**索引常驻 + 全文按需加载**。
 
 ---
 
-## 9.5 在两套架构的子 Agent 中集成 Skill 加载
+## 9.5 在两套架构的子 Agent 中集成按需加载
 
 本项目有两套并行的架构，各自都有子 Agent 需要集成 Skill：
 
@@ -6495,101 +6525,133 @@ class SkillSearcher:
 - Debugger 修复的 Bug 可能需要参照不同的错误处理规范
 - TestWriter 针对不同模块需要遵循不同的测试策略
 
-### 方案：公共 Skill 增强函数
+### 集成方案：索引表常驻 + get_skill_guide 工具
 
-创建一个公共模块，两套基类都调用它：
+不再有"搜索并拼接全文"的 `enhancer.py`。集成只做两件事，对两套架构完全一致：
+
+1. **把技能索引表拼到 system prompt 末尾**：用 9.3 的 `build_skill_index()` 生成，进程启动时构建一次。
+2. **把 `GetSkillGuideTool` 加进子 Agent 的工具列表**：这样 LLM 在 Agentic Loop 里能自主调用它。
+
+先做一个模块级的公共入口，避免每个子 Agent 各自重复加载 Skill：
 
 ```python
-# skills/enhancer.py
+# skills/__init__.py（或新建 skills/registry.py，二选一，这里用 __init__.py）
 """
-Skill 增强模块：给 system prompt 动态拼接相关团队规范。
-两套架构的基类（SubAgent、SwarmAgent）都调用这个函数。
+Skill 系统的公共入口：
+  - SKILL_INDEX：技能索引表文本，拼到各子 Agent 的 system prompt 末尾（常驻，极短）
+  - get_skill_guide_tool()：返回共享的 GetSkillGuideTool 实例，加进子 Agent 的 tools
+两套架构（SubAgent / SwarmAgent）都从这里取，保证索引和工具口径一致。
 """
-from skills.searcher import SkillSearcher
+from skills.loader import load_skills, build_skill_index
+from skills.skill_tool import GetSkillGuideTool
 
-# 全局单例，避免重复加载和计算 IDF
-_searcher = SkillSearcher(skills_dir="skills/")
+# 进程内只加载一次：所有子 Agent 共享同一份 Skill 列表、索引表和工具实例
+_SKILLS = load_skills("skills/")
+SKILL_INDEX = build_skill_index(_SKILLS)
+_SKILL_TOOL = GetSkillGuideTool(skills=_SKILLS)
 
 
-def enhance_system_prompt(base_system: str, context: str, agent_name: str = "") -> str:
-    """
-    根据任务上下文搜索相关 Skill，拼接到 system prompt 后面。
-
-    参数：
-        base_system  原始 system prompt
-        context      搜索用的文本（任务描述、文件名、代码片段等拼接）
-        agent_name   调用者标识（打日志用）
-    """
-    matched = _searcher.search(context, top_k=2)
-    if not matched:
-        return base_system
-
-    skill_section = "\n\n---\n\n".join(
-        f"【团队规范 - {s.name}】\n{s.content}" for s in matched
-    )
-    print(f"[{agent_name or 'Skills'}] 加载 Skill：{[s.name for s in matched]}")
-    return f"{base_system}\n\n以下是团队规范，请在工作中遵守：\n\n{skill_section}"
+def get_skill_guide_tool() -> GetSkillGuideTool:
+    return _SKILL_TOOL
 ```
 
 ---
 
 ### Coordinator 架构集成：修改 `sub_agents/base.py`
 
+`SubAgent.run()` 本来就跑 `run_agent_loop`（第 6 章），改动很小：**system 末尾拼索引表**，
+**tools 里恒定加入 `get_skill_guide`**。
+
 ```python
 # sub_agents/base.py 的 run() 方法中
 
-from skills.enhancer import enhance_system_prompt
+from skills import SKILL_INDEX, get_skill_guide_tool
 
 class SubAgent(ABC):
     # ...name、system_prompt、tools 属性不变...
 
-    async def run(self, task: str, context: dict | None = None) -> str:
+    async def run(self, task: str, context: dict | None = None,
+                  session_id: str | None = None) -> tuple[str, Usage]:
         full_task = task
         if context:
             context_str = "\n".join(f"【{k}的结果】\n{v}" for k, v in context.items())
             full_task = f"{task}\n\n参考信息（来自前置任务）：\n{context_str}"
 
-        # ★ 新增：用完整任务描述搜索相关 Skill，动态增强 system prompt。
-        # 不再只取前 300 字符：搜索是 TF-IDF 打分，关键词可能出现在任务描述靠后的
-        # 位置（尤其 context 注入了前置任务结果时），截断会漏掉这些词、匹配不到该有的规范。
-        system = enhance_system_prompt(
-            base_system=self.system_prompt,
-            context=full_task,
-            agent_name=self.name,
-        )
+        # ★ 改动 1：system prompt 末尾拼上常驻的技能索引表（只有 name + description，很短）。
+        # 不再做 TF-IDF 搜索、也不预注入任何 Skill 全文——加载与否由 LLM 自己在循环里决定。
+        system = f"{self.system_prompt}\n\n{SKILL_INDEX}" if SKILL_INDEX else self.system_prompt
 
         provider = get_provider()
-        # ...后续 run_agent_loop() 调用改为使用 system 而非 self.system_prompt...
+
+        # ★ 改动 2：把 get_skill_guide 工具恒定加入注册表（和子类自己的 tools 合并）。
+        # 这样每个子 Agent 都能按需加载 Skill；registry 恒非空，executor 也恒有效。
+        registry = ToolRegistry()
+        registry.register(get_skill_guide_tool())
+        for tool in self.tools:
+            registry.register(tool)
+        executor = ToolExecutor(registry)
+
         result = await run_agent_loop(
             prompt=full_task,
             provider=provider,
-            system=system,              # ← 这里从 self.system_prompt 改为 system
-            tools=...,
-            executor=...,
+            system=system,                              # ← 带索引表的 system
+            tools=registry.get_all_definitions(),       # ← 恒含 get_skill_guide
+            executor=executor,
             max_turns=10,
+            session_id=session_id,
         )
-        return result.text
+        return result.text, result.total_usage
 ```
 
 **效果**：当用户通过 `/ask` 问"帮我写一个 Redis 缓存的 API 接口"，Coordinator
-规划为 `code_writer` 任务，`code_writer` 在执行时会匹配到 `api-design.md` 和
-`env-config.md` Skill，自动遵循项目的路由命名规则和配置管理流程。
+规划为 `code_writer` 任务。`code_writer` 在循环里看到索引表里有 `api-design`、`env-config`，
+自主调用 `get_skill_guide("api-design")`、`get_skill_guide("env-config")` 加载全文，
+再遵循项目的路由命名规则和配置管理流程写代码。**用不到 Skill 的任务，它就不会去调这个工具。**
 
 ---
 
-### Swarm 架构集成：修改 `swarm/agent_base.py`
+### Swarm 架构集成：让 `handle()` 也走 Agentic Loop
+
+Swarm 子 Agent 原来是**单次 `provider.chat()`**——单次调用里 LLM 没有"先调工具再继续"的机会，
+按需加载无从谈起。所以这里把 `handle()` 改成走 `run_agent_loop`，和 Coordinator 用同一套循环。
+
+`swarm/agent_base.py` 删掉 `_enhance_system`，改提供一个组装 system + tools 的便捷入口：
 
 ```python
-# swarm/agent_base.py（新增部分）
+# swarm/agent_base.py
 
-from skills.enhancer import enhance_system_prompt
+from skills import SKILL_INDEX, get_skill_guide_tool
+from agent_core.loop import run_agent_loop
+from agent_core.executor import ToolExecutor
+from tools.registry import ToolRegistry
+from providers.router import get_provider
 
 class SwarmAgent(ABC):
-    # ...原有 __init__、task_types、handle 等不变...
+    # ...原有 __init__、task_types、handle 等抽象接口不变...
 
-    def _enhance_system(self, base_system: str, context: str) -> str:
-        """Skill 增强的便捷入口（调用公共模块）。"""
-        return enhance_system_prompt(base_system, context, agent_name=self.agent_id)
+    async def _run_with_skills(self, base_system: str, prompt: str,
+                               extra_tools: list | None = None) -> str:
+        """公共执行入口：system 拼索引表 + tools 含 get_skill_guide，走 Agentic Loop。
+
+        取代旧的 _enhance_system（TF-IDF 预注入）。Swarm 子 Agent 由此获得
+        和 Coordinator 一致的"按需加载 Skill"能力。
+        """
+        system = f"{base_system}\n\n{SKILL_INDEX}" if SKILL_INDEX else base_system
+
+        registry = ToolRegistry()
+        registry.register(get_skill_guide_tool())
+        for tool in (extra_tools or []):
+            registry.register(tool)
+
+        result = await run_agent_loop(
+            prompt=prompt,
+            provider=get_provider(),
+            system=system,
+            tools=registry.get_all_definitions(),
+            executor=ToolExecutor(registry),
+            max_turns=10,
+        )
+        return result.text
 ```
 
 ### Swarm 子 Agent 调用示例（以 ReviewerAgent 为例）
@@ -6609,14 +6671,20 @@ async def handle(self, task) -> str:
 每个问题输出：[Critical/Warning/Suggestion] 行号 - 问题描述 - 建议修复。
 发现 Critical 级别问题时，最后一行输出 NEEDS_FIX:true，否则输出 NEEDS_FIX:false。
 """
-    # ★ 新增：用文件名 + focus + 完整代码作为搜索上下文（不截断代码）。
-    # Skill 搜索是 TF-IDF 打分，触发 Skill 的关键词（如 asyncio、subprocess）可能出现在
-    # 代码任意位置；只取前 200 字会漏掉靠后的关键词，导致该加载的团队规范没被加载。
-    search_context = f"{filename} {focus} {code}"
-    system = self._enhance_system(base_system, search_context)
+    prompt = f"文件：{filename}\n重点关注：{focus}\n\n```python\n{code}\n```"
 
-    # ...后续 provider.chat() 调用不变，只是 system 参数用增强后的版本...
+    # ★ 改动：从单次 provider.chat() 改为走 Agentic Loop。
+    # LLM 审查时若发现代码涉及 asyncio、异常处理等，会自主 get_skill_guide 加载对应规范再审。
+    result = await self._run_with_skills(base_system, prompt)
+
+    # 后续解析逻辑不变：从返回文本里判断 NEEDS_FIX，决定是否派生 debug 任务。
+    if "NEEDS_FIX:true" in result:
+        await self.blackboard.post_derived(...)
+    return result
 ```
+
+> **注意返回值来源变了**：旧代码从 `response.content` 逐块拼 `result`；现在 `run_agent_loop`
+> 直接返回 `LoopResult.text`，`result` 就是最终文本，`NEEDS_FIX:true` 的判断照样成立。
 
 ---
 
@@ -6627,26 +6695,26 @@ async def handle(self, task) -> str:
     │
     ├─ POST /ask（Coordinator 架构）
     │       ↓
-    │   planner.py → 规划子任务
-    │       ↓
-    │   dispatcher.py → 分发给 sub_agents
+    │   planner.py → 规划子任务 → dispatcher.py → 分发给 sub_agents
     │       ↓
     │   SubAgent.run()
-    │       ├── enhance_system_prompt(self.system_prompt, full_task)  # 完整任务描述，不截断
-    │       └── run_agent_loop(system=增强后的prompt)
+    │       ├── system = self.system_prompt + SKILL_INDEX     # 常驻索引表（极短）
+    │       ├── tools  = [get_skill_guide] + self.tools       # 按需加载工具
+    │       └── run_agent_loop(...)
+    │              └─（循环内）LLM 判断需要 → get_skill_guide("api-design") → 拿到全文继续
     │
     └─ POST /swarm/ask（Swarm 架构）
             ↓
-        Blackboard.post() → 发布任务
-            ↓
-        SwarmAgent.start() → 认领任务 → handle()
-            ├── self._enhance_system(base_system, context)
-            └── provider.chat(system=增强后的prompt)
+        Blackboard.post() → SwarmAgent.start() → 认领任务 → handle()
+            └── _run_with_skills(base_system, prompt)
+                   ├── system = base_system + SKILL_INDEX
+                   ├── tools  = [get_skill_guide] + extra_tools
+                   └── run_agent_loop(...)
+                          └─（循环内）LLM 按需 get_skill_guide(...) 加载规范
 ```
 
-**两套架构共用 `skills/` 目录下的同一组 Skill 文件**，只是加载时机不同：
-- Coordinator：在 `SubAgent.run()` 调用 `run_agent_loop()` 之前
-- Swarm：在 `handle()` 调用 `provider.chat()` 之前
+**两套架构共用 `skills/` 目录下的同一组 Skill 文件、同一张索引表、同一个 `get_skill_guide` 工具**，
+加载机制完全统一：**system 常驻索引表，LLM 在 Agentic Loop 里自主决定何时加载哪个 Skill 的全文。**
 
 ---
 
@@ -6656,13 +6724,17 @@ async def handle(self, task) -> str:
 **"团队怎么做事"**——编码规范、流程约定、架构决策。它们通过 9.5 的机制被子 Agent
 在工作时按需加载。
 
-每个 Skill 文件放在 `skills/` 目录下，被 `load_skills()` 扫描加载。当子 Agent
-处理任务时，`_enhance_system_prompt()` 根据任务内容搜索最相关的 Skill 并拼接。
+每个 Skill 文件放在 `skills/` 目录下，被 `load_skills()` 扫描加载，其 `name + description`
+进入常驻的技能索引表。当子 Agent 处理任务时，LLM 参照索引表**自主决定**是否调用
+`get_skill_guide(skill_name)` 加载对应全文。
 
-**适用场景举例**：
-- Reviewer 审查含 `asyncio` 的代码 → 加载 `async-patterns.md`，按规范检查是否有 Event 竞态
-- Debugger 修复 Redis 连接问题 → 加载 `error-handling.md`，按规范输出降级策略
-- TestWriter 为 API 端点写测试 → 加载 `api-design.md`，知道该测哪些状态码
+**加载时机举例（由 LLM 判断）**：
+- Reviewer 审查含 `asyncio` 的代码 → 自主 `get_skill_guide("async-patterns")`，按规范检查 Event 竞态
+- Debugger 修复 Redis 连接问题 → 自主 `get_skill_guide("error-handling")`，按规范输出降级策略
+- TestWriter 为 API 端点写测试 → 自主 `get_skill_guide("api-design")`，知道该测哪些状态码
+
+> **每个 Skill 的 frontmatter 只有 `name` 和 `description`（无 `triggers`）**。下面各文件的
+> `description` 都同时说清"是什么 + 何时加载"，因为它是 LLM 判断要不要加载的唯一依据。
 
 ```bash
 mkdir -p skills
@@ -6672,22 +6744,13 @@ mkdir -p skills
 
 **`skills/error-handling.md`**：
 
-> **触发场景**：Reviewer 审查到 try/except 代码时自动加载；Debugger 修复异常处理相关 Bug 时加载。
+> **加载时机**：审查/修改含 try/except 的代码、修复异常处理相关 Bug 时。
 > 本 Skill 内容直接对应项目中 `periodic_save()` 的降级设计和 `sandbox.py` 的自定义异常。
 
 ````markdown
 ---
 name: error-handling
-description: 本项目的异常处理规范——降级策略、日志格式、自定义异常
-triggers:
-  - 异常
-  - 错误处理
-  - try
-  - except
-  - raise
-  - 降级
-  - error
-  - 失败
+description: 本项目的异常处理规范——降级策略、日志格式、自定义异常。审查或编写涉及 try/except、错误处理、降级逻辑的代码时加载。
 ---
 
 ## 分层捕获原则
@@ -6746,23 +6809,13 @@ print(f"Error: {e}")         # 不知道是哪个模块
 
 **`skills/async-patterns.md`**：
 
-> **触发场景**：审查或修改含 `asyncio`/`async`/`await` 的代码时加载。
+> **加载时机**：审查或修改含 `asyncio`/`async`/`await` 的代码时。
 > 本 Skill 内容直接对应项目中 Blackboard 的 Event 竞态修复、`periodic_save()` 的后台任务模式。
 
 ````markdown
 ---
 name: async-patterns
-description: 本项目的 asyncio 规范——白板并发、后台任务、已踩过的坑
-triggers:
-  - 异步
-  - async
-  - await
-  - asyncio
-  - 并发
-  - 协程
-  - Lock
-  - Event
-  - Condition
+description: 本项目的 asyncio 规范——白板并发、后台任务、已踩过的坑。审查或编写涉及 async/await/asyncio、并发协程、Lock/Event/Condition 的代码时加载。
 ---
 
 ## 本项目的异步架构
@@ -6834,22 +6887,13 @@ await asyncio.gather(_task, return_exceptions=True)
 
 **`skills/api-design.md`**：
 
-> **触发场景**：审查或生成 FastAPI 端点代码时加载。
+> **加载时机**：审查或生成 FastAPI 端点代码时。
 > 本 Skill 内容直接对应 `main.py` 中已实现的 `/swarm/tasks` 系列端点。
 
 ````markdown
 ---
 name: api-design
-description: 本项目 FastAPI 端点设计规范——路由、状态码、响应模型
-triggers:
-  - 接口
-  - API
-  - REST
-  - 路由
-  - endpoint
-  - FastAPI
-  - HTTP
-  - 状态码
+description: 本项目 FastAPI 端点设计规范——路由、状态码、响应模型。审查或编写 REST 接口、HTTP 端点、路由时加载。
 ---
 
 ## 已有端点参考（main.py）
@@ -6906,21 +6950,13 @@ class SwarmAskResponse(BaseModel):
 
 **`skills/env-config.md`**：
 
-> **触发场景**：涉及 `.env`、`Settings`、新增配置项时加载。
+> **加载时机**：涉及 `.env`、`Settings`、新增配置项时。
 > 本 Skill 直接对应项目中 `core/config.py` 的 Pydantic Settings 机制和之前踩过的"extra fields forbidden"坑。
 
 ````markdown
 ---
 name: env-config
-description: 本项目配置管理规范——.env + Pydantic Settings 联动流程
-triggers:
-  - 环境变量
-  - 配置
-  - .env
-  - settings
-  - config
-  - Settings
-  - Pydantic
+description: 本项目配置管理规范——.env + Pydantic Settings 联动流程。涉及环境变量、配置项、Settings 类、新增 .env 字段时加载。
 ---
 
 ## 本项目的配置机制
@@ -6981,20 +7017,13 @@ pydantic_core._pydantic_core.ValidationError:
 
 **`skills/prompt-engineering.md`**：
 
-> **触发场景**：修改子 Agent 的 system prompt 或新增 Agent 时加载。
+> **加载时机**：修改子 Agent 的 system prompt 或新增 Agent 时。
 > 本 Skill 直接对应 `reviewer_agent.py` 和 `debugger_agent.py` 中 system prompt 的结构。
 
 ````markdown
 ---
 name: prompt-engineering
-description: 本项目 Agent 提示词规范——结构模板和输出解析约定
-triggers:
-  - 提示词
-  - prompt
-  - system prompt
-  - 系统提示
-  - Agent 指令
-  - NEEDS_FIX
+description: 本项目 Agent 提示词规范——结构模板和输出解析约定。修改子 Agent 的 system prompt、新增 Agent、设计 NEEDS_FIX 之类输出标记时加载。
 ---
 
 ## 本项目 system prompt 结构
@@ -7043,23 +7072,13 @@ triggers:
 
 **`skills/security.md`**：
 
-> **触发场景**：审查涉及文件操作、用户输入、路径拼接的代码时加载。
+> **加载时机**：审查涉及文件操作、用户输入、路径拼接的代码时。
 > 本 Skill 直接对应 `sandbox.py` 的路径遍历防护设计。
 
 ````markdown
 ---
 name: security
-description: 本项目安全规范——路径遍历防护、输入校验、沙箱写入
-triggers:
-  - 安全
-  - 路径
-  - path
-  - 注入
-  - sandbox
-  - 遍历
-  - traversal
-  - 用户输入
-  - 文件写入
+description: 本项目安全规范——路径遍历防护、输入校验、沙箱写入。审查涉及文件操作、用户/LLM 输入、路径拼接、注入风险的代码时加载。
 ---
 
 ## 路径遍历防护（已实现）
@@ -7103,23 +7122,23 @@ def resolve_safe_path(workspace: Path, relative: str) -> Path:
 ## 9.7 本章检查清单
 
 ```
-□ skills/ 目录有 5+ 个 .md 文件，格式正确（有 frontmatter：name、description、triggers）
+□ skills/ 目录有 5+ 个 .md 文件，格式正确（frontmatter 只含 name、description，无 triggers）
 
-□ 已 `pip install jieba`（TF-IDF 分词依赖，见 0.2 依赖清单）
+□ 不再依赖 jieba（TF-IDF 已移除，0.2 依赖清单里不应再有 jieba）
 
 □ load_skills() 能正确解析所有 Skill 文件，打印加载数量
 
-□ SkillSearcher.search("asyncio 竞态") 返回 async-patterns Skill
+□ build_skill_index() 生成的技能索引表只含 name + description，被拼进各子 Agent 的 system prompt
 
-□ 触发词匹配比 TF-IDF 匹配优先（score 差异体现在日志中）
+□ 子 Agent 的工具列表里恒定包含 get_skill_guide（用 registry.list_names() 或日志验证）
 
-□ SwarmAgent 基类有 _enhance_system_prompt() 方法
+□ get_skill_guide("async-patterns") 返回该 Skill 全文；传入不存在的 skill_name 返回可用列表而不崩溃
 
-□ ReviewerAgent 审查含 "async" 的代码时，日志显示加载了 async-patterns Skill
+□ SubAgent 与 SwarmAgent 都走 run_agent_loop（Swarm 不再是单次 provider.chat）
 
-□ 无相关 Skill 时不崩溃，子 Agent 使用原始 system prompt
+□ 提一个涉及 asyncio 的审查任务，日志显示 LLM 自主调用了 get_skill_guide("async-patterns")
 
-□ Skill 内容出现在 LLM 实际收到的 system prompt 中（可通过打印验证）
+□ 提一个用不到任何规范的简单任务，LLM 不调用 get_skill_guide（验证"按需"而非"每次预注入"）
 ```
 
 **全部打勾之后，进入第 10 章。**
@@ -10019,7 +10038,7 @@ def _get_sub_agents() -> dict:
 
 □ 发送业务相关问题，Agent 能调用工具并给出正确回答
 
-□ SKILL.md 文件已按业务领域拆分，SkillSearcher 能正确匹配
+□ SKILL.md 文件已按业务领域拆分，name+description 进技能索引表，LLM 能用 get_skill_guide 按需加载
 
 □ （如果用多 Agent）新的子 Agent 已注册到 dispatcher，Coordinator 能正确路由
 
@@ -10086,8 +10105,8 @@ my-agent/
 │   └── agent_base.py
 │
 ├── skills/                 ← 阶段 9：Skills 系统
-│   ├── loader.py
-│   ├── searcher.py
+│   ├── loader.py           ← 解析 SKILL.md + build_skill_index()
+│   ├── skill_tool.py       ← get_skill_guide 工具（LLM 按需加载）
 │   └── code-review.md
 │
 ├── persistence/            ← 阶段 10：会话持久化
@@ -10161,8 +10180,8 @@ my-agent/
 | **ToolResultBlock** | 工具执行完成后，把结果包装成此类型发回给 LLM |
 | **Stop Reason** | LLM 停止生成的原因：`end_turn`（完成）/ `tool_use`（需调工具）/ `max_tokens`（截断） |
 | **SSE** | Server-Sent Events，服务器向客户端单向推送流式数据的协议（AI 打字机效果）|
-| **SKILL.md** | 描述 Agent 某个专业领域能力的 Markdown 文件，按需加载到 system prompt |
-| **TF-IDF** | 文本相关性算法，用于在多个 Skill 中找出与当前任务最相关的 |
+| **SKILL.md** | 描述某个专业领域规范/操作的 Markdown 文件，其 name+description 进技能索引表，全文由 LLM 调 `get_skill_guide` 按需加载 |
+| **get_skill_guide** | 一个工具：LLM 判断任务需要某 Skill 时调用它，读取对应 SKILL.md 全文注入对话（取代旧的 TF-IDF 预注入） |
 | **Blackboard（黑板模式）** | Swarm 模式中 Agent 共享信息的机制：任务发布到白板，Agent 认领并处理 |
 | **Prompt Cache** | Anthropic 的 system prompt 缓存机制，5 分钟内重复调用可降低 90% 费用 |
 | **JSONL** | JSON Lines 格式，每行一个 JSON 对象，适合顺序追加写入（日志、会话历史）|
@@ -10260,7 +10279,7 @@ Commit 命名规范：
 | Swarm 模式 | 持久化 Agent 团队 + Blackboard 任务白板 |
 | Hub-and-Spoke 路由 | LeadAgent 理解意图，路由到专家 Agent |
 | 拓扑排序并行调度 | 有依赖关系的子任务自动并行 |
-| SKILL.md + TF-IDF 检索 | Agent 能力文件按需加载，避免 Token 浪费 |
+| SKILL.md + get_skill_guide 工具 | 索引表常驻、LLM 自主按需加载能力文件，避免 Token 浪费 |
 
 ### 上下文与记忆层
 
@@ -10358,7 +10377,7 @@ Commit 命名规范：
 
 ### 项目描述（展开版，适合面试中口头介绍）
 
-> 从零实现了一套 Multi-Agent 编排系统，核心是自实现的 Agentic Loop 状态机，避免依赖黑箱框架。设计了统一 Provider 抽象层，通过适配器模式屏蔽 Anthropic / OpenAI / Gemini 等各家 API 差异，支持一行配置切换大模型。在多 Agent 层面实现了 Coordinator 和 Swarm 两种编排模式，用 TF-IDF 按需检索 Agent 技能文件，降低无效 Token 消耗。工程侧接入 structlog 结构化日志、OpenTelemetry 链路追踪和 Prometheus 指标，完整对接飞书机器人并支持 Docker 容器化部署。
+> 从零实现了一套 Multi-Agent 编排系统，核心是自实现的 Agentic Loop 状态机，避免依赖黑箱框架。设计了统一 Provider 抽象层，通过适配器模式屏蔽 Anthropic / OpenAI / Gemini 等各家 API 差异，支持一行配置切换大模型。在多 Agent 层面实现了 Coordinator 和 Swarm 两种编排模式，用"索引表常驻 + LLM 通过 get_skill_guide 工具按需加载技能文件"的机制（对齐 Claude Code 的 Skills 设计）替代全量预注入，降低无效 Token 消耗。工程侧接入 structlog 结构化日志、OpenTelemetry 链路追踪和 Prometheus 指标，完整对接飞书机器人并支持 Docker 容器化部署。
 
 ### 核心成就子弹点（挑选 3-5 条写在简历条目里）
 
@@ -12919,11 +12938,14 @@ class KnowledgeBaseTool(BaseTool):
 
     @property
     def description(self) -> str:
+        # 只声明"能力"（这个工具能查什么、返回什么），不承载"检索策略"。
+        # 何时改写重试、怎么带来源归因等策略，写在 knowledge-base-rag 这个 Skill 里，
+        # 由 knowledge_agent 通过 get_skill_guide 按需加载（见 15.11）。
         count = len(self._docs)
         return (
             f"搜索本地知识库（已加载 {count} 个文档块，支持 PDF、图片、文本）。"
-            "当用户询问公司政策、产品信息、技术文档时优先调用此工具。"
-            "返回最相关的文档片段作为回答依据。"
+            "需要查内部 API 规范、编码规范、错误码、架构约定等文档内容时调用。"
+            "返回最相关的文档片段（含 title/source/relevance）作为回答依据。"
         )
 
     @property
@@ -13162,7 +13184,7 @@ mkdir knowledge_base
 
 ---
 
-## 15.11 让知识库工具接入 Coordinator 架构
+## 15.11 让知识库工具接入 Coordinator 架构（RAG 作为一个 Skill）
 
 > `agent/agent.py` 在第 10 章已经被删除了，所以知识库工具不是"整体替换一个单
 > Agent 的工具列表"，而是要接到 Coordinator 的"规划 → 分发 →聚合"结构里——
@@ -13173,8 +13195,118 @@ mkdir knowledge_base
 > 而是**编码任务的"领域知识供给方"**——它查出内部 API 规范、编码规范、错误码等信息，
 > 作为前置任务的产出，供后续 `code_writer` / `code_reviewer` 当上下文使用（见文末的编排示例）。
 
-新建 `sub_agents/knowledge_agent.py`，复用 `SubAgent` 基类，只需要声明
-`system_prompt` 和 `tools`：
+### 核心思想：把「检索操作规范」做成一个 Skill，而不是塞进 system_prompt
+
+第 9 章确立了"**LLM 通过 `get_skill_guide` 工具按需加载 Skill**"的机制。RAG 检索**天然就是一个 Skill**：
+"什么时候该查知识库、怎么评估检索结果够不够、不够怎么改写重试、答案怎么带来源归因"——
+这些是一整套**操作规范**，正好对应一份 SKILL.md。
+
+所以这一版不再把检索策略硬编码进 `KnowledgeAgent` 的 system_prompt，而是：
+
+1. 新建 `skills/knowledge-base-rag.md`，把检索决策树、止损纪律、来源归因规范写进去（内容仿照
+   DDH-main-agent 的 `datasheet-rag` 技能）；
+2. `KnowledgeAgent` 的 system_prompt **瘦身**为一句话："需要检索时，先 `get_skill_guide('knowledge-base-rag')`
+   拿到操作指南，再按指南驱动 `search_knowledge_base`"；
+3. `KnowledgeAgent` 的 `tools` 同时挂上 `search_knowledge_base` 工具本身。而 `get_skill_guide`
+   由 `SubAgent.run()` 恒定注入（见 9.5），无需在这里重复挂。
+
+这就是用户想要的闭环：**LLM 决定要用 RAG → 加载 RAG 这个 Skill → 按操作文档执行 rag_search**。
+与第 9 章的团队规范 Skill 走的是**同一套** `get_skill_guide` 机制，没有任何旁路。
+
+### 新建 `skills/knowledge-base-rag.md`
+
+> 这是一个"操作文档型" Skill——正文不是编码规范，而是**如何驱动 `search_knowledge_base` 工具**的
+> 决策树。它和 9.6 的团队规范 Skill 放在同一个 `skills/` 目录，同样进索引表、同样由
+> `get_skill_guide` 按需加载。
+
+````markdown
+---
+name: knowledge-base-rag
+description: 本地知识库语义检索操作指南——迭代检索决策树，评估→改写→重试由你在循环中驱动，回答必须带来源归因。当需要查内部 API 规范、编码规范、错误码、架构约定等文档内容时加载。
+---
+
+# 知识库语义检索技能（Agentic RAG）
+
+## 一、这个技能解决什么问题
+
+编码子任务（code_writer / code_reviewer / debugger）需要遵循**团队内部的技术规范**——
+API 封装约定、编码规范、错误码表、架构约定等。这些内容存在本地知识库里，必须**语义检索**
+出相关段落，再基于检索到的原文提供给编码 Agent 当上下文。
+
+**核心心法：检索不是"查一次就用"，而是你主动驱动的行为。**
+每次 `search_knowledge_base` 后，先**评估结果够不够**，再决定：直接采用 / 改写重试 / 如实说明查不到。
+
+## 二、什么时候用 search_knowledge_base（边界判断，先做）
+
+| 需求 | 走哪里 |
+|---|---|
+| 内部 API 规范 / 编码规范 / 错误码 / 架构约定的**具体内容** | ✅ `search_knowledge_base`（本技能） |
+| 通用编程知识（语言语法、标准库用法） | ❌ 直接用你已有的知识回答，不必查库 |
+| 知识库里明显不会有的内容（如客服政策、闲聊） | ❌ 如实说明不在知识库范围 |
+
+## 三、可用工具：search_knowledge_base
+
+`search_knowledge_base(query, top_k?)` —— 返回向量检索的 top-k 文档片段。
+
+**返回关键信号（你的决策全靠它们）：**
+
+| 字段 | 含义与用法 |
+|---|---|
+| `found` | 是否检索到结果（低于相似度阈值会被过滤，可能整体 found=false） |
+| `results[]` | 每条含 `title / source / relevance / content / has_images` |
+| `relevance` | cosine 相似度（归一化向量下约 0~1），**判断是否改写重试的首要信号** |
+
+**`relevance` 阈值解读：**
+- `> 0.5`：匹配度好 → 进入充分性评估
+- `0.3 ~ 0.5`：偏低 → 可用，但要意识到可能不精确，必要时改写再查一次
+- 整体 `found=false` 或结果都很低：**大概率需要改写查询重试**，不要硬凑
+
+## 四、迭代检索决策树（每轮必须走完）
+
+```
+需要内部规范
+   │
+   ▼
+search_knowledge_base(query)     ← 第 1 轮用原始查询
+   │
+   ▼
+[评估] 你自己做（不调工具）：逐条判断"这段原文是否真的覆盖了所需规范？"
+   · 保留真正相关的片段，忽略只是词面相似的
+   · 记住每条的 source / title，作为来源
+   │
+   ├── 足够 ─────────► 整理规范（带来源），交给下游编码 Agent（见第五节）
+   │
+   └── 不足 ────────► [重试决策] 选一种策略：
+           ① relevance 普遍很低 → 改写查询（换同义词 / 中英互换 / 拆分子问题）
+           ② 结果太窄 → 把 top_k 调到 5，或换更宽的关键词
+           ③ 命中错主题 → 查询里补上更精确的术语（如具体的"分页""错误码"）
+                   │
+                   ▼
+           带着改写后的 query 回到 search_knowledge_base
+```
+
+**迭代纪律（硬性上限）：**
+- `search_knowledge_base` 调用总次数 **≤ 4 次**。达到上限立即停止，如实说明"已尝试多种检索仍未找到相关规范"，**绝不编造 API 或规范**。
+- 每次改写要有实质变化，不要重复已试过的查询。
+- 第 1 轮就足够时直接采用，不做无谓重试。
+
+## 五、输出格式（强制）
+
+你的输出会作为 `context` 传给 code_writer / code_reviewer，所以：
+
+- **原样、结构化地**整理检索到的规范（保留接口签名、错误码、约定原文），不要改写或"润色"规范内容。
+- 每条规范标注来源：**（来自 `source`）**，便于下游追溯。
+- 知识库里没有的，明确写"知识库中无相关规范"，**绝不凭空编造** API 名、参数或错误码。
+- 面向的是下游 Agent 而不是最终用户，所以要准确、可直接引用，不要口语化寒暄。
+
+## 六、红线
+
+- 检索不到就如实说，**永不编造**规范内容或来源。
+- 来源标注不可省略——没有 `source` 的规范条目视为不可靠。
+- `search_knowledge_base` 总调用次数不得超过 4 次，达到上限立即停止。
+````
+
+### 新建 `sub_agents/knowledge_agent.py`（system_prompt 瘦身 + 挂 RAG 工具）
 
 ```python
 # sub_agents/knowledge_agent.py
@@ -13194,20 +13326,20 @@ class KnowledgeAgent(SubAgent):
 
     @property
     def system_prompt(self) -> str:
+        # 瘦身：不再把检索策略写死在这里，改为引导 LLM 先加载 knowledge-base-rag 技能，
+        # 按其中的决策树操作。检索规范的"单一事实来源"是那份 SKILL.md，不是这段 prompt。
         return (
-            "你是团队内部技术知识库检索专家，服务于编码类子任务。"
-            "你的职责是：当 code_writer / code_reviewer / debugger 需要遵循团队的"
-            "内部 API 规范、编码规范、错误码约定、架构约定时，你负责从知识库里检索出"
-            "相关规范条目，作为它们编码或审查的依据。\n"
-            "工作方式：先调用 search_knowledge_base 工具查询，再把检索到的规范"
-            "**原样、结构化地**整理出来（保留接口签名、错误码、约定原文），"
-            "不要自行发挥或改写规范内容；知识库里没有的，明确说'知识库中无相关规范'，"
-            "绝不凭空编造 API 或规范。你的输出会作为上下文传给编码子 Agent，"
-            "所以要准确、可直接引用，而不是面向最终用户的口语化回答。"
+            "你是团队内部技术知识库检索专家，服务于编码类子任务——"
+            "为 code_writer / code_reviewer / debugger 供给团队的内部 API 规范、"
+            "编码规范、错误码约定、架构约定。\n"
+            "当需要检索知识库时，**先调用 get_skill_guide('knowledge-base-rag') 获取检索操作指南**，"
+            "再严格按指南里的决策树驱动 search_knowledge_base 工具（评估→改写→重试→带来源归因）。"
+            "绝不凭空编造 API 或规范；知识库里没有的，如实说明。"
         )
 
     @property
     def tools(self):
+        # 只需挂 search_knowledge_base；get_skill_guide 由 SubAgent.run() 恒定注入（见 9.5）。
         return [KnowledgeBaseTool(kb_dir=self._kb_dir)]
 ```
 
@@ -13254,10 +13386,15 @@ def _get_sub_agents() -> dict:
 }
 ```
 
-`dispatch()` 会先跑 `knowledge_agent`，把它检索到的规范作为 `context` 注入到
-`code_writer` 的输入里（`SubAgent.run(context=...)`，见 6.4 节），于是生成的代码
-就会遵循 `HttpClient` 封装、统一响应结构和错误码——跟审查代码、写测试走的是完全
+`dispatch()` 会先跑 `knowledge_agent`。它在自己的 Agentic Loop 里会**先 `get_skill_guide('knowledge-base-rag')`**
+拿到检索操作指南，再按指南驱动 `search_knowledge_base`（评估→必要时改写重试→带来源整理），
+把检索到的规范作为 `context` 注入到 `code_writer` 的输入里（`SubAgent.run(context=...)`，见 6.4 节），
+于是生成的代码就会遵循 `HttpClient` 封装、统一响应结构和错误码——跟审查代码、写测试走的是完全
 相同的分发和聚合逻辑，不需要再单独维护一套"给单 Agent 挂工具"的旁路实现。
+
+> **这就是"RAG 作为 Skill"的完整闭环**：LLM 决定要用知识库 → `get_skill_guide('knowledge-base-rag')`
+> 加载操作文档 → 按文档里的决策树执行 `search_knowledge_base`。和第 9 章加载团队规范
+> 用的是同一套 `get_skill_guide` 机制，RAG 的操作规范也只是众多 Skill 中的一个。
 
 > **对比之前的错配**：如果知识库里装的是"退换货政策"这类内容，planner 面对编码请求
 > 根本不会分派给 `knowledge_agent`，这个 RAG 就成了摆设。把知识库换成技术规范、并让
@@ -13342,10 +13479,14 @@ python cli.py
 预期（规划器先派 knowledge_agent 查规范，再交给 code_writer 按规范写）：
 ```
   [Planner] 生成 2 个任务：knowledge_agent（查规范）→ code_writer（依赖任务 1）
-  [Loop] knowledge_agent 第 1 轮，执行 1 个工具调用（search_knowledge_base）
+  [Loop] knowledge_agent 第 1 轮，执行 1 个工具调用（get_skill_guide → knowledge-base-rag）
+  [Loop] knowledge_agent 第 2 轮，执行 1 个工具调用（search_knowledge_base）
 Agent：（生成的代码通过 core.http.HttpClient 发请求，返回值按 code/message/data 解析，
        分页用 page/page_size —— 完全遵循检索到的内部规范）
 ```
+
+> 注意第 1 轮是 `get_skill_guide('knowledge-base-rag')`——knowledge_agent 先加载检索操作指南，
+> 第 2 轮才按指南调 `search_knowledge_base`。这正是"RAG 作为 Skill 按需加载"的闭环。
 
 ---
 
@@ -13357,8 +13498,10 @@ Agent：（生成的代码通过 core.http.HttpClient 发请求，返回值按 c
   （或改用 qdrant_url=":memory:" 免容器）
 □ 运行 test_kb_load.py，知识库正常加载并建向量索引，输出 2 个文档块 + 向量索引完成日志
 □ 检索测试通过：查询「怎么发 HTTP 请求？」返回 api_spec 文档（语义匹配，非字面匹配）
+□ skills/ 目录有 knowledge-base-rag.md，其 name+description 出现在技能索引表里
 □ cli.py 提"按内部规范写代码"，日志显示规划出 knowledge_agent → code_writer 两步任务，
-  且 knowledge_agent 执行了 search_knowledge_base 工具
+  且 knowledge_agent 先调 get_skill_guide("knowledge-base-rag") 再调 search_knowledge_base
+  （验证 RAG 作为 Skill 按需加载的闭环，而非把检索策略预置在 system_prompt）
 □ （可选）在 knowledge_base/ 放一个 PDF，重跑加载，确认提取了图片描述
 □ （可选）在 knowledge_base/ 放一张 PNG 图片，确认生成了文字描述
 □ 验证视觉 Provider 独立配置生效：临时设 VISION_PROVIDER=openai + OPENAI_MODEL=deepseek-chat

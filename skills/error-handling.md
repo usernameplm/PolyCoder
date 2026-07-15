@@ -1,15 +1,6 @@
 ---
 name: error-handling
-description: 本项目的异常处理规范——降级策略、日志格式、自定义异常
-triggers:
-  - 异常
-  - 错误处理
-  - try
-  - except
-  - raise
-  - 降级
-  - error
-  - 失败
+description: 本项目的异常处理规范——降级策略、日志格式、自定义异常。审查或编写涉及 try/except、错误处理、降级逻辑的代码时加载。
 ---
 
 ## 分层捕获原则

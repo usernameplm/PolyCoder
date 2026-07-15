@@ -1,14 +1,6 @@
 ---
 name: env-config
-description: 本项目配置管理规范——.env + Pydantic Settings 联动流程
-triggers:
-  - 环境变量
-  - 配置
-  - .env
-  - settings
-  - config
-  - Settings
-  - Pydantic
+description: 本项目配置管理规范——.env + Pydantic Settings 联动流程。涉及环境变量、配置项、Settings 类、新增 .env 字段时加载。
 ---
 
 ## 本项目的配置机制

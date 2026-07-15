@@ -11,7 +11,7 @@ from agent_core.executor import ToolExecutor
 from providers.router import get_provider
 from providers.types import Usage
 from tools.registry import ToolRegistry
-from skills.enhancer import enhance_system_prompt
+from skills import SKILL_INDEX, get_skill_guide_tool
 from observability.logging import logger
 
 
@@ -63,29 +63,27 @@ class SubAgent(ABC):
             context_str = "\n".join(f"【{k}的结果】\n{v}" for k, v in context.items())
             full_task = f"{task}\n\n参考信息（来自前置任务）：\n{context_str}"
 
-        # 用完整任务描述搜索相关 Skill，动态增强 system prompt。
-        # 不再只取前 300 字符：搜索是 TF-IDF 打分，关键词可能出现在任务描述靠后的
-        # 位置（尤其 context 注入了前置任务结果时），截断会漏掉这些词、匹配不到该有的规范。
-        system = enhance_system_prompt(
-            base_system=self.system_prompt,
-            context=full_task,
-            agent_name=self.name,
-        )
+        # system prompt 末尾拼上常驻的技能索引表（只有 name + description，很短）。
+        # 不再做 TF-IDF 搜索、也不预注入任何 Skill 全文——加载与否由 LLM 自己在循环里决定。
+        system = f"{self.system_prompt}\n\n{SKILL_INDEX}" if SKILL_INDEX else self.system_prompt
 
         provider = get_provider()
 
-        # 使用 Agentic Loop 执行任务
+        # 使用 Agentic Loop 执行任务。
+        # 把 get_skill_guide 工具恒定加入注册表（和子类自己的 tools 合并），这样每个子 Agent
+        # 都能按需加载 Skill；registry 恒非空、executor 恒有效。
         registry = ToolRegistry()
+        registry.register(get_skill_guide_tool())
         for tool in self.tools:
             registry.register(tool)
 
-        executor = ToolExecutor(registry) if self.tools else ToolExecutor(None)
+        executor = ToolExecutor(registry)
 
         result = await run_agent_loop(
             prompt=full_task,
             provider=provider,
             system=system,
-            tools=registry.get_all_definitions() if self.tools else None,
+            tools=registry.get_all_definitions(),
             executor=executor,
             max_turns=10,
             session_id=session_id,

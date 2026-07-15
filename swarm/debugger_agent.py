@@ -24,11 +24,6 @@ class DebuggerSwarmAgent(SwarmAgent):
         filename = payload.get("file", "")
         review_result = payload.get("review_result", "")
 
-        from providers.router import get_provider
-        from providers.types import Message, TextBlock
-
-        provider = get_provider()
-
         base_system = """
 你是一名调试工程师，根据代码审查结果修复 Bug。
 输出格式：
@@ -42,19 +37,8 @@ class DebuggerSwarmAgent(SwarmAgent):
             f"原始代码：\n```python\n{code}\n```\n\n"
             "请根据审查结果修复所有 Critical 级别的问题。"
         )
-        # 用完整 prompt 作为 Skill 搜索上下文，不截断——触发 Skill 的关键词
-        # （如 asyncio、subprocess）可能在代码靠后位置，截断会漏掉该加载的团队规范。
-        system = self._enhance_system(base_system, prompt)
-
-        response = await provider.chat(
-            messages=[Message(role="user", content=[TextBlock(text=prompt)])],
-            system=system,
-        )
-
-        result = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                result += block.text
+        # 走 Agentic Loop：修复时 LLM 可按需 get_skill_guide 加载错误处理/异步等团队规范。
+        result = await self._run_with_skills(base_system, prompt)
 
         # 修复完成后，自动发布 test_write 任务
         test_write_task_id = await self.blackboard.post_derived(

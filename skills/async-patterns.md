@@ -1,16 +1,6 @@
 ---
 name: async-patterns
-description: 本项目的 asyncio 规范——白板并发、后台任务、已踩过的坑
-triggers:
-  - 异步
-  - async
-  - await
-  - asyncio
-  - 并发
-  - 协程
-  - Lock
-  - Event
-  - Condition
+description: 本项目的 asyncio 规范——白板并发、后台任务、已踩过的坑。审查或编写涉及 async/await/asyncio、并发协程、Lock/Event/Condition 的代码时加载。
 ---
 
 ## 本项目的异步架构

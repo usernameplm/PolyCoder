@@ -40,12 +40,6 @@ class ReviewerSwarmAgent(SwarmAgent):
 
         logger.info("reviewer_agent_started_review", agent_id=self.agent_id, file=filename)
 
-        # 调用 LLM 执行审查
-        from providers.router import get_provider
-        from providers.types import Message, TextBlock
-
-        provider = get_provider()
-
         base_system = """
 你是一名资深代码审查工程师。
 审查维度：SQL 注入、命令注入、硬编码密码、逻辑错误、边界条件、性能问题。
@@ -53,19 +47,9 @@ class ReviewerSwarmAgent(SwarmAgent):
 发现 Critical 级别问题时，最后一行输出 NEEDS_FIX:true，否则输出 NEEDS_FIX:false。
 """
         prompt = f"文件：{filename}\n重点关注：{focus}\n\n```python\n{code}\n```"
-        # 用完整 prompt 作为 Skill 搜索上下文，不截断——触发 Skill 的关键词
-        # （如 asyncio、subprocess）可能在代码靠后位置，截断会漏掉该加载的团队规范。
-        system = self._enhance_system(base_system, prompt)
-
-        response = await provider.chat(
-            messages=[Message(role="user", content=[TextBlock(text=prompt)])],
-            system=system,
-        )
-
-        result = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                result += block.text
+        # 走 Agentic Loop：LLM 审查时若发现代码涉及 asyncio、异常处理等，
+        # 会自主 get_skill_guide 加载对应团队规范再审。返回值即最终审查文本。
+        result = await self._run_with_skills(base_system, prompt)
 
         # 如果发现严重问题，自动发布 debug 任务（这就是 Swarm 的涌现式行为）
         if "NEEDS_FIX:true" in result:
