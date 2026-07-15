@@ -1,6 +1,7 @@
 # sub_agents/test_writer.py
 from tools.builtin.read_file import ReadFileTool
 from tools.builtin.run_python import RunPythonTool
+from tools.builtin.write_file import WriteFileTool
 from .base import SubAgent
 
 
@@ -24,8 +25,9 @@ class TestWriterAgent(SubAgent):
 工作流程：
 1. 用 read_file 读取要测试的源码，理解函数签名和行为
 2. 编写 pytest 风格的测试用例
-3. 用 run_python 运行测试，确认全部通过
-4. 如果测试失败，分析是测试写错了还是被测代码有 Bug，并说明
+3. 用 write_file 将测试代码保存为 test_xxx.py 文件
+4. 用 run_python 运行测试，确认全部通过
+5. 如果测试失败，分析是测试写错了还是被测代码有 Bug，并说明
 
 输出格式：
 ```python
@@ -39,4 +41,4 @@ import pytest
 
     @property
     def tools(self):
-        return [ReadFileTool(), RunPythonTool()]
+        return [ReadFileTool(), RunPythonTool(), WriteFileTool()]

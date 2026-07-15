@@ -131,10 +131,19 @@ class OpenAIProvider(BaseProvider):
             content.append(TextBlock(text=choice.message.content))
         if choice.message.tool_calls:
             for tc in choice.message.tool_calls:
+                try:
+                    parsed = json.loads(tc.function.arguments)
+                except json.JSONDecodeError as e:
+                    logger.warning("openai_tool_args_parse_failed",
+                                   tool_name=tc.function.name,
+                                   tool_id=tc.id,
+                                   error=str(e),
+                                   raw_args=tc.function.arguments[:200])
+                    parsed = {"_parse_error": str(e), "_raw_args": tc.function.arguments}
                 content.append(ToolUseBlock(
                     id=tc.id,
                     name=tc.function.name,
-                    input=json.loads(tc.function.arguments),
+                    input=parsed,
                 ))
 
         if resp.usage is None:

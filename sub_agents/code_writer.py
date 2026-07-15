@@ -1,6 +1,7 @@
 # sub_agents/code_writer.py
 from tools.builtin.read_file import ReadFileTool
 from tools.builtin.run_python import RunPythonTool
+from tools.builtin.write_file import WriteFileTool
 from .base import SubAgent
 
 
@@ -18,8 +19,9 @@ class CodeWriterAgent(SubAgent):
 工作流程：
 1. 先用 read_file 了解已有代码结构和风格（如有相关文件）
 2. 根据需求编写代码，遵循现有代码的风格规范
-3. 用 run_python 执行生成的代码，验证无语法错误和运行时错误
-4. 如果测试失败，自动修复并重新验证
+3. 用 write_file 将代码保存到文件
+4. 用 run_python 执行生成的代码，验证无语法错误和运行时错误
+5. 如果测试失败，自动修复并重新验证
 
 输出格式：
 - 先说明设计思路（2-3 句）
@@ -34,4 +36,4 @@ class CodeWriterAgent(SubAgent):
 
     @property
     def tools(self):
-        return [ReadFileTool(), RunPythonTool()]
+        return [ReadFileTool(), RunPythonTool(), WriteFileTool()]

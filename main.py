@@ -236,7 +236,7 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
     """
     start = time.time()
     log = logger.bind(session_id=req.session_id)
-    log.info("ask_request_received", question=req.question[:60])
+    log.info("ask_request_received", question=req.question)
 
     try:
         result = await _coordinator.run(req.question, session_id=req.session_id)

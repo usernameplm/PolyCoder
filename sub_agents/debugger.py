@@ -2,6 +2,7 @@
 from tools.builtin.read_file import ReadFileTool
 from tools.builtin.run_python import RunPythonTool
 from tools.builtin.search_code import SearchCodeTool
+from tools.builtin.write_file import WriteFileTool
 from .base import SubAgent
 
 
@@ -20,7 +21,7 @@ class DebuggerAgent(SubAgent):
 1. 先用 read_file 读取出错的文件，理解代码逻辑
 2. 用 run_python 复现 Bug（写一个最小可复现的测试用例）
 3. 用 search_code 查找相关函数，追踪 Bug 根因
-4. 构造修复方案，用 run_python 验证修复有效
+4. 构造修复方案，用 write_file 写入修复代码，用 run_python 验证修复有效
 5. 确认修复后没有引入新的问题
 
 输出格式：
@@ -36,4 +37,4 @@ class DebuggerAgent(SubAgent):
 
     @property
     def tools(self):
-        return [ReadFileTool(), RunPythonTool(), SearchCodeTool()]
+        return [ReadFileTool(), RunPythonTool(), SearchCodeTool(), WriteFileTool()]
