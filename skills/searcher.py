@@ -33,7 +33,10 @@ class SkillSearcher:
         # 统计每个词出现在几个 Skill 里
         doc_freq: dict[str, int] = {}
         for skill in self.skills:
-            words = self._tokenize(f"{skill.description} {' '.join(skill.triggers)} {skill.content[:500]}")
+            # 用 Skill 全文参与 IDF 统计，不截断——只看前 500 字会漏掉正文靠后的
+            # 关键术语，导致这些词永远匹配不到，Skill 命中率下降。必须和 search()
+            # 里的分词口径保持一致，否则 IDF 表和打分用的词集对不上。
+            words = self._tokenize(f"{skill.description} {' '.join(skill.triggers)} {skill.content}")
             for word in set(words):
                 doc_freq[word] = doc_freq.get(word, 0) + 1
 
@@ -68,9 +71,9 @@ class SkillSearcher:
                     score += 10.0
                     break
 
-            # 2. TF-IDF 评分
+            # 2. TF-IDF 评分（用 Skill 全文，和 _compute_idf 保持一致，不截断）
             query_words = self._tokenize(query)
-            skill_words = self._tokenize(f"{skill.description} {skill.content[:500]}")
+            skill_words = self._tokenize(f"{skill.description} {skill.content}")
             skill_word_set = set(skill_words)
 
             for word in query_words:

@@ -53,7 +53,9 @@ class ReviewerSwarmAgent(SwarmAgent):
 发现 Critical 级别问题时，最后一行输出 NEEDS_FIX:true，否则输出 NEEDS_FIX:false。
 """
         prompt = f"文件：{filename}\n重点关注：{focus}\n\n```python\n{code}\n```"
-        system = self._enhance_system(base_system, prompt[:300])
+        # 用完整 prompt 作为 Skill 搜索上下文，不截断——触发 Skill 的关键词
+        # （如 asyncio、subprocess）可能在代码靠后位置，截断会漏掉该加载的团队规范。
+        system = self._enhance_system(base_system, prompt)
 
         response = await provider.chat(
             messages=[Message(role="user", content=[TextBlock(text=prompt)])],

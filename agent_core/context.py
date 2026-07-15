@@ -68,13 +68,15 @@ async def compress_messages(
     old_messages = messages[:-keep_count]
     recent_messages = messages[-keep_count:]
 
-    # 构建摘要提示词
+    # 构建摘要提示词。这里喂给摘要模型的是每条历史消息的完整内容，不截断——
+    # 摘要只能覆盖它看得到的文本，若在这一步先砍到 500 字，被砍掉的决策/数据
+    # 就永远进不了摘要，等于历史直接丢失。摘要输出的 max_tokens 已经控制了压缩后的体积。
     history_text = ""
     for msg in old_messages:
         role_label = "用户" if msg.role == "user" else "助手"
         for block in msg.content:
             if isinstance(block, TextBlock):
-                history_text += f"[{role_label}]: {block.text[:500]}\n"
+                history_text += f"[{role_label}]: {block.text}\n"
 
     summary_prompt = f"""
 请对以下历史对话进行简洁的摘要，保留所有重要决策、数据、用户需求和问题。

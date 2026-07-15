@@ -33,4 +33,6 @@ class ListDirTool(BaseTool):
             if any(part.startswith(".") or part == "__pycache__" for part in rel.parts): continue
             indent = "  " * (len(rel.parts) - 1)
             lines.append(f"{indent}{'📁 ' if p.is_dir() else '📄 '}{p.name}")
-        return "\n".join(lines[:100])
+        # 返回完整目录树，不截断——截断到前 100 项会让 Agent 误以为
+        # 项目里没有后面的文件，从而漏读关键代码。depth 参数已能控制展开层级。
+        return "\n".join(lines)

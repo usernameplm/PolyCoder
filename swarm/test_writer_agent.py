@@ -64,7 +64,9 @@ import pytest
             f"{code}\n\n"
             "请为这段代码编写 pytest 单元测试。"
         )
-        system = self._enhance_system(base_system, prompt[:300])
+        # 用完整 prompt 作为 Skill 搜索上下文，不截断——触发 Skill 的关键词
+        # （如 asyncio、subprocess）可能在代码靠后位置，截断会漏掉该加载的团队规范。
+        system = self._enhance_system(base_system, prompt)
 
         response = await provider.chat(
             messages=[Message(role="user", content=[TextBlock(text=prompt)])],

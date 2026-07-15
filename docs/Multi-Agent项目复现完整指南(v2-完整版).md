@@ -3126,22 +3126,16 @@ class ReadFileTool(BaseTool):
         if not target.is_file():
             return f"错误：{raw_path} 是目录，请指定具体文件路径"
 
-        # 文件大小限制：超过 100KB 只读取前 200 行
-        size = target.stat().st_size
         try:
             text = target.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return f"错误：{raw_path} 不是文本文件（可能是二进制文件）"
 
+        # 返回完整文件内容，不做长度截断。
+        # 截断会让 Agent 看到的代码残缺（比如只看到前 200 行就去审查/修改），
+        # 直接影响判断的正确性。上下文窗口超限由 agent_core/context.py 的
+        # 压缩机制统一兜底，不应在读文件这一层提前砍内容。
         lines = text.splitlines()
-        if size > 100_000:
-            preview = "\n".join(lines[:200])
-            return (
-                f"文件：{raw_path}（共 {len(lines)} 行，仅显示前 200 行）\n"
-                f"{'─' * 40}\n{preview}\n{'─' * 40}\n"
-                f"[文件过长，已截断。如需查看特定行，请使用 read_file_lines 工具]"
-            )
-
         return f"文件：{raw_path}（{len(lines)} 行）\n{'─' * 40}\n{text}\n{'─' * 40}"
 ```
 
@@ -3312,7 +3306,10 @@ class SearchCodeTool(BaseTool):
     async def execute(self, inputs: dict) -> str:
         keyword = inputs.get("keyword", "").strip()
         file_pattern = inputs.get("file_pattern", "*")
-        max_results = min(int(inputs.get("max_results", 20)), 50)
+        # 默认 20 条只是给 Agent 一个合理起点，不再强制封顶——
+        # 之前的 min(..., 50) 硬上限会让 Agent 即便显式要更多结果也拿不到，
+        # 排查"某符号所有引用"这类需求时会漏掉真正相关的位置。
+        max_results = int(inputs.get("max_results", 20))
 
         if not keyword:
             return "错误：keyword 不能为空"
@@ -3528,7 +3525,9 @@ class ListDirTool(BaseTool):
             if any(part.startswith(".") or part == "__pycache__" for part in rel.parts): continue
             indent = "  " * (len(rel.parts) - 1)
             lines.append(f"{indent}{'📁 ' if p.is_dir() else '📄 '}{p.name}")
-        return "\n".join(lines[:100])
+        # 返回完整目录树，不截断——截断到前 100 项会让 Agent 误以为
+        # 项目里没有后面的文件，从而漏读关键代码。depth 参数已能控制展开层级。
+        return "\n".join(lines)
 ```
 
         try:
@@ -6110,13 +6109,15 @@ async def compress_messages(
     old_messages = messages[:-keep_count]
     recent_messages = messages[-keep_count:]
 
-    # 构建摘要提示词
+    # 构建摘要提示词。这里喂给摘要模型的是每条历史消息的完整内容，不截断——
+    # 摘要只能覆盖它看得到的文本，若在这一步先砍到 500 字，被砍掉的决策/数据
+    # 就永远进不了摘要，等于历史直接丢失。摘要输出的 max_tokens 已经控制了压缩后的体积。
     history_text = ""
     for msg in old_messages:
         role_label = "用户" if msg.role == "user" else "助手"
         for block in msg.content:
             if isinstance(block, TextBlock):
-                history_text += f"[{role_label}]: {block.text[:500]}\n"
+                history_text += f"[{role_label}]: {block.text}\n"
 
     summary_prompt = f"""
 请对以下历史对话进行简洁的摘要，保留所有重要决策、数据、用户需求和问题。
@@ -6421,7 +6422,10 @@ class SkillSearcher:
         # 统计每个词出现在几个 Skill 里
         doc_freq: dict[str, int] = {}
         for skill in self.skills:
-            words = self._tokenize(f"{skill.description} {' '.join(skill.triggers)} {skill.content[:500]}")
+            # 用 Skill 全文参与 IDF 统计，不截断——只看前 500 字会漏掉正文靠后的
+            # 关键术语，导致这些词永远匹配不到，Skill 命中率下降。必须和 search()
+            # 里的分词口径保持一致，否则 IDF 表和打分用的词集对不上。
+            words = self._tokenize(f"{skill.description} {' '.join(skill.triggers)} {skill.content}")
             for word in set(words):
                 doc_freq[word] = doc_freq.get(word, 0) + 1
 
@@ -6456,9 +6460,9 @@ class SkillSearcher:
                     score += 10.0
                     break
 
-            # 2. TF-IDF 评分
+            # 2. TF-IDF 评分（用 Skill 全文，和 _compute_idf 保持一致，不截断）
             query_words = self._tokenize(query)
-            skill_words = self._tokenize(f"{skill.description} {skill.content[:500]}")
+            skill_words = self._tokenize(f"{skill.description} {skill.content}")
             skill_word_set = set(skill_words)
 
             for word in query_words:
@@ -6545,10 +6549,12 @@ class SubAgent(ABC):
             context_str = "\n".join(f"【{k}的结果】\n{v}" for k, v in context.items())
             full_task = f"{task}\n\n参考信息（来自前置任务）：\n{context_str}"
 
-        # ★ 新增：用任务描述搜索相关 Skill，动态增强 system prompt
+        # ★ 新增：用完整任务描述搜索相关 Skill，动态增强 system prompt。
+        # 不再只取前 300 字符：搜索是 TF-IDF 打分，关键词可能出现在任务描述靠后的
+        # 位置（尤其 context 注入了前置任务结果时），截断会漏掉这些词、匹配不到该有的规范。
         system = enhance_system_prompt(
             base_system=self.system_prompt,
-            context=full_task[:300],     # 取前 300 字符作为搜索依据
+            context=full_task,
             agent_name=self.name,
         )
 
@@ -6603,8 +6609,10 @@ async def handle(self, task) -> str:
 每个问题输出：[Critical/Warning/Suggestion] 行号 - 问题描述 - 建议修复。
 发现 Critical 级别问题时，最后一行输出 NEEDS_FIX:true，否则输出 NEEDS_FIX:false。
 """
-    # ★ 新增：用文件名 + focus + 代码片段作为搜索上下文
-    search_context = f"{filename} {focus} {code[:200]}"
+    # ★ 新增：用文件名 + focus + 完整代码作为搜索上下文（不截断代码）。
+    # Skill 搜索是 TF-IDF 打分，触发 Skill 的关键词（如 asyncio、subprocess）可能出现在
+    # 代码任意位置；只取前 200 字会漏掉靠后的关键词，导致该加载的团队规范没被加载。
+    search_context = f"{filename} {focus} {code}"
     system = self._enhance_system(base_system, search_context)
 
     # ...后续 provider.chat() 调用不变，只是 system 参数用增强后的版本...
@@ -6624,7 +6632,7 @@ async def handle(self, task) -> str:
     │   dispatcher.py → 分发给 sub_agents
     │       ↓
     │   SubAgent.run()
-    │       ├── enhance_system_prompt(self.system_prompt, task[:300])
+    │       ├── enhance_system_prompt(self.system_prompt, full_task)  # 完整任务描述，不截断
     │       └── run_agent_loop(system=增强后的prompt)
     │
     └─ POST /swarm/ask（Swarm 架构）

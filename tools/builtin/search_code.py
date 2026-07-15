@@ -54,7 +54,10 @@ class SearchCodeTool(BaseTool):
     async def execute(self, inputs: dict) -> str:
         keyword = inputs.get("keyword", "").strip()
         file_pattern = inputs.get("file_pattern", "*")
-        max_results = min(int(inputs.get("max_results", 20)), 50)
+        # 默认 20 条只是给 Agent 一个合理起点，不再强制封顶——
+        # 之前的 min(..., 50) 硬上限会让 Agent 即便显式要更多结果也拿不到，
+        # 排查"某符号所有引用"这类需求时会漏掉真正相关的位置。
+        max_results = int(inputs.get("max_results", 20))
 
         if not keyword:
             return "错误：keyword 不能为空"
