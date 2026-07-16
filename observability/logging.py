@@ -10,6 +10,18 @@
 """
 import structlog
 import logging
+from opentelemetry import trace
+
+
+def _inject_trace_id(_, __, event_dict):
+    """从当前 OpenTelemetry Span 提取 trace_id 和 span_id，注入每条日志。"""
+    span = trace.get_current_span()
+    if span is not None:
+        ctx = span.get_span_context()
+        if ctx.is_valid:
+            event_dict["trace_id"] = format(ctx.trace_id, "032x")
+            event_dict["span_id"] = format(ctx.span_id, "016x")
+    return event_dict
 
 
 def setup_logging(log_level: str = "INFO"):
@@ -22,6 +34,7 @@ def setup_logging(log_level: str = "INFO"):
 
     structlog.configure(
         processors=[
+            _inject_trace_id,
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),

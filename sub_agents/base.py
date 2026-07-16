@@ -85,7 +85,7 @@ class SubAgent(ABC):
             system=system,
             tools=registry.get_all_definitions(),
             executor=executor,
-            max_turns=10,
+            max_turns=99,
             session_id=session_id,
         )
 
