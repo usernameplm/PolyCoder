@@ -8,3 +8,4 @@ __pycache__/
 sessions/
 workspace/
 logs/
+qdrant_storage/
