@@ -10,7 +10,7 @@ OpenTelemetry 链路追踪。
 """
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.resources import Resource
 
 from observability.logging import logger
@@ -30,7 +30,9 @@ def setup_tracing(service_name: str = "my-agent", otlp_endpoint: str | None = No
         try:
             from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
             exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
-            provider.add_span_processor(BatchSpanProcessor(exporter))
+            # SimpleSpanProcessor 同步导出，避免 BatchSpanProcessor 在 asyncio 环境下
+            # 后台线程无法正常 flush 的问题
+            provider.add_span_processor(SimpleSpanProcessor(exporter))
             logger.info("tracing_enabled", otlp_endpoint=otlp_endpoint)
         except ImportError:
             logger.warning("tracing_exporter_missing", hint="未安装 opentelemetry-exporter-otlp，链路数据不导出")
