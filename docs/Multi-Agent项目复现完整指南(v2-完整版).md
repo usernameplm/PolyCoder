@@ -8155,6 +8155,20 @@ async def ask_endpoint(req: AskRequest) -> AskResponse:
 >
 > **注意 2**：`GET /ask/stream`（SSE 流式接口）**没有**接入 `record_request()`——它的生成器只管边生成边往外推文本增量，函数返回前拿不到聚合后的最终 usage 和总耗时，要打点得先改造流式生成器在结束时收集 usage，本次没有做这一步，如果需要可以补。
 
+**指标一览表（中英对照）**
+
+| 指标名 Metric Name | 类型 Type | 中文说明 | English Description | Label 维度 | 状态 |
+|---|---|---|---|---|---|
+| `agent_requests_total` | Counter | Agent 接收并处理的请求总数 | Total number of requests received and processed by the agent | `provider`, `model`, `status` | ✅ 已接入（`/ask` 成功/失败都会 +1） |
+| `agent_latency_seconds` | Histogram | Agent 完成一次请求的端到端延迟（秒），桶边界 0.5/1/2/5/10/30/60s | End-to-end request latency distribution (seconds), buckets: 0.5/1/2/5/10/30/60s | `provider` | ✅ 已接入 |
+| `token_usage_total` | Counter | 累计 Token 用量 | Cumulative token usage | `type`（input / output / cache_read） | ✅ 已接入（仅成功请求记录，失败时不传 usage） |
+| `tool_calls_total` | Counter | 工具被调用的总次数 | Total number of tool invocations | `tool_name`, `status`（success/error） | ⚠️ 已定义但代码里未调用，当前恒为空 |
+| `active_requests` | Gauge | 当前正在处理中的请求数 | Number of requests currently being processed | 无 | ⚠️ 已定义但代码里未 `.set()`/`.inc()`，恒为 0 |
+
+> **prometheus_client 的一个坑**：`agent_requests_total`/`agent_latency_seconds`/`token_usage_total` 这类带 label 的 Counter/Histogram，只有代码里真正调用过 `.labels(xxx=...).inc()`/`.observe()` 之后，那个具体 label 组合的时间序列才会出现在 `/metrics` 输出里——进程刚启动、还没打过一次 `/ask` 请求时，`/metrics` 端点只会输出不带 label 的 `active_requests`（Gauge 无论如何都会输出一行，哪怕值是 0），Grafana 的 Metric 下拉框也就搜不到那几个带 label 的指标名。这不是 bug，打一次 `/ask` 请求后指标就会出现。
+
+> **采集范围的局限**：`record_request()` 只挂在 `/ask`（非流式）这一个端点上，`GET /ask/stream`（SSE）和 `/swarm/ask`（Swarm 架构）的请求**不会**计入这几个指标。Prometheus 侧除了这 5 个自定义指标，还会附带 `prometheus_client` 库自带的进程级指标（`process_cpu_seconds_total`、`process_resident_memory_bytes`、`python_gc_collections_total` 等）以及 Prometheus 自身的抓取元指标（如 `scrape_duration_seconds`）。
+
 ---
 
 ### 11.3.1 预拉取可观测性栈镜像
@@ -8501,6 +8515,17 @@ active_requests
 sum by (type) (token_usage_total)
 ```
 查完点右上角 **Add to dashboard** 可以固化成图表面板，长期盯着看就建一个 Dashboard；临时排查用 Explore 就够。
+
+> **为什么 Metric 下拉框里 `agent_latency_seconds` 会展开出好几个指标？** 这是 Histogram 类型的固定行为，不是配置多了——一个 `Histogram(...)` 定义在 `/metrics` 里会拆成多条时间序列：
+>
+> | 后缀 Suffix | 含义 |
+> |---|---|
+> | `_bucket{le="X"}` | 累积分桶计数：延迟 ≤X 秒的请求数（`le` = less than or equal），`buckets=[0.5,1,2,5,10,30,60]` 生成 7 条 + 隐含的 `le="+Inf"` |
+> | `_sum` | 所有观测值（延迟秒数）总和，配合 `_count` 算平均延迟 |
+> | `_count` | 观测次数总数，等价于 `_bucket{le="+Inf"}` |
+> | `_created` | 指标首次创建的 Unix 时间戳，`prometheus_client` 自动加的元数据，日常查询用不上 |
+>
+> Counter（如 `agent_requests_total`）同样会自动带一条 `_created`，但没有 `_bucket`/`_sum`——那两个是 Histogram 独有的。
 
 ### 11.7.2 查 Traces（选数据源 "Tempo"）
 

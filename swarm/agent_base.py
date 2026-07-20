@@ -66,6 +66,7 @@ class SwarmAgent(ABC):
             executor=ToolExecutor(registry),
             max_turns=99,
             session_id=self.agent_id,
+            agent_name=type(self).__name__,
         )
         return result.text
 

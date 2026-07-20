@@ -51,6 +51,7 @@ async def run_agent_loop(
     on_text_delta: Callable[[str], None] | None = None,
     initial_messages: list[Message] | None = None,
     session_id: str | None = None,
+    agent_name: str | None = None,
 ) -> LoopResult:
     """
     Agentic Loop 主函数。
@@ -67,6 +68,9 @@ async def run_agent_loop(
         initial_messages  已有的历史消息（含本轮新问题），传入则跳过用 prompt
                           单独构造首条消息——用于带会话记忆的多轮对话场景
         session_id    会话标识，传入后所有日志自动带上 session_id 字段
+        agent_name    调用方的 Agent 名字（如 code_reviewer/debugger），传入后
+                      作为 span 名字，让 Tempo trace 树能区分是哪个子 Agent，
+                      不传则退回通用的 "agent_loop"
 
     返回：
         LoopResult 包含最终文字、用量统计、轮次数、终止原因
@@ -79,9 +83,10 @@ async def run_agent_loop(
     state = LoopState(messages=tuple(starting_messages))
 
     # ── 主循环 ─────────────────────────────────────────────────────────────────
-    with tracer.start_as_current_span("agent_loop") as loop_span:
+    with tracer.start_as_current_span(agent_name or "agent_loop") as loop_span:
         loop_span.set_attribute("session_id", session_id or "")
         loop_span.set_attribute("provider", provider.model_name)
+        loop_span.set_attribute("agent.name", agent_name or "")
 
         while True:
 

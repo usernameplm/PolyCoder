@@ -87,6 +87,7 @@ class SubAgent(ABC):
             executor=executor,
             max_turns=99,
             session_id=session_id,
+            agent_name=self.name,
         )
 
         log.info("sub_agent_done", result_chars=len(result.text))
