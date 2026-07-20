@@ -10,8 +10,8 @@ from typing import AsyncGenerator
 from .base import BaseProvider
 from .types import (
     Message, ToolDefinition, ProviderResponse,
-    StreamChunk, TextBlock, ToolUseBlock, Usage,
-    TextDelta, ToolInputDelta, ToolUseStart, MessageStart, MessageStop,
+    StreamChunk, TextBlock, ToolUseBlock, ImageBlock, Usage,
+    TextDelta, MessageStart, MessageStop,
 )
 
 
@@ -27,6 +27,11 @@ class AnthropicProvider(BaseProvider):
     @property
     def model_name(self) -> str:
         return self._model
+    
+    @property
+    def supports_vision(self) -> bool:
+        # Claude 3 及之后的全系列模型（含本项目默认的 claude-sonnet-4-6）原生支持图片输入。
+        return True
 
     def _to_sdk_messages(self, messages: list[Message]) -> list[dict]:
         """
@@ -51,6 +56,15 @@ class AnthropicProvider(BaseProvider):
                         "tool_use_id": block.tool_use_id,
                         "content": block.content,
                         "is_error": block.is_error,
+                    })
+                elif isinstance(block, ImageBlock):          # ← 新增这一段
+                    blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": block.media_type,
+                            "data": block.data,
+                        },
                     })
                 else:  # TextBlock
                     blocks.append({"type": "text", "text": block.text})
@@ -105,8 +119,8 @@ class AnthropicProvider(BaseProvider):
             usage=Usage(
                 input_tokens=resp.usage.input_tokens,
                 output_tokens=resp.usage.output_tokens,
-                cache_read_tokens=getattr(resp.usage, "cache_read_input_tokens", 0),
-                cache_write_tokens=getattr(resp.usage, "cache_creation_input_tokens", 0),
+                cache_read_tokens=getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
+                cache_write_tokens=getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
             ),
         )
 

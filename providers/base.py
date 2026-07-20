@@ -59,3 +59,13 @@ class BaseProvider(ABC):
         默认返回 True（主流 Provider 都支持）。
         """
         return True
+    
+    @property
+    def supports_vision(self) -> bool:
+        """
+        是否支持图片输入。
+
+        默认返回 False——多模态是模型级能力而不是 Provider 级能力，
+        必须由具体子类根据自己接的模型显式声明，不能笼统地假设"这家厂商都支持"。
+        """
+        return False

@@ -35,3 +35,30 @@ class ToolRegistry:
         发给 LLM 时传入这个列表，LLM 就知道有哪些工具可用。
         """
         return [t.definition for t in self._tools.values()]
+
+    @classmethod
+    def default(cls) -> "ToolRegistry":
+        """
+        创建并返回一个已注册所有内置工具的注册表。
+
+        这是启动 Agent 时最常用的入口：
+            registry = ToolRegistry.default()
+            executor = ToolExecutor(registry)
+        """
+        registry = cls()
+
+        from tools.knowledge_base import KnowledgeBaseTool
+        from tools.builtin.list_dir import ListDirTool
+        from tools.builtin.read_file import ReadFileTool
+        from tools.builtin.search_code import SearchCodeTool
+        from tools.builtin.run_python import RunPythonTool
+        from tools.builtin.write_file import WriteFileTool
+
+        registry.register(KnowledgeBaseTool())
+        registry.register(ListDirTool())
+        registry.register(ReadFileTool())
+        registry.register(SearchCodeTool())
+        registry.register(RunPythonTool())
+        registry.register(WriteFileTool())
+
+        return registry
