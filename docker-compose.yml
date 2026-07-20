@@ -26,6 +26,8 @@ services:
   redis:
     image: redis:7-alpine           # 使用 Alpine 版本，体积小
     command: redis-server --save 60 1 --loglevel warning  # 60 秒内有 1 次写入就持久化
+    ports:
+      - "6379:6379"                 # 暴露给宿主机，方便宿主机直跑的 app 用 localhost 连接
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

@@ -4,6 +4,16 @@
 > 自实现 Agentic Loop，同时支持 Anthropic / OpenAI-compat / Gemini / Bedrock 等多 Provider。
 > 每一阶段都是可独立运行的完整程序，在上一阶段基础上增加一个新能力。
 
+> **📎 2026 行业趋势对标增补（基于 2026-07-17 的评估）**：在不改动第 1-14 章已实现主体的前提下，
+> 本版新增了 4 处训练无关的进阶改进，全部与"RL 只训本地小模型"的约束兼容：
+> - **15.14** CONCAT 动态分组与稀疏通信裁剪——按相关性裁剪 Coordinator 注入的上下文、对 Swarm
+>   相似任务聚类去重（对应 2026 趋势"稀疏通信"）；
+> - **16.13** MAST 失败结构化分类——给指标加 `failure_category` 三分类字段；
+> - **16.14** 评测技能化——把测试模式沉淀为 `agent-eval-authoring` Skill（对应 EvalAgent 研究）；
+> - **第 18 章（附录）** 收录本该落在第 6、11 章的改进：**18.1** Coordinator DAG 局部重新规划、
+>   **18.2** 按失败类别的 Grafana 聚合查询、**18.3** LLM 输出层安全护栏的已知空白。
+>   第 6、11 章正文只在对应位置留了一行"进阶备注"指引，未改动其编号与已实现内容。
+
 ---
 
 ## 阶段划分总览
@@ -4366,6 +4376,10 @@ curl -X POST http://localhost:8002/ask \
   -d '{"question": "分别审查 auth.py 和 payment.py 这两个文件的代码质量"}'
 ```
 
+> 📌 **进阶备注**（不影响本章已实现内容）：Coordinator 的 DAG 是一次性规划的，若 Planner
+> 规划有误（漏依赖、粒度错），现状只能等所有波次跑完才发现、无法中途纠正。2026 行业趋势
+> 评估把这列为可改进点，训练无关的**局部重新规划**容错方案见 **第 18 章 18.1 节**。
+
 ---
 
 ## 6.11 本章检查清单
@@ -8530,6 +8544,11 @@ sum(rate({container="agent"} | json | level="error" [5m]))
 3. 确认是个别请求慢还是整体退化，去 **Prometheus** 看 `agent_latency_seconds` 的 P95/P99 曲线和 `agent_requests_total{status="error"}` 的速率，判断影响面。
 
 三个数据源都在同一个 Grafana 里，来回切换不用跳出页面。
+
+> 📌 **进阶备注**（不影响本章已实现内容）：现有三支柱可观测性的**数据**已经很充分，但缺一层
+> **失败的结构化归类**——把失败归到"规划缺陷/Agent 间失配/验证失败"三类再跨会话统计。这层
+> 归类（`failure_category` 字段）在 **第 16 章 16.13 节** 定义、在 **第 18 章 18.2 节** 给出
+> Loki 聚合查询写法。此外，LLM 输出层安全护栏的已知空白说明见 **18.3 节**。
 
 ---
 
@@ -13511,6 +13530,153 @@ Agent：（生成的代码通过 core.http.HttpClient 发请求，返回值按 c
 
 ---
 
+## 15.14 进阶：训练无关的动态分组与稀疏通信裁剪（CONCAT 范式）
+
+> 本节复用 15.9 节已经搭好的 `bge-small-zh-v1.5` embedding 能力，给第 6 章的 Coordinator 和
+> 第 7 章的 Swarm 各叠加一层"按相关性裁剪通信"的优化。它是**纯运行时算法，不涉及任何训练**，
+> 因此和第 17 章"RL 只能训本地小模型、不能训 Claude/GPT"的硬约束完全兼容，可以共存。
+
+### 背景：为什么现有编排在"通信"上是浪费的
+
+2026 年多智能体工程的一条主线是**稀疏通信**——不是所有 Agent 都需要看到所有其他 Agent 的
+输出。代表性工作 CONCAT（arXiv:2605.29612，2026-05）提出一套训练无关的框架：一致性聚类选出
+leader → 用 Theory-of-Mind 启发式预测"谁和谁协作有收益" → 据此裁剪掉大部分通信边，构成稀疏
+拓扑。其报告的收益是相对全连接辩论范式效率（准确率/延迟比）最高提升约 2 倍。
+
+对照 PolyCoder 现状，有两处正是它批评的"静态全连接/广播"：
+
+- **Coordinator**（`coordinator/dispatcher.py` 的 `_run_one`）：把前置任务的**全部**结果原样
+  塞进下游的 `context`——`context = {dep: prior_results[dep] for dep in spec.depends_on ...}`。
+  哪怕前置产出里只有一小段和下游相关，也整段注入，既增加噪音也多烧 token。
+- **Swarm**（`swarm/blackboard.py`）：白板全局共享、谁先来谁认领，没有"这批高度相似的任务其实
+  做一次就够"的判断。
+
+> **和第 17 章 `RouterAgent` 的分工**：别把两者搞混。`RouterAgent` 解决的是"**这一个请求该
+> 派给哪个子 Agent**"的单步分类问题；本节解决的是"**多个子 Agent / 子任务之间该怎么分组、谁
+> 该看到谁的结果**"的协调层问题。作用域不同，互补共存。
+
+### 改造一：Coordinator 侧——按相关性裁剪注入的上下文
+
+思路：下游任务真正需要的，往往只是前置产出里语义相关的片段。在 `_run_one` 注入 context 前，
+先用 embedding 给"当前任务描述 vs 每段前置结果"打个相关性分，低于阈值的做截断而非全量拼接。
+阈值直接沿用 15.11 节 `knowledge-base-rag.md` 已经定义好的经验值，保持全项目一致：
+
+```python
+# coordinator/dispatcher.py（在 6.7 节版本上增量修改 _run_one）
+
+from tools.knowledge_base import _embed   # 复用 15.9 节已有的归一化 embedding
+
+
+def _relevance(a: str, b: str) -> float:
+    """两段文本的余弦相似度。_embed 返回的是 L2 归一化向量，点积即 cosine。"""
+    va, vb = _embed([a[:2000], b[:2000]])   # 截断防止超长文本拖慢编码
+    return sum(x * y for x, y in zip(va, vb))
+
+
+def _prune_context(task_input: str, raw_context: dict[str, str]) -> dict[str, str]:
+    """
+    按与当前任务的相关性裁剪前置结果的注入量：
+      relevance > 0.5   → 全量注入（高度相关）
+      0.3 ~ 0.5         → 截断到前 500 字（相关但不必全给）
+      < 0.3             → 只留一行摘要提示，不注入正文（几乎无关）
+    阈值与 15.11 节 knowledge-base-rag 的 relevance 经验一致。
+    """
+    pruned = {}
+    for dep_id, text in raw_context.items():
+        score = _relevance(task_input, text)
+        if score > 0.5:
+            pruned[dep_id] = text
+        elif score >= 0.3:
+            pruned[dep_id] = text[:500] + "…（已按相关性截断）"
+        else:
+            pruned[dep_id] = f"（前置任务 {dep_id} 的产出与本任务相关度低，已省略，如需可回溯）"
+    return pruned
+```
+
+在 `_run_one` 里把原来的一行替换掉：
+
+```python
+    # 原来：context = {dep: prior_results[dep] for dep in spec.depends_on if dep in prior_results}
+    raw_context = {dep: prior_results[dep] for dep in spec.depends_on if dep in prior_results}
+    context = _prune_context(spec.input, raw_context) if raw_context else None
+```
+
+单个子任务链路（数个前置）额外多几次 embedding 编码，`bge-small-zh-v1.5` 在 CPU 上是毫秒级，
+相对一次 LLM 调用可忽略；省下的是注入 LLM 的无关 token（既降本又减少干扰）。
+
+### 改造二：Swarm 侧——对同类型 pending 任务做一致性聚类
+
+思路：当短时间内涌入多条**高度相似**的同类型任务（如批量提交的相似代码审查），没必要每条都
+独立跑一遍。给 `Blackboard` 加一个轻量的聚类方法：对同类型 pending 任务的 payload 做 embedding，
+用"相似度阈值 + 连通分量"聚类（**不引入任何新聚类库**），每簇选一个代表任务作 leader 真正执行，
+其余在 leader 完成后直接复用其结果。
+
+```python
+# swarm/blackboard.py（在第 7 章版本上新增方法）
+
+    def cluster_pending(self, task_type: str, threshold: float = 0.85) -> list[list[str]]:
+        """
+        把同类型的 pending 任务按 payload 相似度聚类，返回 [[task_id, ...], ...]。
+        只有相似度 >= threshold（默认 0.85，即"几乎重复"）才归为一簇——阈值刻意设高，
+        宁可不聚也不要把"相似但不同"的任务错误合并。
+        """
+        from tools.knowledge_base import _embed
+        pend = [t for t in self._tasks.values()
+                if t.type == task_type and t.status == "pending"]
+        if len(pend) < 2:
+            return [[t.id] for t in pend]
+
+        texts = [str(t.payload)[:2000] for t in pend]
+        vecs = _embed(texts)
+        n = len(pend)
+
+        # 并查集求连通分量：相似度 >= threshold 的两任务连一条边
+        parent = list(range(n))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]; x = parent[x]
+            return x
+        for i in range(n):
+            for j in range(i + 1, n):
+                if sum(a * b for a, b in zip(vecs[i], vecs[j])) >= threshold:
+                    parent[find(i)] = find(j)
+
+        clusters: dict[int, list[str]] = {}
+        for i, t in enumerate(pend):
+            clusters.setdefault(find(i), []).append(t.id)
+        return list(clusters.values())
+```
+
+消费循环里的用法（示意）：拿到簇后，只让每簇的第一个任务正常 `claim()` 执行，其余标记为
+"跟随者"，在 leader `complete()` 时把结果复制过去。**这是可选优化**，仅在"同类型任务短时间
+大量涌入"时才有意义——建议加一个触发条件（如某类型 pending 数 > 5 才调 `cluster_pending`），
+平时不启用，避免给正常的低并发场景增加无谓开销。
+
+### 刻意不做：多轮 leader 重选
+
+CONCAT 原论文的完整流程包含"聚类→选主→裁剪→重复 m-1 轮"的多轮迭代。**本节只取"一次聚类 +
+一次裁剪"的简化版**，不做多轮。理由：PolyCoder 单次请求的任务粒度是数个到十几个子任务，
+远小于论文验证的多 Agent 大规模辩论场景，多轮迭代的收益撑不起它的复杂度和额外延迟——这与
+15.3.4 节"有明确收益才升级"的一贯判断一致。
+
+### 验证
+
+```bash
+# 场景 ①（Coordinator 上下文裁剪）：构造一个前置产出很长、但只有一小段和下游相关的请求，
+#   对比改造前后 SessionMetrics 的 total_input_tokens 应明显下降，且下游结果质量不降。
+curl -X POST http://localhost:8002/ask -H "Content-Type: application/json" \
+  -d '{"question": "先详细讲解整个订单模块的架构，然后只针对其中的分页参数写一个校验函数"}'
+
+# 场景 ②（Swarm 聚类去重）：短时间内提交 5 条几乎相同的 code_review 任务，
+#   观察日志应显示它们被聚成一簇，只有 leader 真正跑 LLM，其余复用结果。
+for i in 1 2 3 4 5; do
+  curl -X POST http://localhost:8002/swarm/ask -H "Content-Type: application/json" \
+    -d '{"task_type":"code_review","payload":"审查 def add(a,b): return a-b 是否有逻辑错误"}' &
+done; wait
+```
+
+---
+
 # 第 16 章：阶段 16 —— 自动化测试模块（Agent 指标收集）
 
 ## 16.1 为什么要自动化测试
@@ -14805,7 +14971,196 @@ if result.metrics:
 
 ---
 
-## 16.13 本章检查清单
+## 16.13 失败结构化分类（MAST 三分类）
+
+> 本节把可观测性从"这次失败了"提升到"这类失败为什么系统性发生"。它给 16.4 节的
+> `ToolRecord`/`TurnRecord` 加一个可选的归类字段，配合第 11 章已有的 structlog/Loki，
+> 就能在 Grafana 里做跨会话的失败模式统计（查询写法见 18.2 节）。
+
+### 为什么需要归类：MAST 分类学
+
+学术界（MAST 失败分类学，arXiv:2503.13657，NeurIPS 2025，标注一致性 Cohen's Kappa=0.88）
+把多 Agent 系统的失败归纳为三大类。我们取其可直接落地的简化版：
+
+| 类别 | 含义 | PolyCoder 里的典型例子 |
+|---|---|---|
+| `spec_flaw` | 规范 / 规划缺陷 | Planner 漏写 `depends_on`，导致下游任务被跳过（见 18.1） |
+| `misalignment` | Agent 间失配 | 上游子 Agent 的产出被下游误解，或工具调用格式对不上、重试才成功 |
+| `verification_failure` | 任务验证失败 | RAG 检索到了但相关度低，没二次校验就当真，导致后续答案错 |
+
+16.4 节的 `ToolRecord.error` 只回答了"这次成没成"，没回答"属于哪一类"。加上分类维度后，
+"某类失败反复出现"才会浮出水面，才谈得上有针对性地改进（比如 `verification_failure` 高就该
+去调 15.11 节的 relevance 阈值）。
+
+### 给 `core/metrics.py` 加 `failure_category` 字段
+
+在 16.4 节的 `ToolRecord` / `TurnRecord` 上各加一个**可选**字段，默认 `None` 表示"未失败或
+未分类"——对老代码零影响：
+
+```python
+# core/metrics.py（在 16.4 节版本上增量修改）
+
+from typing import Literal
+
+# 三类失败的类型别名（也可以用 str，这里用 Literal 让 IDE 有补全和校验）
+FailureCategory = Literal["spec_flaw", "misalignment", "verification_failure"]
+
+
+@dataclass
+class ToolRecord:
+    tool_name: str
+    duration_ms: float
+    success: bool
+    error: str = ""
+    failure_category: FailureCategory | None = None   # ← 新增：失败归类，成功时留空
+
+
+@dataclass
+class TurnRecord:
+    # ...（原有字段全部不变）...
+    failure_category: FailureCategory | None = None   # ← 新增：本轮若失败，归到哪一类
+```
+
+再加一个**克制的**分类函数——只覆盖能从现有信息直接判定的规则，判不了的就返回 `None`，
+绝不硬猜（硬猜会污染统计）：
+
+```python
+# core/metrics.py（新增函数）
+
+def classify_failure(
+    error: str = "",
+    result_text: str = "",
+    retried_then_succeeded: bool = False,
+    adopted_low_relevance: bool = False,
+) -> FailureCategory | None:
+    """
+    从已有信号里判定失败类别；判不了返回 None（不追求 100% 覆盖）。
+
+    调用方按自己掌握的信号传参，例如：
+      - Coordinator 的 dispatcher 捕获到"前置任务失败被跳过" → 传 error
+      - executor 发现工具调用重试后才成功                     → retried_then_succeeded=True
+      - knowledge_agent 采纳了 relevance<0.3 的检索结果        → adopted_low_relevance=True
+    """
+    if "前置任务" in error or "MISSING_CONTEXT" in result_text:
+        return "spec_flaw"            # 依赖链断了，属于规划缺陷
+    if retried_then_succeeded:
+        return "misalignment"         # 首次格式/语义对不上，重试才成——典型的 Agent 间失配
+    if adopted_low_relevance:
+        return "verification_failure" # 检索到了但没校验相关性就用
+    return None
+```
+
+在 `SessionMetrics` 里补一个按类别计数的聚合，并让报告和 `to_dict()` 带上它：
+
+```python
+# core/metrics.py — SessionMetrics 内新增
+
+    @property
+    def failure_counts(self) -> dict[str, int]:
+        """按 failure_category 统计次数（跨所有 turn 和 tool 记录），成功/未分类不计入。"""
+        from collections import Counter
+        cats = [t.failure_category for t in self.turns if t.failure_category]
+        cats += [r.failure_category for r in self.tool_records if r.failure_category]
+        return dict(Counter(cats))
+
+    # print_report() 末尾追加（在原有工具明细之后）：
+    #   if self.failure_counts:
+    #       print(f"  失败分类       : {self.failure_counts}")
+    # to_dict() 的返回字典里追加一项：
+    #   "failure_counts": self.failure_counts,
+```
+
+### 落地范围与克制原则
+
+- **能自动判的判，判不了的留空**：`classify_failure` 只写了三条最确定的规则。不要为了"每次
+  失败都有分类"去堆启发式——错误的分类比没有分类更有害（会让 18.2 的趋势图产生误导）。
+- 打标的位置在**调用方显式传信号**，而不是让 `classify_failure` 去猜。Coordinator 的
+  dispatcher（18.1）、`agent_core/executor.py`（工具重试）、`knowledge_agent`（低相关度采纳）
+  各自最清楚发生了什么，由它们传参最准。
+- 这个字段一旦进了 structlog 日志（第 11 章的打点习惯），跨会话聚合查询就是 18.2 节的事了。
+
+---
+
+## 16.14 评测技能化：把测试模式沉淀为可复用 Skill
+
+### 为什么："强编码能力 ≠ 会评估 Agent"
+
+一个和直觉相反、但有实证支撑的发现（AWS AI Labs，arXiv:2605.11378，2026-06）：前沿编码模型
+在**没有评估领域知识**时直接写 Agent 评估代码，首次可执行率只有约 30%，且倾向于"过度设计"
+（一个 Agent 塞 12+ 个指标）。解法不是换更强的模型，而是把**评估领域知识封装成可复用的
+"评测技能"**——程序化指令 + 可复用模板 + 决策树。
+
+这正好套用第 9 章已经确立的机制：**操作规范都走 Skill，由 `get_skill_guide` 按需加载**。
+16 章现在的测试（`test_metrics.py` / `test_rag.py` / `test_tool_accuracy.py` / `test_agent_e2e.py`）
+是人工手写的项目定制断言，换一个新子 Agent / 新工具就得从零再写一遍，没有沉淀成方法论——
+这恰是上面那篇论文批评的"临时手写"模式。把它做成一份 SKILL.md，就和 15.11 节的
+`knowledge-base-rag.md` 走了同一条路。
+
+### 新建 `skills/agent-eval-authoring.md`
+
+> 这是一份"操作文档型"Skill，和 15.11 节的 `knowledge-base-rag.md` 放在同一个 `skills/` 目录、
+> 同样进第 9 章的索引表、同样由 `get_skill_guide` 按需加载。它面向的是"写测试/评估代码的人"——
+> 既是开发者本人，也可以是未来某个自动生成测试的子 Agent。
+
+````markdown
+---
+name: agent-eval-authoring
+description: 给 Agent / 工具写评估测试的操作指南——先判分层（要不要调 LLM），再按标准模板构造最小 fixture 和断言，避免过度设计。当需要为新子 Agent、新工具或新编排流程编写测试时加载。
+---
+
+# Agent 评估代码编写技能
+
+## 一、先做分层判断（对应 16.3.2）
+
+写任何一条测试前，先问："这条断言需要真的调 LLM 吗？"
+
+| 你要验证的东西 | 分层 | 放哪个文件 |
+|---|---|---|
+| 指标计算、缓存命中率、费用估算、检索排序等**确定性逻辑** | 不调 LLM 的快测试 | `test_metrics.py` / `test_rag.py` |
+| 工具是否被正确调用、参数对不对 | 不调 LLM（用 mock/固定轨迹） | `test_tool_accuracy.py` |
+| 端到端回答质量、多轮编排是否正确 | 需调 LLM 的慢测试 | `test_agent_e2e.py` |
+
+**默认优先写不调 LLM 的那层**——快、稳、不烧钱、可进 CI。只有确实要验证"模型判断质量"时
+才落到端到端层。
+
+## 二、标准步骤模板（给新子 Agent / 新工具写测试）
+
+```
+1. 构造最小 fixture
+   · 只放验证这一条断言所必需的输入，不要堆无关数据
+   · ground truth 写死在测试里，不依赖外部环境 / 工作目录
+
+2. 断言"做了该做的事"（结构断言，优先）
+   · assert "预期工具名" in metrics.tool_names_called
+   · assert metrics.failure_counts == {} 或符合预期分类（用 16.13 的字段）
+
+3. 断言"结果含关键要点"（语义断言，克制）
+   · 断言输出里包含核心关键词 / 结构，而不是逐字匹配 LLM 措辞
+
+4. 断言"没有跑偏"（负向断言）
+   · assert 不该调的工具没被调用
+   · assert 费用 / 轮次在合理上限内
+```
+
+## 三、红线（反模式）
+
+- ❌ 一条测试里塞 12+ 个断言——拆成多条，每条只验证一个行为
+- ❌ 断言依赖 LLM 的**具体措辞**（`assert "你好，我是" in text`）——模型换一版就挂；
+     只断言**语义要点 / 结构**
+- ❌ 为了凑覆盖率给每个指标都造断言——只测真正会出错、会回归的路径
+- ❌ 端到端测试不设费用/轮次上限——必须有 `assert metrics.total_turns <= N` 之类的兜底
+````
+
+### 接入方式
+
+只需把它加进第 9 章的 Skill 索引表（和 `knowledge-base-rag`、`security` 等并列），**不需要**改
+`sub_agents/` 的注册——因为它是文档/知识型 Skill，不像 15.11 节的 `knowledge_agent` 那样还要
+挂一个 `search_knowledge_base` 工具。加载路径就是标准的
+`get_skill_guide('agent-eval-authoring')`。
+
+---
+
+## 16.15 本章检查清单
 
 ```
 □ 运行 pytest tests/test_metrics.py -v，全部通过（不需要 API Key）
@@ -14816,6 +15171,8 @@ if result.metrics:
 □ 运行 pytest tests/test_agent_e2e.py::test_ask_returns_ask_result -v，通过
 □ 运行全部集成测试 pytest tests/ -v，无错误（或仅有预期的 skip）
 □ 修改 cli.py 加入 metrics.print_report()，对话后能看到统计报告
+□ （16.13）ToolRecord/TurnRecord 有可选的 failure_category 字段，print_report 能显示失败分类
+□ （16.14）skills/agent-eval-authoring.md 已加入 Skill 索引表，可被 get_skill_guide 加载
 ```
 
 ---
@@ -15809,5 +16166,235 @@ ROUTER_MODEL=polycoder-router
 ```
 
 其余 `sub_agents/router_agent.py` 和 17.10 的端到端测试**完全不用改**——这正是第 3 章 OpenAI Provider 抽象层的价值：换后端只改一行 `base_url`。
+
+---
+
+# 第 18 章：2026 行业趋势对标增量改进（附录）
+
+> 本章是一份**非侵入式**的改进记录。第 1-14 章是已经落地实现、无需回头翻改的主体；这里
+> 收录的是针对第 6 章（Coordinator）、第 11 章（可观测性）两处的增量改进方案，以及一处
+> 明确的空白说明。原则是：**不改动前面章节的正文与编号**，需要读者关注的地方只在原章节留
+> 一行引用批注（见 6.10、11.7 节末尾的"进阶备注"），完整方案统一放在本章，每一节标题直接
+> 点名它对应第几章。
+>
+> 这些改进来自 2026-07-17 的一次行业趋势对标评估：2026 年多智能体工程的共识已从"越多
+> Agent 越好"转向**按需分解、稀疏通信、可验证评估**。第 15 章 15.14 节的 CONCAT 动态分组、
+> 第 16 章 16.13 节的 MAST 失败分类、16.14 节的评测技能化，与本章的 DAG 重规划容错，都是
+> 这条主线下的具体落点。**所有方案均训练无关**，与第 17 章"RL 只能训本地小模型、不能训
+> Claude/GPT"的硬约束完全兼容。
+
+## 18.1 Coordinator：DAG 执行失败的局部重新规划（对应第 6 章）
+
+### 现状与问题
+
+第 6 章的 Coordinator 是一个**一次性规划**的编排器：`coordinator/planner.py` 的 `make_plan()`
+调一次 LLM 把用户请求拆成带 `depends_on` 的任务 DAG，`coordinator/dispatcher.py` 的
+`dispatch()` 随后按拓扑波次执行到底。这套设计干净，但有一个没有覆盖的失败面：
+
+- **规划本身可能是错的**。Planner 可能漏写依赖（本该 `depends_on:["t1"]` 却写成 `[]`）、
+  把粒度切得不对（该拆两步的合成一步），或选错子 Agent。
+- 现状下 `dispatch()` 只有一种失败处理：某个任务抛异常或其前置失败时，把它记进 `errors` 并
+  跳过下游（见 6.7 节 `dispatch()` 里 `errors[tid] = f"前置任务 '{failed_dep}' 失败，跳过本
+  任务"` 的分支）。**它不会尝试纠正规划**——错误的 DAG 会一路执行到所有波次跑完，用户只能
+  拿到一个残缺结果，再手动重发请求。
+
+这正是 2026 行业趋势评估里"orchestrator-worker 拓扑的已知风险：supervisor 一次规划失误无
+补救"的具体体现。
+
+### 方案：波次结束后的局部重新规划检查点
+
+思路是给 `dispatch()` 的每个波次结束处加一个**可选的检查点**：如果这一波里出现了"非预期
+的失败"（不是业务上正常的 `NEEDS_FIX`，而是任务被跳过 / 子 Agent 明确报"上游没给我该有的
+上下文"这类规划性错误），就**只针对受影响的子图**重新调一次 `make_plan()`，生成一个补丁
+DAG 合并进后续波次——而不是推倒整个请求重来。
+
+给 `coordinator/dispatcher.py` 的 `dispatch()` 增加一个可选参数与波次后钩子：
+
+```python
+# coordinator/dispatcher.py（在第 6 章版本上增量修改）
+
+async def dispatch(
+    tasks: list[TaskSpec],
+    session_id: str | None = None,
+    on_task_done: Callable[[TaskSpec, str], None] | None = None,
+    allow_replan: bool = False,        # ← 新增：是否允许局部重新规划（默认关，不影响老行为）
+    max_replans: int = 1,             # ← 新增：整个请求内最多触发几次，兜底防止无限重规划
+    user_request: str | None = None,  # ← 新增：重新规划时要带上原始请求作上下文
+) -> tuple[dict[str, str], Usage]:
+    ...
+    replans_used = 0
+    while ready:
+        wave = list(ready)
+        ready.clear()
+        # ...（原有的 runnable/errors 分类与 asyncio.gather 执行逻辑，完全不变）...
+
+        # ── 新增：波次结束检查点 ───────────────────────────────────────────────
+        if allow_replan and replans_used < max_replans:
+            bad = _detect_planning_failures(wave, spec_by_id, results, errors)
+            if bad:
+                patch = await _replan_subgraph(
+                    bad, spec_by_id, results, errors,
+                    user_request=user_request, session_id=session_id,
+                )
+                if patch:
+                    replans_used += 1
+                    _merge_patch(patch, spec_by_id, in_degree, dependents, ready, errors)
+                    log.warning("dispatch_replanned",
+                                failed=[t.id for t in bad], patch_size=len(patch))
+
+        # 更新依赖计数、解锁下一波次（原有逻辑不变）
+        for tid in wave:
+            ...
+    return results, _sum_usage(usages)
+```
+
+其中三个辅助函数保持"能自动判的判、判不了的放过"的克制风格：
+
+```python
+def _detect_planning_failures(wave, spec_by_id, results, errors) -> list[TaskSpec]:
+    """
+    只挑出'疑似规划错误'的失败任务，不把所有失败都当成需要重规划。
+    判据（保守，宁可漏判不误判）：
+      - 任务进了 errors，且错误信息里带"前置任务 ... 失败"（说明依赖链断了）
+      - 或子 Agent 结果里出现约定的规划性失败标记（如 "[MISSING_CONTEXT]"）
+    业务性失败（如 code_reviewer 判定 NEEDS_FIX）不算，那是正常产出，交给下游正常处理。
+    """
+    bad = []
+    for tid in wave:
+        err = errors.get(tid, "")
+        if "前置任务" in err or "MISSING_CONTEXT" in results.get(tid, ""):
+            bad.append(spec_by_id[tid])
+    return bad
+
+
+async def _replan_subgraph(bad, spec_by_id, results, errors, user_request, session_id):
+    """
+    只把'失败任务 + 其未执行的下游'的描述重新喂给 make_plan()，
+    并带上已成功任务的结果作为上下文，让 LLM 生成一个补丁 DAG。
+    注意：不重规划整个请求，避免已经跑完的任务白跑一遍、也避免 token 浪费。
+    """
+    from .planner import make_plan
+    done_context = {tid: results[tid] for tid in results}   # 已完成任务结果作上下文
+    hint = (
+        f"原始请求：{user_request}\n"
+        f"以下子任务因规划问题失败，请只为这些任务及其后续重新给出修正后的任务计划"
+        f"（可补依赖、拆分或改派子 Agent）：{[t.id for t in bad]}\n"
+        f"已完成并可复用的结果：{list(done_context.keys())}"
+    )
+    patch_tasks, _reply, _usage = await make_plan(hint, session_id=session_id)
+    return patch_tasks
+
+
+def _merge_patch(patch, spec_by_id, in_degree, dependents, ready, errors):
+    """把补丁 DAG 的新任务并入执行状态：登记 spec、重算入度、把无依赖的补丁任务塞进 ready。"""
+    for t in patch:
+        if t.id in spec_by_id:      # 补丁任务 id 与老任务撞了就改名，避免覆盖
+            t.id = f"{t.id}_replan"
+        spec_by_id[t.id] = t
+        errors.pop(t.id, None)
+        in_degree[t.id] = len(t.depends_on)
+        for dep in t.depends_on:
+            dependents[dep].append(t.id)
+        if in_degree[t.id] == 0:
+            ready.append(t.id)
+```
+
+### 边界：这是"人工兜底"，不是自动拓扑选择器
+
+要克制地界定这个功能的范围。它**只做**"检测到规划性失败 → 局部补一次规划"，**不做**行业
+评估里提到的"上来先自动判断这个请求该不该拆、该用哪种拓扑"。原因是：
+
+- "任务能否分解、该用几个 Agent"目前**没有可靠的自动判据**，硬做一个启发式判断器很容易变成
+  拍脑袋的魔法阈值，属于过度设计——这与本项目一贯的"先跑通、有明确收益再升级"风格相悖
+  （对照 15.3.4 节"为什么现在才从 TF-IDF 升级到向量检索"的论证方式）。
+- `max_replans` 默认 1，是刻意的保守设定：重新规划本身也可能再次出错，必须有硬上限兜底，
+  不能让 Coordinator 陷入"规划→失败→再规划"的循环烧 token。
+
+### 验证
+
+构造一个 Planner **故意漏写依赖**的场景，观察局部重新规划触发并补全：
+
+```bash
+# 1. 临时在 planner 的系统提示词里注入一个会漏 depends_on 的诱导，或直接构造一个
+#    "写函数并按检索到的规范修正"但故意不声明依赖的请求：
+curl -X POST http://localhost:8002/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "按内部规范写一个分页函数，然后立刻用刚写的规范审查它"}'
+
+# 2. 期望日志里能看到：
+#    - 第一波 code_reviewer 因为拿不到前置规范，结果里带 [MISSING_CONTEXT]
+#    - dispatch_replanned 事件触发（failed=[...], patch_size=N）
+#    - 补丁任务补上了 knowledge_agent→code_reviewer 的依赖，第二轮正常产出
+```
+
+对应地，在第 6 章的 "6.11 本章检查清单" 之外，读者可自行补一条验收项：
+`□ allow_replan=True 时，模拟 DAG 规划错误能触发局部重新规划而非整体失败`。
+
+---
+
+## 18.2 可观测性：按失败类别聚合查询（对应第 11 章）
+
+> 本节依赖第 16 章 16.13 节新增的 `failure_category` 字段。请先读 16.13 再回到这里。
+
+第 11 章的三支柱（Metrics / Traces / Logs）在"生产级可观测性基础设施"上已经很完整，
+`SessionMetrics`（16 章）也提供了足够细的埋点。缺的不是数据，而是**数据之上的一层归类**——
+把每次失败归到 16.13 定义的三类（`spec_flaw` / `misalignment` / `verification_failure`）之
+一，然后跨会话统计"哪类失败在系统性发生"。
+
+好消息是：这不需要引入任何新工具。16.13 让失败日志带上了 `failure_category` 字段，而第 11 章
+的日志本来就是 `structlog` 输出的 JSON、进了 Loki，`| json` 之后即可按该字段过滤聚合。
+
+在 Grafana 的 Loki 数据源里（沿用 11.7.3 的 LogQL 写法）：
+
+```logql
+# 看所有被归类为"规范/规划缺陷"的失败（如 Planner 漏依赖导致的跳过）
+{container="agent"} | json | failure_category="spec_flaw"
+
+# 按失败类别统计最近 1 小时的发生速率——一眼看出哪类失败最猖獗
+sum by (failure_category) (
+  count_over_time({container="agent"} | json | failure_category=~".+" [1h])
+)
+
+# 结合 session_id，定位某次会话到底栽在哪一类失败上
+{container="agent"} | json | session_id="user_001" | failure_category=~".+"
+```
+
+把第二条查询做成 Grafana 的一个 `sum by (failure_category)` 时间序列面板，就得到了一张
+"失败类别趋势图"：如果 `verification_failure` 常年偏高，说明 RAG 环节采纳了太多低相关度结果
+（该调 15.11 节的 relevance 阈值或 15.14 节的裁剪策略）；如果 `spec_flaw` 高，说明 Planner
+规划质量差（该开 18.1 的局部重规划）。**这是在既有基础设施上叠加的归类层，改造成本低**，
+恰是行业评估里"数据充分、只缺归类维度"判断的落地。
+
+---
+
+## 18.3 已知空白：LLM 输出层安全护栏（未来方向，不在本次范围）
+
+诚实地记录一处空白，而不是硬造一个方案来凑"看起来完整"。
+
+PolyCoder 现有的安全防护都在**执行层**，且做得扎实：
+
+- 路径穿越沙箱：`core/workspace.py` 的 `resolve_safe_path()`，所有文件操作限定在工作目录内；
+- 子进程沙箱：`run_python` 工具带超时 + 危险模块黑名单；
+- SQL 注入防御：MySQL 相关工具用参数化查询；
+- 一份 `skills/security.md` 把上述红线沉淀为可加载的 Skill。
+
+但项目**没有 LLM 输出层的护栏**，具体缺三样：
+
+1. **Prompt injection 防御**——用户/检索文档里夹带的"忽略以上指令"类注入，目前没有检测；
+2. **输出内容审查**——LLM 生成内容在返回/落盘前没有过滤；
+3. **越权工具调用的运行时拦截**——子 Agent 调用超出其职责范围的工具时，没有一层运行时白名单
+   校验（现在靠 system prompt 约定，属于"软约束"）。
+
+**为什么本版不给完整设计**：2026 年的行业检索对这一维度本身也缺乏可靠的、可量化的最佳实践
+来源（评估报告将其列为"开放问题，不做强行归因"）。在没有可信基准的情况下写一套护栏方案，
+风险是把不成熟的做法固化进文档。这里只记录空白和两个**可能**的探索方向，供后续单独立项调研：
+
+- **工具调用白名单校验**：在 `agent_core/executor.py` 执行工具前，按"当前子 Agent → 允许的
+  工具集"做一次运行时校验，越权直接拒绝（把软约束变硬约束）。这是三项里最容易落地、最不依赖
+  外部基准的一项。
+- **system prompt 注入检测启发式**：对进入 LLM 的用户输入/检索片段做轻量启发式扫描（如检测
+  "ignore previous instructions"类模式），命中则标记而非直接信任。
+
+在有可信的评测基准之前，这一节保持"记录而不实现"的状态。
 
 ---
