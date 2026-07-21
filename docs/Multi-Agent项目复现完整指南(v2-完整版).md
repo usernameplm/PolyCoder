@@ -11739,13 +11739,14 @@ agg demo.cast demo.gif
 新增文件：
 tools/
 ├── registry.py                   ← 工具注册表（本章需要）
-├── knowledge_base.py             ← 多模态 RAG 工具（替换 G.1.4 的版本）
+├── knowledge_base.py             ← 多模态 RAG 工具（BM25+向量+RRF，替换 G.1.4 的版本）
 └── document_loaders/
     ├── __init__.py
-    ├── base.py                   ← DocumentChunk 数据结构
+    ├── base.py                   ← DocumentChunk 数据结构（含切分后的 title_path 等字段）
+    ├── splitter.py               ← ★ 结构化切分（标题+段落控长），解决 chunk 粒度过粗
     ├── vision.py                 ← 调用视觉 LLM 生成图片描述
-    ├── text_loader.py            ← 加载 .txt / .md
-    ├── pdf_loader.py             ← 加载 PDF（文字 + 图片）
+    ├── text_loader.py            ← 加载 .txt / .md（切成多个 chunk）
+    ├── pdf_loader.py             ← 加载 PDF（按页/段切块 + 图片描述）
     └── image_loader.py           ← 加载独立图片
 
 修改文件：
@@ -11820,43 +11821,54 @@ Anthropic SDK 原生支持这种格式，我们只需要在 `providers/types.py`
 本章采用"加载器 + 工具"两层设计：
 
 ```
-Layer 1：document_loaders/（负责"读懂"各种格式的文件）
-  TextLoader  → list[DocumentChunk]
-  PDFLoader   → list[DocumentChunk]（异步：并发调用视觉 LLM）
+Layer 1：document_loaders/（负责"读懂"各种格式的文件 + 切成语义片段）
+  splitter.split_markdown() / split_plain()  → 把长文本按标题+段落控长切成多段
+  TextLoader  → list[DocumentChunk]（一份文档切成多个 chunk）
+  PDFLoader   → list[DocumentChunk]（按页切 + 并发调用视觉 LLM 描述图片）
   ImageLoader → list[DocumentChunk]（异步：调用视觉 LLM）
 
 Layer 2：knowledge_base.py（负责索引、检索）
-  KnowledgeBaseTool.ensure_loaded()  → 扫描目录，调用加载器 + 编码建向量索引
-  KnowledgeBaseTool.execute()        → 向量近邻检索（cosine），返回 top-k 结果
+  KnowledgeBaseTool.ensure_loaded()  → 扫描目录，调用加载器 + 建 dense(向量)+sparse(BM25) 两路索引
+  KnowledgeBaseTool.execute()        → BM25 + 向量 双路召回 → RRF 融合，返回 top-k 结果
 ```
 
-这样做的好处：以后想支持新格式（如 Word、Excel），只需新增一个 Loader，不需要动检索逻辑。
+这样做的好处：以后想支持新格式（如 Word、Excel），只需新增一个 Loader，不需要动切分/检索逻辑；
+切分逻辑集中在 `splitter.py`，各 Loader 复用同一套控长规则。
 
-### 15.3.4 为什么用向量检索（Embedding + Qdrant）而不是 TF-IDF
+### 15.3.4 检索方案：结构化切分 + BM25 与向量双路召回 + RRF 融合
 
-第 9 章的基础 RAG 用的是 **TF-IDF**：把文本分词后按"词频 × 逆文档频率"打分。它简单、零依赖，
-但只会做**字面匹配**——查询"请假"匹配不到写着"休假 / 年假"的文档，因为它不理解语义。
+第 9 章的基础 RAG 有两个短板，本章一并补齐（对齐 `DDH-main-agent` 的 `rag/` 实现）：
 
-本章升级为**向量检索**，核心是两个组件：
+**短板一：粒度太粗。** 旧版"一份文档 = 一个块"，把整篇 .md / 整个 PDF 编码成一个向量。
+长文本的局部要点（某个错误码、某条命名约定）会被整篇的平均语义"稀释"掉，query 命中率低，
+命中后返回的还是整篇、下游要自己再找。→ 本章先用 `splitter.py` 把文档按**标题 + 段落 + 控长**
+切成多个语义片段（见 15.7.6），每个片段单独编码、单独召回。
 
-| 组件 | 作用 | 本项目选型 |
-|---|---|---|
-| **Embedding 模型** | 把文本"翻译"成一串数字（向量），语义相近的文本向量也相近 | `bge-small-zh-v1.5` |
-| **向量数据库** | 高效存储向量，按"距离/夹角"快速找出最相近的若干条 | `Qdrant`（cosine 距离）|
+**短板二：只有字面匹配（TF-IDF），不理解语义。** 查询"请假"匹配不到写着"休假 / 年假"的文档。
+→ 本章不是简单地"换成向量检索"，而是做 **BM25（稀疏/字面）+ 向量（稠密/语义）双路召回，再用
+RRF 融合**——两种检索各有盲区，融合后互补：
 
-检索流程：文档和查询都用**同一个 embedding 模型**编码成向量，再用**余弦相似度**（cosine，
-衡量两个向量夹角，越接近 1 越相关）在 Qdrant 里做近邻检索。这样"请假流程"和"怎么申请年假"
-即使一个字都不重合，也能因为语义相近而匹配上——这是 TF-IDF 做不到的。
+| 组件 | 作用 | 擅长 / 盲区 | 本项目选型 |
+|---|---|---|---|
+| **BM25（稀疏）** | 分词后按词频×逆文档频率打分 | 擅长**精确术语/型号/错误码**（`ERR_4001`、`asyncio.gather`）；不懂同义 | `rank-bm25`（进程内现建，零服务） |
+| **向量（稠密）** | 文本编码成向量，按余弦夹角找近邻 | 擅长**语义近似**（"请假"↔"年假"）；对罕见精确 token 反而弱 | `bge-small-zh-v1.5` + `Qdrant` |
+| **RRF 融合** | 把两路的**排名**（非分数）加权合并 | 消除两套分数量纲不可比的问题，稳定可靠 | 自实现，`k=60`（业界惯例） |
 
-**为什么是这套选型：**
+**为什么是 RRF（Reciprocal Rank Fusion）而不是"分数加权求和"：** BM25 的分数范围是 `[0, +∞)`，
+cosine 是 `[-1, 1]`，两者量纲完全不同，直接加权要反复调系数且不稳定。RRF 只看**每路里的名次**，
+第 r 名贡献 `1/(k + r)`，两路名次相加后重排——无需归一化、无需调参，是混合检索的事实标准。
+最终透传的 `rrf_score` 就是 Agent 判断"要不要改写重试"的核心信号（见 15.11 的决策树）。
+
+**为什么是这套选型（BM25 + bge + Qdrant + RRF）：**
+- **rank-bm25**：纯 Python、零外部服务，索引在进程内用 chunk 语料现建，几万块以内毫秒级；
 - **bge-small-zh-v1.5**：BAAI 智源开源，中文效果强，仅 ~100MB，CPU 就能跑，**完全免费、离线、
   数据不出本地**，无需任何 API Key；
 - **Qdrant**：专用向量库（Rust 实现），Docker 一键启动，原生支持 cosine 距离、HNSW 索引和元数据
   过滤，和项目"本地 + Docker 部署"的调性一致；
-- 文档量再大（上万篇）也扛得住，比 TF-IDF 每次全量扫描更能扩展。
+- 三者都免费、可本地部署，比"单路 TF-IDF 全量扫描"更准也更能扩展。
 
-> **成本权衡**：相比 TF-IDF，代价是多了一个 embedding 模型（首次下载 ~100MB）和一个 Qdrant 容器。
-> 但换来了语义级检索能力，且两者都免费、可本地部署，对演示和生产都够用。
+> **成本权衡**：相比单路 TF-IDF，代价是多了一个 embedding 模型（首次下载 ~100MB）、一个 Qdrant
+> 容器和一次 BM25 建索引。换来的是"精确术语 + 语义近似"双覆盖的检索质量，对演示和生产都够用。
 
 ---
 
@@ -11868,7 +11880,7 @@ Layer 2：knowledge_base.py（负责索引、检索）
 
 ```bash
 # 激活虚拟环境（确保提示符前有 (.venv)）
-uv add pymupdf pillow sentence-transformers qdrant-client
+uv add pymupdf pillow sentence-transformers qdrant-client rank-bm25
 ```
 
 `pyproject.toml` 会自动更新，加入：
@@ -11876,7 +11888,8 @@ uv add pymupdf pillow sentence-transformers qdrant-client
 "pymupdf>=1.24.0",              # PDF 文字 + 图片提取
 "pillow>=10.0.0",              # 图片处理
 "sentence-transformers>=3.0.0", # 加载 bge-small-zh-v1.5，本地生成 embedding
-"qdrant-client>=1.9.0",        # Qdrant 向量库客户端
+"qdrant-client>=1.9.0",        # Qdrant 向量库客户端（稠密/向量检索）
+"rank-bm25>=0.2.2",            # BM25 稀疏检索（进程内现建，与向量做 RRF 融合）
 ```
 
 ### 启动 Qdrant（Docker）
@@ -11904,7 +11917,7 @@ export HF_ENDPOINT=https://hf-mirror.com   # 可选：走国内镜像加速下�
 
 验证安装：
 ```bash
-python -c "import fitz, PIL; from sentence_transformers import SentenceTransformer; from qdrant_client import QdrantClient; print('依赖安装成功')"
+python -c "import fitz, PIL; from sentence_transformers import SentenceTransformer; from qdrant_client import QdrantClient; from rank_bm25 import BM25Okapi; print('依赖安装成功')"
 # 预期输出：依赖安装成功
 ```
 
@@ -12353,13 +12366,21 @@ DocumentChunk：从文档中提取的一个内容块。
 无论原始文件是 .txt、.pdf 还是 .png，
 最终都会被加载器转换成若干个 DocumentChunk。
 知识库只和 DocumentChunk 打交道，不关心原始格式。
+
+⚠️ 粒度约定（本章的关键改动）：一个 chunk 是"一个可独立检索、可独立作答的语义片段"，
+   **不是一整篇文档**。旧版把整份 .md / 整个 PDF 塞进一个 chunk，粒度太粗会带来两个问题：
+     1. 向量被长文本"稀释"——一段几千字的文档编码成一个向量，局部要点（某个错误码、
+        某条命名约定）的语义被平均掉，query 命中率下降；
+     2. 命中后返回的 content 是整篇，下游 Agent 还要自己在里面找那一句规范。
+   所以本章由 `splitter.py` 按"标题 + 段落 + 控长"把文档切成多个 chunk（见 15.7.6），
+   Loader 返回的是 `list[DocumentChunk]` 而不再是"一份文档一个块"。
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
 class DocumentChunk:
-    """一个可供检索的文本块。"""
+    """一个可供检索的文本块（语义片段，不是整篇文档）。"""
 
     source: str
     """原始文件路径，如 'knowledge_base/manual.pdf'。"""
@@ -12368,17 +12389,36 @@ class DocumentChunk:
     """文档标题，通常取文件名（去掉扩展名）。"""
 
     text: str
-    """文本内容。
-    - 纯文本文件：直接是文件内容
-    - PDF：文字内容 + 图片描述（拼接在一起）
+    """chunk 的正文（原文片段）。
+    - 纯文本文件：按标题/段落切出来的一段
+    - PDF：某一页或某一段的文字，或某张图片的描述
     - 图片文件：视觉 LLM 生成的描述文字
-    embedding 就是基于这个字段编码成向量做检索的。"""
+    这是"呈现给下游的原文"，检索命中后原样返回，不做改写。"""
+
+    # ── 检索/定位用的结构化字段（切分后才有意义）──────────────────────────────
+    searchable_text: str = ""
+    """真正拿去编码/BM25 的文本 = "[标题路径] title_path\\n" + text。
+    把所属标题层级拼进检索文本，能让"这段属于哪一节"的上下文参与召回
+    （对齐 DDH-main-agent build_chunks 的 searchable_text 设计）。
+    为空时检索层会回退用 text。"""
+
+    section_title: str = ""
+    """本 chunk 所属的小节标题（最近的一个 Markdown 标题 / PDF 段落标题）。"""
+
+    title_path: str = ""
+    """标题层级路径，如 "错误码规范 > 4xx 客户端错误"，供来源归因和定位。"""
+
+    chunk_index: int = 0
+    """该 chunk 在所属文档内的序号（从 0 开始），便于回溯上下文顺序。"""
 
     image_count: int = 0
-    """原始文档中包含的图片数量（纯文本为 0）。"""
+    """本 chunk 关联的图片数量（纯文本为 0）。"""
+
+    page_num: int = 0
+    """所在页码（PDF 才有意义，其他为 0）。"""
 
     page_count: int = 0
-    """文档页数（PDF 才有意义，其他为 0）。"""
+    """文档总页数（PDF 才有意义，其他为 0）。"""
 ```
 
 ---
@@ -12486,10 +12526,11 @@ async def caption_image(image_bytes: bytes, media_type: str = "image/jpeg") -> s
 
 ```python
 # tools/document_loaders/text_loader.py
-"""加载 .txt 和 .md 纯文本文件。"""
+"""加载 .txt 和 .md 纯文本文件，并切成多个语义 chunk。"""
 
 from pathlib import Path
 from .base import DocumentChunk
+from .splitter import split_markdown, split_plain
 
 
 class TextLoader:
@@ -12498,10 +12539,10 @@ class TextLoader:
 
     def load(self, path: Path) -> list[DocumentChunk]:
         """
-        加载单个文本文件。
+        加载单个文本文件，切成**多个** DocumentChunk。
 
-        返回包含一个 DocumentChunk 的列表。
-        如果文件无法读取，返回空列表（不抛异常，让知识库跳过这个文件）。
+        .md 走标题感知切分（split_markdown），.txt 走纯段落控长切分（split_plain）。
+        文件无法读取或为空时返回空列表（不抛异常，让知识库跳过这个文件）。
         """
         try:
             content = path.read_text(encoding="utf-8")
@@ -12512,15 +12553,26 @@ class TextLoader:
         if not content.strip():
             return []
 
-        return [
-            DocumentChunk(
+        title = path.stem.replace("_", " ").replace("-", " ")
+        pieces = (split_markdown(content) if path.suffix.lower() == ".md"
+                  else split_plain(content))
+
+        chunks: list[DocumentChunk] = []
+        for i, p in enumerate(pieces):
+            # searchable_text 把标题路径拼进检索文本，让"属于哪一节"参与召回
+            title_path = p["title_path"]
+            searchable = (f"[标题路径] {title_path}\n{p['text']}"
+                          if title_path else p["text"])
+            chunks.append(DocumentChunk(
                 source=str(path),
-                title=path.stem.replace("_", " ").replace("-", " "),
-                text=content,
-                image_count=0,
-                page_count=0,
-            )
-        ]
+                title=title,
+                text=p["text"],
+                searchable_text=searchable,
+                section_title=p["section_title"],
+                title_path=title_path,
+                chunk_index=i,
+            ))
+        return chunks
 ```
 
 ---
@@ -12534,12 +12586,14 @@ class TextLoader:
 """
 PDF 文档加载器。
 
-处理流程（每个 PDF 生成一个 DocumentChunk）：
+处理流程（每个 PDF 生成**多个** DocumentChunk，粒度到"页 / 段"）：
 1. 用 pymupdf (fitz) 打开 PDF
-2. 逐页提取文字，拼接成完整文本
-3. 逐页提取图片，对每张图片调用 vision.caption_image()
-4. 把图片描述以「图片N描述」格式拼接到文本末尾
-5. 返回一个包含所有内容的 DocumentChunk
+2. 逐页提取文字：每页文字过长时再按 splitter 控长切成多段
+3. 逐页提取图片，对每张图片调用 vision.caption_image()，图片描述各自单独成块
+4. 每个 chunk 记住自己的 page_num，便于来源归因到"第 N 页"
+
+为什么不再"整份 PDF 一个块"：一份几十页的 PDF 编码成一个向量，局部要点会被整篇稀释，
+命中后返回的还是整篇。改为按页/按段切，检索命中的是具体那一页那一段。
 """
 
 import asyncio
@@ -12552,6 +12606,7 @@ except ImportError:
     HAS_PYMUPDF = False
 
 from .base import DocumentChunk
+from .splitter import split_plain
 from .vision import caption_image, _guess_media_type
 
 
@@ -12582,19 +12637,20 @@ class PDFLoader:
             print(f"  [PDFLoader] 无法打开 {path}: {e}")
             return []
 
-        all_text_parts: list[str] = []
-        all_images: list[tuple[bytes, str]] = []  # (图片二进制, media_type)
+        # 按页收集文字；图片记录其所属页码，稍后并发描述后各自成块
+        page_texts: dict[int, str] = {}                       # page_num(1基) → 文字
+        all_images: list[tuple[int, bytes, str]] = []         # (page_num, 二进制, media_type)
 
         # 遍历每一页
         for page_num in range(len(doc)):
             page = doc[page_num]
 
-            # 步骤 1：提取当前页的文字
+            # 步骤 1：提取当前页的文字（暂存，稍后切块）
             page_text = page.get_text("text").strip()
             if page_text:
-                all_text_parts.append(f"[第{page_num + 1}页]\n{page_text}")
+                page_texts[page_num + 1] = page_text
 
-            # 步骤 2：提取当前页的图片（如果还没超上限）
+            # 步骤 2：提取当前页的图片（如果还没超上限），记录所属页码
             if len(all_images) < self.MAX_IMAGES:
                 for img_info in page.get_images(full=True):
                     xref = img_info[0]  # 图片的 xref 编号（PDF 内部 ID）
@@ -12609,7 +12665,7 @@ class PDFLoader:
                         if len(img_bytes) < self.MIN_IMAGE_BYTES:
                             continue
 
-                        all_images.append((img_bytes, media_type))
+                        all_images.append((page_num + 1, img_bytes, media_type))
 
                         if len(all_images) >= self.MAX_IMAGES:
                             break
@@ -12619,35 +12675,45 @@ class PDFLoader:
         page_count = len(doc)
         doc.close()
 
-        # 步骤 3：并发调用视觉 LLM 描述所有图片
-        image_count = len(all_images)
-        if all_images:
-            print(f"  [PDFLoader] {path.name}：正在描述 {image_count} 张图片（并发）...")
-            # asyncio.gather 同时发起所有视觉请求，比串行快很多
-            captions = await asyncio.gather(*[
-                caption_image(img_bytes, mt)
-                for img_bytes, mt in all_images
-            ])
+        title = path.stem.replace("_", " ").replace("-", " ")
+        chunks: list[DocumentChunk] = []
+        idx = 0
 
-            # 把描述追加到文本内容
-            for i, caption in enumerate(captions, 1):
-                if caption:
-                    all_text_parts.append(f"【图片{i}描述】: {caption}")
-
-        # 合并所有内容
-        full_text = "\n\n".join(all_text_parts).strip()
-        if not full_text:
-            return []
-
-        return [
-            DocumentChunk(
+        def _add(text: str, page: int, is_image: bool):
+            nonlocal idx
+            if not text.strip():
+                return
+            section = f"第 {page} 页"
+            chunks.append(DocumentChunk(
                 source=str(path),
-                title=path.stem.replace("_", " ").replace("-", " "),
-                text=full_text,
-                image_count=image_count,
+                title=title,
+                text=text,
+                searchable_text=f"[标题路径] {title} > {section}\n{text}",
+                section_title=section,
+                title_path=f"{title} > {section}",
+                chunk_index=idx,
+                image_count=1 if is_image else 0,
+                page_num=page,
                 page_count=page_count,
-            )
-        ]
+            ))
+            idx += 1
+
+        # 步骤 3：每页文字过长时按 splitter 控长切成多段，各自成块
+        for page in sorted(page_texts):
+            for seg in split_plain(page_texts[page]):
+                _add(seg["text"], page, is_image=False)
+
+        # 步骤 4：并发调用视觉 LLM 描述所有图片，每张描述单独成块（带所属页码）
+        if all_images:
+            print(f"  [PDFLoader] {path.name}：正在描述 {len(all_images)} 张图片（并发）...")
+            captions = await asyncio.gather(*[
+                caption_image(img_bytes, mt) for _, img_bytes, mt in all_images
+            ])
+            for (page, _, _), caption in zip(all_images, captions):
+                if caption:
+                    _add(f"【图片描述】: {caption}", page, is_image=True)
+
+        return chunks
 ```
 
 ---
@@ -12710,16 +12776,142 @@ class ImageLoader:
         if not caption:
             return []
 
+        title = path.stem.replace("_", " ").replace("-", " ")
+        text = f"【图片文件描述】\n{caption}"
         return [
             DocumentChunk(
                 source=str(path),
-                title=path.stem.replace("_", " ").replace("-", " "),
-                text=f"【图片文件描述】\n{caption}",
+                title=title,
+                text=text,
+                searchable_text=f"[标题路径] {title}\n{text}",
+                section_title=title,
+                title_path=title,
+                chunk_index=0,
                 image_count=1,
                 page_count=0,
             )
         ]
 ```
+
+---
+
+### 15.7.6 切分器 `tools/document_loaders/splitter.py`
+
+这是本章**解决"chunk 粒度太粗"的核心**。设计思路对齐 `DDH-main-agent` 的 `build_chunks`：
+**不做定长硬切**（会把一句话/一行表格从中间截断），而是**按文档结构 + 控长**切分：
+
+- **Markdown**：以标题（`#`~`######`）为边界切段，维护"标题路径"（`title_path`，如
+  `错误码规范 > 4xx`），让每个 chunk 记住自己属于哪一节；标题下正文过长时再按空行段落
+  累加、超过 `MAX_TOKENS` 才断，**绝不从段落中间截断**。
+- **纯文本**：没有标题结构，按空行分段后按 `MAX_TOKENS` 累加控长。
+
+```python
+# tools/document_loaders/splitter.py
+"""
+把长文本切成"语义片段"——按结构（Markdown 标题）+ 控长，不做定长硬切。
+
+为什么不定长硬切（如每 500 字一刀）：
+  会把一句话、一行表格、一个代码块从中间截断，chunk 语义破碎、检索命中后不可读。
+  改为"沿标题/空行等自然边界切，只在超长时才在段落边界断"，每个 chunk 都是完整语义单元。
+
+返回的每个片段是 dict：{"text", "section_title", "title_path"}，
+由各 Loader 包装成 DocumentChunk（见 text_loader.py / pdf_loader.py）。
+"""
+
+import re
+
+# 单个 chunk 的粗略 token 上限：中文按字符、英文按词估算，取较大者的近似
+MAX_TOKENS = 350
+# 过短的尾块并入上一块的阈值（避免切出"只有一个标题"的碎块）
+MIN_TOKENS = 20
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+
+
+def _rough_tokens(s: str) -> int:
+    """粗略 token 估算：中文按字符数、英文按词数，取较大值。"""
+    return max(len(s) // 2, len(s.split()))
+
+
+def _split_long_paragraphs(text: str) -> list[str]:
+    """把一段较长的正文按空行分段后，按 MAX_TOKENS 累加控长（不切断段落）。"""
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    out: list[str] = []
+    cur: list[str] = []
+    cur_tok = 0
+    for p in paras:
+        pt = _rough_tokens(p)
+        if cur and cur_tok + pt > MAX_TOKENS:
+            out.append("\n\n".join(cur))
+            cur, cur_tok = [], 0
+        cur.append(p)
+        cur_tok += pt
+    if cur:
+        out.append("\n\n".join(cur))
+    return out
+
+
+def split_markdown(content: str) -> list[dict]:
+    """标题感知切分：以标题为边界，维护 title_path，正文超长再按段落控长。"""
+    lines = content.splitlines()
+    # 标题栈：[(level, text), ...]，用于拼当前标题路径
+    stack: list[tuple[int, str]] = []
+    buf: list[str] = []
+    pieces: list[dict] = []
+
+    def title_path() -> str:
+        return " > ".join(t for _, t in stack)
+
+    def section_title() -> str:
+        return stack[-1][1] if stack else ""
+
+    def flush():
+        body = "\n".join(buf).strip()
+        buf.clear()
+        if not body:
+            return
+        tp, st = title_path(), section_title()
+        for seg in _split_long_paragraphs(body):
+            pieces.append({"text": seg, "section_title": st, "title_path": tp})
+
+    for line in lines:
+        m = _HEADING_RE.match(line)
+        if m:
+            flush()  # 遇到新标题，先把上一节正文落盘
+            level = len(m.group(1))
+            heading = m.group(2).strip()
+            # 弹出同级或更深的标题，维护层级路径
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, heading))
+        else:
+            buf.append(line)
+    flush()
+
+    # 合并过短的碎块到上一块（常见于"只有一个标题、正文极短"）
+    merged: list[dict] = []
+    for p in pieces:
+        if merged and _rough_tokens(p["text"]) < MIN_TOKENS:
+            merged[-1]["text"] += "\n\n" + p["text"]
+        else:
+            merged.append(p)
+    return merged or ([{"text": content.strip(),
+                        "section_title": "", "title_path": ""}]
+                      if content.strip() else [])
+
+
+def split_plain(content: str) -> list[dict]:
+    """纯文本切分：无标题结构，按空行分段 + MAX_TOKENS 控长。"""
+    return [{"text": seg, "section_title": "", "title_path": ""}
+            for seg in _split_long_paragraphs(content)]
+```
+
+> **为什么切分粒度是"标题 + 段落控长"而不是简单定长？** 内部规范类文档（API 约定、
+> 错误码表、编码规范）天然是分节的，标题就是最好的切分边界；`title_path` 还顺便解决了
+> 来源归因——命中某个 chunk 时能直接告诉下游"这条规范出自《错误码规范 > 4xx 客户端错误》"，
+> 而不只是"出自 error_codes.md"。
+
+---
 
 创建空的 `__init__.py`：
 
@@ -12800,31 +12992,36 @@ class ToolRegistry:
 ```python
 # tools/knowledge_base.py
 """
-多模态本地知识库检索工具（向量检索版）。
+多模态本地知识库检索工具（BM25 + 向量 双路召回 + RRF 融合版）。
 
 支持三种文件格式：
-  .txt / .md  → TextLoader（直接读取文字）
-  .pdf        → PDFLoader（提取文字 + 并发调用视觉 LLM 描述图片）
+  .txt / .md  → TextLoader（切成多个语义 chunk）
+  .pdf        → PDFLoader（按页/段切块 + 并发调用视觉 LLM 描述图片）
   .jpg .png 等 → ImageLoader（调用视觉 LLM 描述整张图片）
 
-检索算法：Embedding（bge-small-zh-v1.5）+ Qdrant 向量库 + 余弦相似度。
-  - 用 sentence-transformers 加载本地开源模型 bge-small-zh-v1.5，把文本编码成 512 维向量；
-  - 向量存进 Qdrant（本地 Docker，cosine 距离），查询时对 query 编码后做近邻检索；
-  - 相比 TF-IDF 的"字面匹配"，向量检索能理解语义（"请假"能匹配到"休假/年假"）。
+检索算法：BM25（稀疏/字面）+ Embedding 向量（稠密/语义）双路召回，再用 RRF 融合排序。
+  - 稠密：sentence-transformers 加载 bge-small-zh-v1.5 编码成 512 维向量，存 Qdrant（cosine）；
+  - 稀疏：rank-bm25 用全部 chunk 语料在进程内现建 BM25 索引，擅长精确术语/型号/错误码；
+  - 融合：两路各取 topn，按"名次"做 Reciprocal Rank Fusion（k=60），得到 rrf_score 重排。
+  为什么要两路融合：向量懂语义但对罕见精确 token 弱，BM25 擅长精确匹配但不懂同义，
+  RRF 只看名次、无需归一化两套不可比的分数，是混合检索的事实标准（对齐 DDH-main-agent）。
 
-为什么是 bge-small-zh-v1.5 + Qdrant：
+为什么是 bge-small-zh-v1.5 + Qdrant + rank-bm25：
   - bge-small-zh-v1.5：BAAI 开源、中文效果强、仅 ~100MB，CPU 就能跑，完全免费、离线、数据不出本地；
   - Qdrant：专用向量库，Docker 一键启动，原生支持 cosine 距离 / HNSW 索引 / 元数据过滤；
-  - 两者都无需 API Key，和项目"本地 + Docker 部署"的调性一致。
+  - rank-bm25：纯 Python、零外部服务，索引进程内现建，几万块以内毫秒级；
+  - 三者都无需 API Key，和项目"本地 + Docker 部署"的调性一致。
 """
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
+from rank_bm25 import BM25Okapi
 
 from tools.base import BaseTool
 from tools.document_loaders.base import DocumentChunk
@@ -12838,7 +13035,14 @@ from providers.types import ToolDefinition
 
 _EMBED_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
 _EMBED_DIM = 512  # bge-small-zh-v1.5 输出维度
+_RRF_K = 60       # RRF 融合常数（业界惯例；越大越平滑，越小越偏向头部名次）
 _embedder: SentenceTransformer | None = None
+
+
+def _tokenize(text: str) -> list[str]:
+    """BM25 分词：保留字母数字型号/错误码（如 err4001）与单个中文字符。
+    与 DDH-main-agent 的 _tokenize 一致——中文按字切，英文/数字按 token 切。"""
+    return re.findall(r"[a-z0-9]+|[一-鿿]", text.lower())
 
 
 def _get_embedder() -> SentenceTransformer:
@@ -12882,6 +13086,7 @@ class KnowledgeBaseTool(BaseTool):
         self.kb_dir = Path(kb_dir)
         self.collection = collection
         self._docs: list[DocumentChunk] = []
+        self._bm25: BM25Okapi | None = None   # 稀疏索引，_build_index 时现建
         self._loaded = False
 
         self._text_loader = TextLoader()
@@ -12896,7 +13101,7 @@ class KnowledgeBaseTool(BaseTool):
             self._qdrant = QdrantClient(url=qdrant_url)
 
     async def ensure_loaded(self):
-        """延迟加载：第一次被调用时触发文档加载 + 建向量索引，之后直接返回。"""
+        """延迟加载：第一次被调用时触发文档加载 + 建两路索引（向量+BM25），之后直接返回。"""
         if not self._loaded:
             await self._load_all()
             self._build_index()
@@ -12940,35 +13145,50 @@ class KnowledgeBaseTool(BaseTool):
 
         print(f"  [KnowledgeBase] 加载完成，共 {len(self._docs)} 个文档块")
 
+    @staticmethod
+    def _index_text(doc: DocumentChunk) -> str:
+        """真正拿去检索的文本：优先 searchable_text（含标题路径），回退 text。"""
+        return doc.searchable_text or doc.text
+
     def _build_index(self):
-        """把所有 DocumentChunk 编码成向量，写入 Qdrant 集合（重建）。"""
-        # 每次重建：删掉旧集合再按 embedding 维度 + cosine 距离新建
+        """建两路索引：Qdrant 稠密向量 + rank-bm25 稀疏索引（都用 searchable_text）。"""
+        # 稠密：每次重建 Qdrant 集合（按 embedding 维度 + cosine 距离）
         self._qdrant.recreate_collection(
             collection_name=self.collection,
             vectors_config=VectorParams(size=_EMBED_DIM, distance=Distance.COSINE),
         )
+        self._bm25 = None
 
         if not self._docs:
             return
 
-        vectors = _embed([doc.text for doc in self._docs])
+        index_texts = [self._index_text(doc) for doc in self._docs]
+
+        # 稠密索引：编码 searchable_text → 写入 Qdrant。id 用 chunk 下标，检索后据此回取
+        vectors = _embed(index_texts)
         points = [
             PointStruct(
                 id=i,
                 vector=vec,
-                # payload 存原始内容，检索命中后直接取回，无需再回查文件
+                # payload 存原始内容 + 定位信息，命中后直接取回，无需回查文件
                 payload={
                     "title": doc.title,
                     "source": doc.source,
                     "text": doc.text,
+                    "title_path": doc.title_path,
+                    "page_num": doc.page_num,
                     "image_count": doc.image_count,
                 },
             )
             for i, (vec, doc) in enumerate(zip(vectors, self._docs))
         ]
         self._qdrant.upsert(collection_name=self.collection, points=points)
-        print(f"  [KnowledgeBase] 向量索引完成，共 {len(points)} 个向量"
-              f"（模型 {_EMBED_MODEL_NAME}，维度 {_EMBED_DIM}）")
+
+        # 稀疏索引：用同一份语料在进程内现建 BM25（下标与 self._docs 对齐）
+        self._bm25 = BM25Okapi([_tokenize(t) for t in index_texts])
+
+        print(f"  [KnowledgeBase] 双路索引完成：{len(points)} 个向量"
+              f"（{_EMBED_MODEL_NAME}，{_EMBED_DIM} 维）+ BM25 稀疏索引")
 
     async def reload(self):
         """重新加载知识库并重建向量索引（热更新，不重启服务）。"""
@@ -12989,7 +13209,8 @@ class KnowledgeBaseTool(BaseTool):
         return (
             f"搜索本地知识库（已加载 {count} 个文档块，支持 PDF、图片、文本）。"
             "需要查内部 API 规范、编码规范、错误码、架构约定等文档内容时调用。"
-            "返回最相关的文档片段（含 title/source/relevance）作为回答依据。"
+            "采用 BM25 + 向量双路召回、RRF 融合排序，"
+            "返回最相关的文档片段（含 title/source/title_path/rrf_score）作为回答依据。"
         )
 
     @property
@@ -13012,12 +13233,34 @@ class KnowledgeBaseTool(BaseTool):
             "required": ["query"],
         }
 
-    # cosine 相似度低于此阈值视为不相关（归一化向量下取值范围约 [-1, 1]）
-    _SCORE_THRESHOLD = 0.3
+    # 双路各召回的候选数（融合前）：取得比 top_k 宽，给 RRF 足够的重排空间
+    _RECALL_N = 30
+    # 融合后 rrf_score 低于此值视为"几乎无匹配"，整体判为未命中
+    # （RRF 分数量级由 1/(k+rank) 决定，k=60 时单路第 1 名约 0.016，两路都命中约 0.032）
+    _RRF_MIN = 0.005
+
+    def _dense_rank(self, query: str) -> list[int]:
+        """稠密召回：query 编码后在 Qdrant 找近邻，返回 chunk 下标按相似度降序。"""
+        query_vec = _embed([query])[0]
+        hits = self._qdrant.search(
+            collection_name=self.collection,
+            query_vector=query_vec,
+            limit=self._RECALL_N,
+        )
+        return [int(h.id) for h in hits]
+
+    def _sparse_rank(self, query: str) -> list[int]:
+        """稀疏召回：BM25 对 query 打分，返回 chunk 下标按分数降序（取前 _RECALL_N）。"""
+        if self._bm25 is None:
+            return []
+        scores = self._bm25.get_scores(_tokenize(query))
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        # 只保留有正分的（BM25 无任何词命中时为 0，无意义）
+        return [i for i in order if scores[i] > 0][:self._RECALL_N]
 
     async def execute(self, inputs: dict) -> str:
         """
-        检索知识库，返回 top_k 最相关的文档片段。
+        检索知识库：BM25 + 向量双路召回 → RRF 融合 → 返回 top_k。
 
         inputs 字典由 LLM 填写，包含：
             query   搜索问题（必填）
@@ -13033,25 +13276,36 @@ class KnowledgeBaseTool(BaseTool):
                 "error": f"知识库为空。请在 {self.kb_dir}/ 目录放置文档。"
             }, ensure_ascii=False)
 
-        # 1. 把 query 编码成向量  2. 在 Qdrant 里做 cosine 近邻检索
-        query_vec = _embed([query])[0]
-        hits = self._qdrant.search(
-            collection_name=self.collection,
-            query_vector=query_vec,
-            limit=top_k,
-            score_threshold=self._SCORE_THRESHOLD,  # 低于阈值的直接被过滤掉
-        )
+        # 1. 双路召回：稠密（语义）+ 稀疏（字面），各得一份按名次排好的 chunk 下标列表
+        dense = self._dense_rank(query)
+        sparse = self._sparse_rank(query)
+
+        # 2. RRF 融合：每路里第 rank 名（0 基）贡献 1/(k + rank + 1)，两路相加后重排。
+        #    只看名次、不看原始分数，天然消除 cosine 与 BM25 量纲不可比的问题。
+        rrf: dict[int, float] = {}
+        for rank, i in enumerate(dense):
+            rrf[i] = rrf.get(i, 0.0) + 1.0 / (_RRF_K + rank + 1)
+        for rank, i in enumerate(sparse):
+            rrf[i] = rrf.get(i, 0.0) + 1.0 / (_RRF_K + rank + 1)
+
+        ranked = sorted(rrf, key=lambda i: rrf[i], reverse=True)
 
         results = []
-        for hit in hits:
-            payload = hit.payload
+        for i in ranked:
+            score = rrf[i]
+            if score < self._RRF_MIN:   # 融合后仍极低，判为无匹配
+                break
+            doc = self._docs[i]
             results.append({
-                "title": payload["title"],
-                "source": payload["source"],
-                "relevance": round(hit.score, 4),   # cosine 相似度，越接近 1 越相关
-                "content": _extract_best_chunk(payload["text"]),
-                "has_images": payload["image_count"] > 0,
+                "title": doc.title,
+                "source": doc.source,
+                "title_path": doc.title_path,   # 命中片段所在的标题层级，供来源归因
+                "rrf_score": round(score, 4),   # 融合置信度，Agent 判断是否改写重试的核心信号
+                "content": _extract_best_chunk(doc.text),
+                "has_images": doc.image_count > 0,
             })
+            if len(results) >= top_k:
+                break
 
         if not results:
             return json.dumps({
@@ -13105,7 +13359,8 @@ async def main():
             print("  → 未命中（符合无关查询的预期）")
             continue
         for i, r in enumerate(data["results"], 1):
-            print(f"  {i}. [{r['relevance']}] {r['title']}（{r['source']}）")
+            loc = r["title_path"] or r["title"]
+            print(f"  {i}. [rrf={r['rrf_score']}] {loc}（{r['source']}）")
             print(f"     {r['content'][:60]}...")
 
 
@@ -13119,38 +13374,41 @@ if __name__ == "__main__":
 python demo_kb.py
 ```
 
-预期输出（相似度分数、命中文档因模型/文档而异，重点看**语义匹配是否正确**）：
+预期输出（rrf_score、命中片段因模型/文档/切分而异，重点看**命中的是不是正确的那一节**）：
 
 ```
 首次加载（含模型下载 + 建索引，可能要几秒到几十秒）...
   [KnowledgeBase] 发现 2 个文件（文本 2，PDF 0，图片 0）
-  [KnowledgeBase] 加载完成，共 2 个文档块
-  [KnowledgeBase] 向量索引完成，共 2 个向量（模型 BAAI/bge-small-zh-v1.5，维度 512）
+  [KnowledgeBase] 加载完成，共 9 个文档块        # ← 两份 .md 按标题切成 9 段（旧版是 2 个整块）
+  [KnowledgeBase] 双路索引完成：9 个向量（BAAI/bge-small-zh-v1.5，512 维）+ BM25 稀疏索引
 
 ============================================================
 查询：怎么发 HTTP 请求？
-  1. [0.61] api_spec（knowledge_base/api_spec.md）
-     # 内部 HTTP 客户端规范 ## 统一请求封装 - 所有对外请求必须通过 core.http.HttpClient...
+  1. [rrf=0.0323] 内部 HTTP 客户端规范 > 统一请求封装（knowledge_base/api_spec.md）
+     所有对外请求必须通过 core.http.HttpClient，禁止直接使用 requests / httpx...
 
 ============================================================
 查询：变量和类应该怎么命名
-  1. [0.60] coding_style（knowledge_base/coding_style.md）
-     # Python 编码规范 ## 命名 - 函数 / 变量：snake_case；类：PascalCase...
+  1. [rrf=0.0299] Python 编码规范 > 命名（knowledge_base/coding_style.md）
+     函数 / 变量：snake_case；类：PascalCase...
 
 ============================================================
 查询：并发跑多个协程怎么写
-  1. [0.57] coding_style（knowledge_base/coding_style.md）
-     ...并发多个协程用 asyncio.gather，不要手动创建裸 Task 不管理...
+  1. [rrf=0.0164] Python 编码规范 > 异步（knowledge_base/coding_style.md）
+     并发多个协程用 asyncio.gather，不要手动创建裸 Task 不管理...
 
 ============================================================
 查询：今天天气怎么样
   → 未命中（符合无关查询的预期）
 ```
 
-> **看点**：前三个查询用的词和原文几乎不重合（"发 HTTP 请求"→"对外请求 / HttpClient"、
-> "命名"→"snake_case / PascalCase"、"并发跑协程"→"asyncio.gather"），但都命中了正确文档——
-> 这正是 TF-IDF 做不到、向量检索能做到的**语义匹配**。最后一个无关查询被 `_SCORE_THRESHOLD`
-> 过滤掉，返回"未命中"。如果这里也返回了文档，说明阈值偏低，可上调 `_SCORE_THRESHOLD`。
+> **看点**：
+> 1. **粒度**：同一份 `coding_style.md` 现在被切成"命名 / 异步 / …"多个片段，命中的是**具体那一节**
+>    （`title_path` 直接告诉你出自"Python 编码规范 > 命名"），而不再是整篇文档。
+> 2. **双路互补**：语义类查询（"发 HTTP 请求"→"对外请求 / HttpClient"）靠向量召回；若查的是精确
+>    术语（如 `asyncio.gather`、某个错误码），BM25 会把它顶到前面——两路名次经 RRF 融合后重排。
+> 3. **无匹配**：无关查询两路都召不到有效结果，融合分低于 `_RRF_MIN`，返回"未命中"。
+>    若无关查询也返回了内容，说明 `_RRF_MIN` 偏低，可上调。
 
 ---
 
@@ -13239,23 +13497,29 @@ mkdir knowledge_base
 > 而是**编码任务的"领域知识供给方"**——它查出内部 API 规范、编码规范、错误码等信息，
 > 作为前置任务的产出，供后续 `code_writer` / `code_reviewer` 当上下文使用（见文末的编排示例）。
 
-### 核心思想：把「检索操作规范」做成一个 Skill，而不是塞进 system_prompt
+### 核心思想：把「检索操作规范」做成一个 Skill，走第 9 章的 skill index 机制
 
-第 9 章确立了"**LLM 通过 `get_skill_guide` 工具按需加载 Skill**"的机制。RAG 检索**天然就是一个 Skill**：
-"什么时候该查知识库、怎么评估检索结果够不够、不够怎么改写重试、答案怎么带来源归因"——
-这些是一整套**操作规范**，正好对应一份 SKILL.md。
+> **这正是"做成 skill index"。** 第 9 章确立了 Skills 系统的两层结构：**system_prompt 里常驻一张
+> 极短的「技能索引表」（只有 `name + 一句话描述`），LLM 语义匹配后主动调用 `get_skill_guide(name)`
+> 按需加载全文**（见 9.2/9.3）。RAG 检索**天然就是这样一个 Skill**——"什么时候该查知识库、怎么评估
+> 结果够不够、不够怎么改写重试、答案怎么带来源归因"是一整套操作规范，正好对应一份 SKILL.md，
+> 进索引表、由 `get_skill_guide` 按需加载，和 `code-review` / 团队规范那些 Skill **走完全同一套机制**。
+> 这套设计对齐 `DDH-main-agent` 的 `hpd_agent`：它的 System Prompt 里就是一张技能索引表，`datasheet-rag`
+> （RAG 检索）只是其中一行，LLM 命中后调 `get_skill_guide("datasheet-rag")` 拿到检索决策树再驱动检索。
 
 所以这一版不再把检索策略硬编码进 `KnowledgeAgent` 的 system_prompt，而是：
 
 1. 新建 `skills/knowledge-base-rag.md`，把检索决策树、止损纪律、来源归因规范写进去（内容仿照
-   DDH-main-agent 的 `datasheet-rag` 技能）；
+   DDH-main-agent 的 `datasheet-rag` 技能）。它和团队规范 Skill 一样**自动进第 9 章的技能索引表**
+   （`build_skill_index()` 只取它的 `name + description`），无需额外注册；
 2. `KnowledgeAgent` 的 system_prompt **瘦身**为一句话："需要检索时，先 `get_skill_guide('knowledge-base-rag')`
-   拿到操作指南，再按指南驱动 `search_knowledge_base`"；
+   拿到操作指南，再按指南驱动 `search_knowledge_base`"——检索规范的"单一事实来源"是那份 SKILL.md；
 3. `KnowledgeAgent` 的 `tools` 同时挂上 `search_knowledge_base` 工具本身。而 `get_skill_guide`
    由 `SubAgent.run()` 恒定注入（见 9.5），无需在这里重复挂。
 
-这就是用户想要的闭环：**LLM 决定要用 RAG → 加载 RAG 这个 Skill → 按操作文档执行 rag_search**。
-与第 9 章的团队规范 Skill 走的是**同一套** `get_skill_guide` 机制，没有任何旁路。
+这就是用户想要的闭环：**索引表让 LLM 知道"有 RAG 这个 Skill" → LLM 决定要用 → `get_skill_guide`
+加载全文 → 按操作文档驱动 `search_knowledge_base`**。与第 9 章的团队规范 Skill 是**同一套 skill index
+机制**，没有任何旁路。
 
 ### 新建 `skills/knowledge-base-rag.md`
 
@@ -13290,20 +13554,22 @@ API 封装约定、编码规范、错误码表、架构约定等。这些内容�
 
 ## 三、可用工具：search_knowledge_base
 
-`search_knowledge_base(query, top_k?)` —— 返回向量检索的 top-k 文档片段。
+`search_knowledge_base(query, top_k?)` —— BM25（字面）+ 向量（语义）双路召回、RRF 融合后的 top-k 片段。
 
 **返回关键信号（你的决策全靠它们）：**
 
 | 字段 | 含义与用法 |
 |---|---|
-| `found` | 是否检索到结果（低于相似度阈值会被过滤，可能整体 found=false） |
-| `results[]` | 每条含 `title / source / relevance / content / has_images` |
-| `relevance` | cosine 相似度（归一化向量下约 0~1），**判断是否改写重试的首要信号** |
+| `found` | 是否检索到结果（融合分低于阈值会被过滤，可能整体 found=false） |
+| `results[]` | 每条含 `title / source / title_path / rrf_score / content / has_images` |
+| `title_path` | 命中片段所在的标题层级路径（如 `错误码规范 > 4xx 客户端错误`），**来源归因用它** |
+| `rrf_score` | BM25+向量的 RRF 融合置信度，**判断是否改写重试的首要信号** |
 
-**`relevance` 阈值解读：**
-- `> 0.5`：匹配度好 → 进入充分性评估
-- `0.3 ~ 0.5`：偏低 → 可用，但要意识到可能不精确，必要时改写再查一次
-- 整体 `found=false` 或结果都很低：**大概率需要改写查询重试**，不要硬凑
+**`rrf_score` 阈值解读（RRF k=60，单路第 1 名约 0.016，两路都命中约 0.032）：**
+- `> 0.02`：两路较一致命中 → 进入充分性评估
+- `0.01 ~ 0.02`：只有一路命中或名次靠后 → 可用，但要意识到可能不精确，必要时改写再查一次
+- `< 0.01` 或整体 `found=false`：**大概率需要改写查询重试**，不要硬凑
+- 提示：查**精确术语/错误码/函数名**时靠 BM25，用原词更容易命中；查**概念/意图**时靠向量，换同义说法更有效。
 
 ## 四、迭代检索决策树（每轮必须走完）
 
@@ -13318,12 +13584,13 @@ search_knowledge_base(query)     ← 第 1 轮用原始查询
    · 保留真正相关的片段，忽略只是词面相似的
    · 记住每条的 source / title，作为来源
    │
-   ├── 足够 ─────────► 整理规范（带来源），交给下游编码 Agent（见第五节）
+   ├── 足够 ─────────► 整理规范（带来源 title_path），交给下游编码 Agent（见第五节）
    │
    └── 不足 ────────► [重试决策] 选一种策略：
-           ① relevance 普遍很低 → 改写查询（换同义词 / 中英互换 / 拆分子问题）
-           ② 结果太窄 → 把 top_k 调到 5，或换更宽的关键词
-           ③ 命中错主题 → 查询里补上更精确的术语（如具体的"分页""错误码"）
+           ① rrf_score 普遍 <0.01 → 改写查询（换同义词 / 中英互换 / 拆分子问题）
+           ② 查的是精确术语/错误码/函数名却没命中 → 用**原词**再查（走 BM25 字面路更容易命中）
+           ③ 查的是概念/意图却命中错主题 → 换更贴近语义的说法（走向量路）
+           ④ 结果太窄 → 把 top_k 调到 5，或换更宽的关键词
                    │
                    ▼
            带着改写后的 query 回到 search_knowledge_base
@@ -13339,7 +13606,7 @@ search_knowledge_base(query)     ← 第 1 轮用原始查询
 你的输出会作为 `context` 传给 code_writer / code_reviewer，所以：
 
 - **原样、结构化地**整理检索到的规范（保留接口签名、错误码、约定原文），不要改写或"润色"规范内容。
-- 每条规范标注来源：**（来自 `source`）**，便于下游追溯。
+- 每条规范标注来源：**（来自 `source` 的 `title_path`）**，如"（来自 coding_style.md 的《Python 编码规范 > 命名》）"，便于下游精确追溯到具体章节。
 - 知识库里没有的，明确写"知识库中无相关规范"，**绝不凭空编造** API 名、参数或错误码。
 - 面向的是下游 Agent 而不是最终用户，所以要准确、可直接引用，不要口语化寒暄。
 
@@ -13462,7 +13729,8 @@ async def main():
     await kb.ensure_loaded()
     print(f"\n加载完成：{len(kb._docs)} 个文档块")
     for doc in kb._docs:
-        print(f"  [{doc.source}]  图片数={doc.image_count}  字符数={len(doc.text)}")
+        loc = doc.title_path or doc.title
+        print(f"  [{doc.source}] «{loc}»  字符数={len(doc.text)}")
 
 asyncio.run(main())
 ```
@@ -13471,15 +13739,22 @@ asyncio.run(main())
 python test_kb_load.py
 ```
 
-预期输出：
+预期输出（两份 .md 按标题切成多个片段，不再是"一份文档一个块"）：
 ```
   [KnowledgeBase] 发现 2 个文件（文本 2，PDF 0，图片 0）
-  [KnowledgeBase] 加载完成，共 2 个文档块
-  [KnowledgeBase] 向量索引完成，共 2 个向量（模型 BAAI/bge-small-zh-v1.5，维度 512）
+  [KnowledgeBase] 加载完成，共 9 个文档块
+  [KnowledgeBase] 双路索引完成：9 个向量（BAAI/bge-small-zh-v1.5，512 维）+ BM25 稀疏索引
 
-加载完成：2 个文档块
-  [knowledge_base\api_spec.md]  图片数=0  字符数=...
-  [knowledge_base\coding_style.md]  图片数=0  字符数=...
+加载完成：9 个文档块
+  [knowledge_base\api_spec.md] «内部 HTTP 客户端规范 > 统一请求封装»  字符数=...
+  [knowledge_base\api_spec.md] «内部 HTTP 客户端规范 > 认证»  字符数=...
+  [knowledge_base\api_spec.md] «内部 HTTP 客户端规范 > 统一响应结构»  字符数=...
+  [knowledge_base\api_spec.md] «内部 HTTP 客户端规范 > 分页约定»  字符数=...
+  [knowledge_base\coding_style.md] «Python 编码规范 > 命名»  字符数=...
+  [knowledge_base\coding_style.md] «Python 编码规范 > 类型注解»  字符数=...
+  [knowledge_base\coding_style.md] «Python 编码规范 > 异步»  字符数=...
+  [knowledge_base\coding_style.md] «Python 编码规范 > 异常处理»  字符数=...
+  [knowledge_base\coding_style.md] «统一错误码表»  字符数=...
 ```
 
 ### 验证检索效果
@@ -13540,7 +13815,7 @@ Agent：（生成的代码通过 core.http.HttpClient 发请求，返回值按 c
 □ 运行：python -c "import fitz, PIL; from sentence_transformers import SentenceTransformer; from qdrant_client import QdrantClient; print('OK')"  → 输出 OK
 □ Qdrant 已启动：curl http://localhost:6333/healthz 返回 healthz check passed
   （或改用 qdrant_url=":memory:" 免容器）
-□ 运行 test_kb_load.py，知识库正常加载并建向量索引，输出 2 个文档块 + 向量索引完成日志
+□ 运行 test_kb_load.py，知识库正常加载并建双路索引，输出多个文档块（两份 .md 按标题切成 9 段）+ 双路索引完成日志
 □ 检索测试通过：查询「怎么发 HTTP 请求？」返回 api_spec 文档（语义匹配，非字面匹配）
 □ skills/ 目录有 knowledge-base-rag.md，其 name+description 出现在技能索引表里
 □ cli.py 提"按内部规范写代码"，日志显示规划出 knowledge_agent → code_writer 两步任务，
@@ -13604,7 +13879,8 @@ def _prune_context(task_input: str, raw_context: dict[str, str]) -> dict[str, st
       relevance > 0.5   → 全量注入（高度相关）
       0.3 ~ 0.5         → 截断到前 500 字（相关但不必全给）
       < 0.3             → 只留一行摘要提示，不注入正文（几乎无关）
-    阈值与 15.11 节 knowledge-base-rag 的 relevance 经验一致。
+    注意：这里是"任务↔前置产出"两段文本的直接 cosine（0~1），与 15.11 检索返回的
+    rrf_score（融合名次分，量级完全不同）不是一回事，阈值各自独立，勿混用。
     """
     pruned = {}
     for dep_id, text in raw_context.items():
@@ -14544,9 +14820,10 @@ import json
 
 
 async def test_kb_loads_test_documents(loaded_kb):
-    """知识库应该能正确加载测试目录里的文档。"""
-    # fixtures 里有 2 个文档
-    assert len(loaded_kb._docs) == 2
+    """知识库应该能正确加载测试目录里的文档，并按标题切成多个 chunk。"""
+    # fixtures 里有 2 个 .md，每个有多个 ## 小节 → 切分后 chunk 数应明显多于文件数
+    # （不写死具体数字，避免切分策略微调时测试变脆）
+    assert len(loaded_kb._docs) > 2, "文档应被切成多个 chunk，而不是一份文档一个块"
 
 
 async def test_kb_documents_have_content(loaded_kb):
@@ -14626,9 +14903,9 @@ async def test_unrelated_query_returns_not_found_or_low_score(loaded_kb):
     data = json.loads(result)
 
     if data.get("found"):
-        # 低于 _SCORE_THRESHOLD(0.3) 的会被 Qdrant 直接过滤；即使命中，cosine 相似度也应偏低
-        assert data["results"][0]["relevance"] < 0.5, (
-            f"无关查询的相关度分数过高：{data['results'][0]['relevance']}"
+        # 低于 _RRF_MIN 的会被判为未命中；即使命中，融合置信度也应偏低
+        assert data["results"][0]["rrf_score"] < 0.02, (
+            f"无关查询的融合置信度过高：{data['results'][0]['rrf_score']}"
         )
 
 
@@ -14955,7 +15232,7 @@ AssertionError: 请求封装问题应该返回 API 规范文档，实际返回�
 
 解读：向量检索返回了错误的文档。
 可能原因：test_api_spec.md 的语义与「怎么发 HTTP 请求」查询不够贴近，或两篇测试文档语义太接近难以区分。
-修复方向：检查 test_api_spec.md 的内容，让请求封装规范描述更完整具体；必要时调低 _SCORE_THRESHOLD 或换更强的 embedding 模型（如 bge-base-zh-v1.5）。
+修复方向：检查 test_api_spec.md 的内容，让请求封装规范描述更完整具体；必要时调低 _RRF_MIN、调宽 _RECALL_N，或换更强的 embedding 模型（如 bge-base-zh-v1.5）。
 ```
 
 ### 在 cli.py 里打印指标报告
@@ -15015,7 +15292,7 @@ if result.metrics:
 
 16.4 节的 `ToolRecord.error` 只回答了"这次成没成"，没回答"属于哪一类"。加上分类维度后，
 "某类失败反复出现"才会浮出水面，才谈得上有针对性地改进（比如 `verification_failure` 高就该
-去调 15.11 节的 relevance 阈值）。
+去调 15.11 节的 rrf_score 阈值）。
 
 ### 给 `core/metrics.py` 加 `failure_category` 字段
 
@@ -15064,7 +15341,7 @@ def classify_failure(
     调用方按自己掌握的信号传参，例如：
       - Coordinator 的 dispatcher 捕获到"前置任务失败被跳过" → 传 error
       - executor 发现工具调用重试后才成功                     → retried_then_succeeded=True
-      - knowledge_agent 采纳了 relevance<0.3 的检索结果        → adopted_low_relevance=True
+      - knowledge_agent 采纳了 rrf_score<0.01 的检索结果       → adopted_low_relevance=True
     """
     if "前置任务" in error or "MISSING_CONTEXT" in result_text:
         return "spec_flaw"            # 依赖链断了，属于规划缺陷
@@ -16386,7 +16663,7 @@ sum by (failure_category) (
 
 把第二条查询做成 Grafana 的一个 `sum by (failure_category)` 时间序列面板，就得到了一张
 "失败类别趋势图"：如果 `verification_failure` 常年偏高，说明 RAG 环节采纳了太多低相关度结果
-（该调 15.11 节的 relevance 阈值或 15.14 节的裁剪策略）；如果 `spec_flaw` 高，说明 Planner
+（该调 15.11 节的 rrf_score 阈值或 15.14 节的裁剪策略）；如果 `spec_flaw` 高，说明 Planner
 规划质量差（该开 18.1 的局部重规划）。**这是在既有基础设施上叠加的归类层，改造成本低**，
 恰是行业评估里"数据充分、只缺归类维度"判断的落地。
 
