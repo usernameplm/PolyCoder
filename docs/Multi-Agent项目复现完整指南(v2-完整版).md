@@ -11907,11 +11907,11 @@ uv add docling pillow sentence-transformers qdrant-client rank-bm25
 
 `pyproject.toml` 会自动更新，加入：
 ```toml
-"docling>=2.0.0",              # PDF 版面分析：文本/表格/图片 block 解析
-"pillow>=10.0.0",              # 图片处理
-"sentence-transformers>=3.0.0", # 加载 bge-small-zh-v1.5，本地生成 embedding
-"qdrant-client>=1.9.0",        # Qdrant 向量库客户端（稠密/向量检索）
-"rank-bm25>=0.2.2",            # BM25 稀疏检索（进程内现建，与向量做 RRF 融合）
+"docling>=2.0.0",               # PDF 版面分析：文本/表格/图片 block 解析
+"pillow>=12.3.0",               # 图片处理
+"sentence-transformers>=5.6.0", # 加载 bge-small-zh-v1.5，本地生成 embedding
+"qdrant-client>=1.18.0",        # Qdrant 向量库客户端（稠密/向量检索；1.10+ 用 query_points API）
+"rank-bm25>=0.2.2",             # BM25 稀疏检索（进程内现建，与向量做 RRF 融合）
 ```
 
 ### 启动 Qdrant（Docker）
@@ -13553,12 +13553,14 @@ class KnowledgeBaseTool(BaseTool):
     def _dense_rank(self, query: str) -> list[int]:
         """稠密召回：query 编码后在 Qdrant 找近邻，返回 chunk 下标按相似度降序。"""
         query_vec = _embed([query])[0]
-        hits = self._qdrant.search(
+        # qdrant-client 1.10+ 用 query_points（旧的 search() 已废弃）：
+        # 参数名是 query（不是 query_vector），返回对象的命中列表在 .points 里。
+        response = self._qdrant.query_points(
             collection_name=self.collection,
-            query_vector=query_vec,
+            query=query_vec,
             limit=self._RECALL_N,
         )
-        return [int(h.id) for h in hits]
+        return [int(p.id) for p in response.points]
 
     def _sparse_rank(self, query: str) -> list[int]:
         """稀疏召回：BM25 对 query 打分，返回 chunk 下标按分数降序（取前 _RECALL_N）。"""
@@ -14057,15 +14059,15 @@ python test_kb_load.py
   [KnowledgeBase] 双路索引完成：9 个向量（BAAI/bge-small-zh-v1.5，512 维）+ BM25 稀疏索引
 
 加载完成：9 个文档块
-  [knowledge_base\api_spec.md] «内部 HTTP 客户端规范 > 统一请求封装»  字符数=...
-  [knowledge_base\api_spec.md] «内部 HTTP 客户端规范 > 认证»  字符数=...
-  [knowledge_base\api_spec.md] «内部 HTTP 客户端规范 > 统一响应结构»  字符数=...
-  [knowledge_base\api_spec.md] «内部 HTTP 客户端规范 > 分页约定»  字符数=...
-  [knowledge_base\coding_style.md] «Python 编码规范 > 命名»  字符数=...
-  [knowledge_base\coding_style.md] «Python 编码规范 > 类型注解»  字符数=...
-  [knowledge_base\coding_style.md] «Python 编码规范 > 异步»  字符数=...
-  [knowledge_base\coding_style.md] «Python 编码规范 > 异常处理»  字符数=...
-  [knowledge_base\coding_style.md] «统一错误码表»  字符数=...
+  [knowledge_base/api_spec.md] «内部 HTTP 客户端规范 > 统一请求封装»  字符数=...
+  [knowledge_base/api_spec.md] «内部 HTTP 客户端规范 > 认证»  字符数=...
+  [knowledge_base/api_spec.md] «内部 HTTP 客户端规范 > 统一响应结构»  字符数=...
+  [knowledge_base/api_spec.md] «内部 HTTP 客户端规范 > 分页约定»  字符数=...
+  [knowledge_base/coding_style.md] «Python 编码规范 > 命名»  字符数=...
+  [knowledge_base/coding_style.md] «Python 编码规范 > 类型注解»  字符数=...
+  [knowledge_base/coding_style.md] «Python 编码规范 > 异步»  字符数=...
+  [knowledge_base/coding_style.md] «Python 编码规范 > 异常处理»  字符数=...
+  [knowledge_base/coding_style.md] «统一错误码表»  字符数=...
 ```
 
 ### 验证检索效果
@@ -14123,7 +14125,7 @@ Agent：（生成的代码通过 core.http.HttpClient 发请求，返回值按 c
 ## 15.13 本章检查清单
 
 ```
-□ 运行：python -c "from docling.document_converter import DocumentConverter; import PIL; from sentence_transformers import SentenceTransformer; from qdrant_client import QdrantClient; print('OK')"  → 输出 OK
+□ 运行：python -c "from docling.document_converter import DocumentConverter; import PIL; from sentence_transformers import SentenceTransformer; from qdrant_client import QdrantClient; from rank_bm25 import BM25Okapi; print('OK')"  → 输出 OK
 □ Qdrant 已启动：curl http://localhost:6333/healthz 返回 healthz check passed
   （或改用 qdrant_url=":memory:" 免容器）
 □ 运行 test_kb_load.py，知识库正常加载并建双路索引，输出多个文档块（两份 .md 按标题切成 9 段）+ 双路索引完成日志
