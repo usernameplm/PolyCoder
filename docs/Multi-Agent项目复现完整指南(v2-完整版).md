@@ -11738,8 +11738,8 @@ agg demo.cast demo.gif
 ```
 新增文件：
 tools/
-├── registry.py                   ← 工具注册表（本章需要）
-├── knowledge_base.py             ← 多模态 RAG 工具（BM25+向量+RRF，替换 G.1.4 的版本）
+├── builtin/
+│   └── knowledge_base.py         ← 多模态 RAG 工具（BM25+向量+RRF，替换 G.1.4 的版本）；与其它内置工具同放 builtin/
 └── document_loaders/
     ├── __init__.py
     ├── base.py                   ← DocumentChunk 数据结构（含切分后的 title_path 等字段）
@@ -11749,7 +11749,15 @@ tools/
     ├── pdf_loader.py             ← 加载 PDF（用 docling 解析成文本/表格/图片 block）
     └── image_loader.py           ← 加载独立图片
 
+（下面这些在第 5 章已建好，本章沿用，无需新建）
+tools/
+├── registry.py                   ← 工具注册表（第 5 章 5.4 已建；本章只在 default() 里多注册 KnowledgeBaseTool，见 15.8）
+├── base.py                       ← 工具抽象基类（第 5 章）
+└── builtin/                      ← 内置工具目录（第 5 章；新增的 knowledge_base.py 也放这里）
+    ├── read_file.py / write_file.py / search_code.py / run_python.py / list_dir.py
+
 修改文件：
+tools/registry.py                 ← default() 增量注册 KnowledgeBaseTool（不删第 5 章已有的 5 个内置工具），见 15.8
 providers/types.py                ← 新增 ImageBlock 类型
 providers/base.py                 ← 新增 supports_vision 能力声明
 providers/anthropic.py            ← _to_sdk_messages() 支持 ImageBlock；supports_vision = True
@@ -13242,54 +13250,21 @@ touch tools/document_loaders/__init__.py          # macOS/Linux
 
 ---
 
-## 15.8 工具注册表 `tools/registry.py`
+## 15.8 工具注册表 `tools/registry.py`（增量修改，非新建）
 
-工具注册表是一个"工具名 → 工具实例"的映射表。
-`ToolExecutor`（第 4 章）要求注册表提供 `.get(name)` 和 `.list_names()` 方法。
+> **注意：`ToolRegistry` 在第 5 章 5.4 就已经写好了**（`register` / `get` / `list_names` /
+> `get_all_definitions` / `default()`），本章**不重写**这个类，只在它的 `default()` 里
+> **多注册一个** `KnowledgeBaseTool`。下面只展示需要改动的那一处，其余保持第 5 章原样。
+
+`KnowledgeBaseTool` 的构造参数（`kb_dir` / `collection`）都有默认值，无参构造即可。
+把它加进 `default()` 里已有的那批内置工具中——**注意不要删掉第 5 章注册的 5 个内置工具**
+（read_file / write_file / search_code / run_python / list_dir），否则会把已有能力弄丢：
 
 ```python
-# tools/registry.py
-"""
-工具注册表：管理所有可用工具。
-
-为什么需要注册表：
-- ToolExecutor 接到 LLM 返回的工具调用（只有工具名字符串），
-  需要通过名字找到对应的工具实例来执行
-- 注册表统一管理，避免散落在各处的工具实例难以维护
-- default() 方法提供一键注册所有内置工具的快捷方式
-"""
-
-from tools.base import BaseTool
-from providers.types import ToolDefinition
-from observability.logging import logger
-
-
-class ToolRegistry:
-
-    def __init__(self):
-        self._tools: dict[str, BaseTool] = {}
-
-    def register(self, tool: BaseTool) -> None:
-        """注册一个工具。工具名重复时会覆盖旧的。"""
-        self._tools[tool.name] = tool
-        logger.info("tool_registered", tool_name=tool.name)
-
-    def get(self, name: str) -> BaseTool | None:
-        """按名字查找工具，找不到返回 None。"""
-        return self._tools.get(name)
-
-    def list_names(self) -> list[str]:
-        """列出所有已注册的工具名。"""
-        return list(self._tools.keys())
-
-    def all_definitions(self) -> list[ToolDefinition]:
-        """返回所有工具的定义（发给 LLM 用）。"""
-        return [tool.definition for tool in self._tools.values()]
-
+# tools/registry.py —— 只改 default() 这一个方法，类的其余部分（第 5 章 5.4）不动
     @classmethod
-    def default(cls, kb_dir: str = "knowledge_base") -> "ToolRegistry":
-        """
-        创建并返回一个已注册常用工具的注册表。
+    def default(cls) -> "ToolRegistry":
+        """创建并返回一个已注册所有内置工具的注册表。
 
         这是启动 Agent 时最常用的入口：
             registry = ToolRegistry.default()
@@ -13297,19 +13272,36 @@ class ToolRegistry:
         """
         registry = cls()
 
-        from tools.knowledge_base import KnowledgeBaseTool
-        kb_tool = KnowledgeBaseTool(kb_dir=kb_dir)
-        registry.register(kb_tool)
+        # ── 第 5 章已有的内置工具（保持不动）──────────────────────────────
+        from tools.builtin.list_dir import ListDirTool
+        from tools.builtin.read_file import ReadFileTool
+        from tools.builtin.search_code import SearchCodeTool
+        from tools.builtin.run_python import RunPythonTool
+        from tools.builtin.write_file import WriteFileTool
+
+        registry.register(ListDirTool())
+        registry.register(ReadFileTool())
+        registry.register(SearchCodeTool())
+        registry.register(RunPythonTool())
+        registry.register(WriteFileTool())
+
+        # ── 本章新增：多模态知识库检索工具（search_knowledge_base）──────────
+        from tools.builtin.knowledge_base import KnowledgeBaseTool
+        registry.register(KnowledgeBaseTool())
 
         return registry
 ```
 
+> **为什么强调"增量、别删已有工具"？** 15.9 的 `KnowledgeBaseTool` 是给 Agent 加一项
+> 文档检索能力，不是替换掉文件读写/代码搜索这些基础工具。`register()` 返回 `self`、
+> 定义查询方法叫 `get_all_definitions()`（都在第 5 章定义），本章沿用即可，不要改名或改签名。
+
 ---
 
-## 15.9 多模态知识库工具 `tools/knowledge_base.py`
+## 15.9 多模态知识库工具 `tools/builtin/knowledge_base.py`
 
 ```python
-# tools/knowledge_base.py
+# tools/builtin/knowledge_base.py
 """
 多模态本地知识库检索工具（BM25 + 向量 双路召回 + RRF 融合版）。
 
@@ -13650,7 +13642,7 @@ class KnowledgeBaseTool(BaseTool):
 import asyncio
 import json
 
-from tools.knowledge_base import KnowledgeBaseTool
+from tools.builtin.knowledge_base import KnowledgeBaseTool
 
 
 async def main():
@@ -13941,7 +13933,7 @@ search_knowledge_base(query)     ← 第 1 轮用原始查询
 ```python
 # sub_agents/knowledge_agent.py
 from .base import SubAgent
-from tools.knowledge_base import KnowledgeBaseTool
+from tools.builtin.knowledge_base import KnowledgeBaseTool
 
 
 class KnowledgeAgent(SubAgent):
@@ -14041,7 +14033,7 @@ def _get_sub_agents() -> dict:
 ```python
 # test_kb_load.py — 运行：python test_kb_load.py
 import asyncio
-from tools.knowledge_base import KnowledgeBaseTool
+from tools.builtin.knowledge_base import KnowledgeBaseTool
 
 async def main():
     kb = KnowledgeBaseTool(kb_dir="knowledge_base")
@@ -14082,7 +14074,7 @@ python test_kb_load.py
 # 追加到 test_kb_load.py 末尾，或新建文件运行
 
 import asyncio, json
-from tools.knowledge_base import KnowledgeBaseTool
+from tools.builtin.knowledge_base import KnowledgeBaseTool
 
 async def test_search():
     kb = KnowledgeBaseTool(kb_dir="knowledge_base")
@@ -14184,7 +14176,7 @@ leader → 用 Theory-of-Mind 启发式预测"谁和谁协作有收益" → 据�
 ```python
 # coordinator/dispatcher.py（在 6.7 节版本上增量修改 _run_one）
 
-from tools.knowledge_base import _embed   # 复用 15.9 节已有的归一化 embedding
+from tools.builtin.knowledge_base import _embed   # 复用 15.9 节已有的归一化 embedding
 
 
 def _relevance(a: str, b: str) -> float:
@@ -14241,7 +14233,7 @@ def _prune_context(task_input: str, raw_context: dict[str, str]) -> dict[str, st
         只有相似度 >= threshold（默认 0.85，即"几乎重复"）才归为一簇——阈值刻意设高，
         宁可不聚也不要把"相似但不同"的任务错误合并。
         """
-        from tools.knowledge_base import _embed
+        from tools.builtin.knowledge_base import _embed
         pend = [t for t in self._tasks.values()
                 if t.type == task_type and t.status == "pending"]
         if len(pend) < 2:
@@ -14892,7 +14884,7 @@ async def loaded_kb(test_kb_dir):
     这里用 qdrant_url=":memory:" 走纯内存向量库，测试不依赖 Docker 起的 Qdrant 服务，
     且每个测试实例互相隔离、退出即清空。
     """
-    from tools.knowledge_base import KnowledgeBaseTool
+    from tools.builtin.knowledge_base import KnowledgeBaseTool
     kb = KnowledgeBaseTool(kb_dir=test_kb_dir, qdrant_url=":memory:")
     await kb.ensure_loaded()
     return kb

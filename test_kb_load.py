@@ -1,7 +1,7 @@
 # test_kb_load.py — 运行：uv run python test_kb_load.py
 import asyncio
 import json
-from tools.knowledge_base import KnowledgeBaseTool
+from tools.builtin.knowledge_base import KnowledgeBaseTool
 
 
 async def main():

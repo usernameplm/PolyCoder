@@ -47,7 +47,7 @@ class ToolRegistry:
         """
         registry = cls()
 
-        from tools.knowledge_base import KnowledgeBaseTool
+        from tools.builtin.knowledge_base import KnowledgeBaseTool
         from tools.builtin.list_dir import ListDirTool
         from tools.builtin.read_file import ReadFileTool
         from tools.builtin.search_code import SearchCodeTool

@@ -1,4 +1,4 @@
-# tools/knowledge_base.py
+# tools/builtin/knowledge_base.py
 """
 多模态本地知识库检索工具（向量检索版）。
 
