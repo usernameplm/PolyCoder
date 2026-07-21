@@ -9,7 +9,11 @@ Swarm Agent 基类。
 import asyncio
 from abc import ABC, abstractmethod
 from .blackboard import Blackboard, Task
-from skills.enhancer import enhance_system_prompt
+from skills import SKILL_INDEX, get_skill_guide_tool
+from agent_core.loop import run_agent_loop
+from agent_core.executor import ToolExecutor
+from tools.registry import ToolRegistry
+from providers.router import get_provider
 from observability.logging import logger
 
 
@@ -39,9 +43,32 @@ class SwarmAgent(ABC):
         """
         ...
 
-    def _enhance_system(self, base_system: str, context: str) -> str:
-        """Skill 增强的便捷入口（调用公共模块）。"""
-        return enhance_system_prompt(base_system, context, agent_name=self.agent_id)
+    async def _run_with_skills(self, base_system: str, prompt: str,
+                               extra_tools: list | None = None) -> str:
+        """公共执行入口：system 拼索引表 + tools 含 get_skill_guide，走 Agentic Loop。
+
+        取代旧的 _enhance_system（TF-IDF 预注入）。Swarm 子 Agent 由此获得
+        和 Coordinator 一致的"按需加载 Skill"能力——单次 provider.chat() 里 LLM 没有
+        "先调工具再继续"的机会，改走 run_agent_loop 才能让 LLM 自主调 get_skill_guide。
+        """
+        system = f"{base_system}\n\n{SKILL_INDEX}" if SKILL_INDEX else base_system
+
+        registry = ToolRegistry()
+        registry.register(get_skill_guide_tool())
+        for tool in (extra_tools or []):
+            registry.register(tool)
+
+        result = await run_agent_loop(
+            prompt=prompt,
+            provider=get_provider(),
+            system=system,
+            tools=registry.get_all_definitions(),
+            executor=ToolExecutor(registry),
+            max_turns=99,
+            session_id=self.agent_id,
+            agent_name=type(self).__name__,
+        )
+        return result.text
 
     async def start(self):
         """启动 Agent，持续监听白板上的任务。"""

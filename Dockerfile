@@ -9,8 +9,9 @@ WORKDIR /app
 # 设置 Python 不生成 .pyc 文件（容器里不需要）；输出不缓冲（日志实时可见）
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-# 用国内镜像加速依赖下载
+# 用国内镜像加速依赖下载；超时设长一些防止大包下载中断
 ENV UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV UV_HTTP_TIMEOUT=120
 
 # 先只复制依赖清单，利用 Docker 层缓存（依赖没变时不重装）
 COPY pyproject.toml uv.lock ./

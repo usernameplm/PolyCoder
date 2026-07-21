@@ -1,15 +1,6 @@
 ---
 name: api-design
-description: 本项目 FastAPI 端点设计规范——路由、状态码、响应模型
-triggers:
-  - 接口
-  - API
-  - REST
-  - 路由
-  - endpoint
-  - FastAPI
-  - HTTP
-  - 状态码
+description: 本项目 FastAPI 端点设计规范——路由、状态码、响应模型。审查或编写 REST 接口、HTTP 端点、路由时加载。
 ---
 
 ## 已有端点参考（main.py）

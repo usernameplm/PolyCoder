@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     # Anthropic
     anthropic_api_key: str = ""
+    anthropic_base_url: str = ""
 
     # OpenAI / 兼容服务
     openai_api_key: str = ""
@@ -41,6 +42,13 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+
+    # 视觉调用专用的 Provider/模型（可选）。
+    # 留空时回退到对话用的 llm_provider/对应模型，见 providers/router.py 的 get_vision_provider()。
+    vision_provider: str = ""
+    vision_model: str = ""
+    # 当模型名不在 OpenAIProvider 的启发式列表里，但实际支持视觉时，用这个显式声明。
+    vision_capable: bool = False
 
 # 全局单例——所有模块都 from core.config import settings 来使用
 settings = Settings()

@@ -36,11 +36,6 @@ class TestWriterSwarmAgent(SwarmAgent):
 
         logger.info("test_writer_agent_started", agent_id=self.agent_id, file=filename)
 
-        from providers.router import get_provider
-        from providers.types import Message, TextBlock
-
-        provider = get_provider()
-
         base_system = """
 你是一名测试工程师，专注于编写高质量的 pytest 单元测试。
 
@@ -64,17 +59,8 @@ import pytest
             f"{code}\n\n"
             "请为这段代码编写 pytest 单元测试。"
         )
-        system = self._enhance_system(base_system, prompt[:300])
-
-        response = await provider.chat(
-            messages=[Message(role="user", content=[TextBlock(text=prompt)])],
-            system=system,
-        )
-
-        result = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                result += block.text
+        # 走 Agentic Loop：编写测试时 LLM 可按需 get_skill_guide 加载异步/API 等团队规范。
+        result = await self._run_with_skills(base_system, prompt)
 
         logger.info("test_writer_agent_completed", agent_id=self.agent_id)
         return result

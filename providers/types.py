@@ -42,9 +42,27 @@ class ToolResultBlock(BaseModel):
     content: str        # 工具的返回内容（字符串）
     is_error: bool = False   # 工具是否执行失败
 
+class ImageBlock(BaseModel):
+    """
+    图片内容块——把图片以 base64 格式传给多模态 LLM。
+
+    使用场景：
+      1. 文档加载时：把 PDF 里的图片 / 独立图片文件传给 LLM 生成描述
+      2. 直接对话时：如果将来需要让用户上传图片提问
+
+    media_type 支持的值：
+      "image/jpeg"  最常见，文件大小小
+      "image/png"   截图常用，支持透明度
+      "image/webp"  现代格式，比 JPEG 小
+      "image/gif"   动图（只取第一帧）
+    """
+    type: Literal["image"] = "image"
+    source_type: Literal["base64"] = "base64"
+    media_type: str   # 图片的 MIME 类型
+    data: str         # base64 编码的图片，不包含 "data:image/jpeg;base64," 前缀
 
 # 内容块的联合类型
-ContentBlock = Union[TextBlock, ToolUseBlock, ToolResultBlock]
+ContentBlock = Union[TextBlock, ToolUseBlock, ToolResultBlock, ImageBlock]
 
 
 # ── 消息 ──────────────────────────────────────────────────────────────────────

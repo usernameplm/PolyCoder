@@ -1,13 +1,6 @@
 ---
 name: prompt-engineering
-description: 本项目 Agent 提示词规范——结构模板和输出解析约定
-triggers:
-  - 提示词
-  - prompt
-  - system prompt
-  - 系统提示
-  - Agent 指令
-  - NEEDS_FIX
+description: 本项目 Agent 提示词规范——结构模板和输出解析约定。修改子 Agent 的 system prompt、新增 Agent、设计 NEEDS_FIX 之类输出标记时加载。
 ---
 
 ## 本项目 system prompt 结构

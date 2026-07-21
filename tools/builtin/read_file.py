@@ -56,20 +56,14 @@ class ReadFileTool(BaseTool):
         if not target.is_file():
             return f"错误：{raw_path} 是目录，请指定具体文件路径"
 
-        # 文件大小限制：超过 100KB 只读取前 200 行
-        size = target.stat().st_size
         try:
             text = target.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return f"错误：{raw_path} 不是文本文件（可能是二进制文件）"
 
+        # 返回完整文件内容，不做长度截断。
+        # 截断会让 Agent 看到的代码残缺（比如只看到前 200 行就去审查/修改），
+        # 直接影响判断的正确性。上下文窗口超限由 agent_core/context.py 的
+        # 压缩机制统一兜底，不应在读文件这一层提前砍内容。
         lines = text.splitlines()
-        if size > 100_000:
-            preview = "\n".join(lines[:200])
-            return (
-                f"文件：{raw_path}（共 {len(lines)} 行，仅显示前 200 行）\n"
-                f"{'─' * 40}\n{preview}\n{'─' * 40}\n"
-                f"[文件过长，已截断。如需查看特定行，请使用 read_file_lines 工具]"
-            )
-
         return f"文件：{raw_path}（{len(lines)} 行）\n{'─' * 40}\n{text}\n{'─' * 40}"

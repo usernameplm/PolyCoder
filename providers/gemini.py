@@ -18,7 +18,7 @@ from google.generativeai.types import GenerationConfig
 from .base import BaseProvider
 from .types import (
     Message, ToolDefinition, ProviderResponse,
-    StreamChunk, TextBlock, ToolUseBlock, ToolResultBlock,
+    StreamChunk, TextBlock, ToolUseBlock, ToolResultBlock, ImageBlock,
     Usage, TextDelta, MessageStart, MessageStop,
 )
 
@@ -51,6 +51,13 @@ class GeminiProvider(BaseProvider):
             for block in msg.content:
                 if isinstance(block, TextBlock):
                     parts.append({"text": block.text})
+                elif isinstance(block, ImageBlock):           # ← 新增这一段
+                    parts.append({
+                        "inline_data": {
+                            "mime_type": block.media_type,
+                            "data": block.data,
+                        }
+                    })
                 elif isinstance(block, ToolUseBlock):
                     parts.append({
                         "function_call": {
@@ -184,3 +191,8 @@ class GeminiProvider(BaseProvider):
                 output_tokens=output_tokens,
             ),
         )
+    
+    @property
+    def supports_vision(self) -> bool:
+        # Gemini 1.5 / 2.0 系列（含本项目默认的 gemini-2.0-flash）原生支持图片输入。
+        return True

@@ -1,8 +1,11 @@
+.DS_Store
 .env
 .env.docker
 .venv/
 __pycache__/
 *.pyc
+*.tar
 sessions/
 workspace/
 logs/
+qdrant_storage/
