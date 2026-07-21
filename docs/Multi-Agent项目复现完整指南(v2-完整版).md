@@ -783,7 +783,7 @@ pip install -r requirements.txt
    ```python
    client = anthropic.AsyncAnthropic(
        api_key=settings.anthropic_api_key,
-       base_url=settings.anthropic_base_url,  # 需要在 Settings 里加这个字段
+       base_url=settings.anthropic_base_url or None,  # Settings 已有该字段，见 3.7 节
    )
    ```
 
@@ -1979,6 +1979,7 @@ def get_provider() -> BaseProvider:
         return AnthropicProvider(
             api_key=settings.anthropic_api_key,
             model=settings.llm_model,
+            base_url=settings.anthropic_base_url or None,  # 走代理/中转时用，非官方端点必须传
         )
 
     elif name in ("openai", "ollama", "deepseek", "azure"):
@@ -12309,7 +12310,11 @@ def _build_provider(name: str, model: str) -> BaseProvider:
     """
     if name == "anthropic":
         from .anthropic import AnthropicProvider
-        return AnthropicProvider(api_key=settings.anthropic_api_key, model=model)
+        return AnthropicProvider(
+            api_key=settings.anthropic_api_key,
+            model=model,
+            base_url=settings.anthropic_base_url or None,
+        )
 
     elif name in ("openai", "ollama", "deepseek", "azure"):
         from .openai import OpenAIProvider
@@ -12369,6 +12374,11 @@ def clear_provider_cache() -> None:
 > `get_provider()` 原来用 `@lru_cache(maxsize=1)` 直接包住自己；现在缓存下沉到 `_build_provider`，
 > `get_provider()`/`get_vision_provider()` 变成薄封装。行为不变（同名同模型只创建一次客户端），
 > 但多了一条路由：`(anthropic, claude-sonnet-4-6)` 和 `(openai, gpt-4o)` 可以同时存在两个实例。
+
+> `anthropic` 分支要传 `base_url=settings.anthropic_base_url or None`：实际接入的往往不是
+> Anthropic 官方端点，而是走代理/中转的 Anthropic 兼容接口，`AnthropicProvider` 的构造函数
+> 本身支持 `base_url` 参数（见 3.7 节 `AnthropicProvider.__init__`），路由器这里如果不传，
+> 就永远只能打官方地址，配了 `ANTHROPIC_BASE_URL` 也不会生效。
 
 ---
 

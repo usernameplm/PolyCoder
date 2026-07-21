@@ -53,11 +53,17 @@ class ImageLoader:
         if not caption:
             return []
 
+        title = path.stem.replace("_", " ").replace("-", " ")
+        text = f"【图片文件描述】\n{caption}"
         return [
             DocumentChunk(
                 source=str(path),
-                title=path.stem.replace("_", " ").replace("-", " "),
-                text=f"【图片文件描述】\n{caption}",
+                title=title,
+                text=text,
+                searchable_text=f"[标题路径] {title}\n{text}",
+                section_title=title,
+                title_path=title,
+                chunk_index=0,
                 image_count=1,
                 page_count=0,
             )
