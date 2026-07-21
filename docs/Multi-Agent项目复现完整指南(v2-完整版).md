@@ -11723,7 +11723,7 @@ agg demo.cast demo.gif
 
 ```
 知识库目录
-├── manual.pdf     → 提取文字 + 图片 → 图片发给视觉 LLM → 合并为文本块
+├── manual.pdf     → docling 解析成 文本/表格/图片 block → 表格导出 Markdown，图片发给视觉 LLM → 合并为文本块
 ├── screenshot.png → 发给视觉 LLM 描述 → 得到文本块
 └── policy.md      → 直接读取文字
          ↓ 统一变成 DocumentChunk（文本）
@@ -11746,7 +11746,7 @@ tools/
     ├── splitter.py               ← ★ 结构化切分（标题+段落控长），解决 chunk 粒度过粗
     ├── vision.py                 ← 调用视觉 LLM 生成图片描述
     ├── text_loader.py            ← 加载 .txt / .md（切成多个 chunk）
-    ├── pdf_loader.py             ← 加载 PDF（按页/段切块 + 图片描述）
+    ├── pdf_loader.py             ← 加载 PDF（用 docling 解析成文本/表格/图片 block）
     └── image_loader.py           ← 加载独立图片
 
 修改文件：
@@ -11757,7 +11757,7 @@ providers/openai.py               ← _to_openai_messages() 支持 ImageBlock；
 providers/gemini.py               ← _to_gemini_messages() 支持 inline_data 图片 Part；supports_vision = True
 providers/router.py               ← 新增 get_vision_provider()：视觉调用可配置成独立于对话的 Provider
 core/config.py                    ← 新增 VISION_PROVIDER / VISION_MODEL 配置项
-pyproject.toml                    ← 新增 pymupdf、pillow、sentence-transformers、qdrant-client 依赖
+pyproject.toml                    ← 新增 docling、pillow、sentence-transformers、qdrant-client 依赖
 
 外部服务：
 Qdrant（Docker）                   ← 本地向量库，存放文档 embedding，见 15.4
@@ -11807,14 +11807,28 @@ Anthropic SDK 原生支持这种格式，我们只需要在 `providers/types.py`
 而不是让图片被静默吃掉。这样即使主对话跑在本地纯文本模型上，也能单独指定一个支持视觉的 Provider
 （比如 Anthropic 或 GPT-4o）专门处理图片描述，两者互不影响。
 
-### 15.3.2 PDF 里有什么
+### 15.3.2 PDF 解析：为什么用 docling 的 block 模型
 
-一个 PDF 文件在底层包含三类内容：
-1. **文字流**：可以直接提取成字符串
-2. **图片对象**：以 JPEG/PNG 格式嵌入，提取后是二进制数据
-3. **矢量图形**：折线、方块等，本章暂不处理
+**旧方案（pymupdf 纯文本流 + 内嵌图片提取）的两个短板。** 最直接的做法是用 `pymupdf`
+（`import fitz`）逐页 `get_text("text")` 拿文字流、`get_images()` 抓内嵌图片对象。它简单，但漏两类内容：
 
-`pymupdf`（Python 中 `import fitz`）是处理 PDF 最常用的库，能同时提取文字和图片二进制数据。
+1. **表格行列结构丢失**：`get_text("text")` 是纯文本流提取，不识别表格的行列关系。一张多列表格
+   提出来往往是文字按坐标顺序拼在一起、行列错乱的一段——数字密集的表尤其严重，语义完全被破坏。
+2. **矢量图表完全捕获不到**：很多"图表"（架构图、柱状图、流程图）是用 PDF 的**矢量绘图指令**画的，
+   不是内嵌的 JPEG/PNG 位图。它们既不在文字流里，也不在 `get_images()` 的对象列表里，会被整体漏掉——
+   旧版对此只能"暂不处理"。只有本身就是截图的位图不受影响。
+
+**docling 的解决思路：版面分析 + block 模型。** docling（IBM 开源）先用**版面分析模型**理解页面结构，
+再把每一页切成一串结构化 block：
+
+- `TextItem` / `SectionHeaderItem`：正文与标题，带层级信息，可继续走本章的 splitter 控长切块；
+- `TableItem`：识别出行列结构，可直接 `export_to_markdown()` 导出成 Markdown 表格，**保留行列关系**；
+- `PictureItem`：图片/图表区域。关键点是它基于**渲染后的页面裁剪**得到图像，而不是去 PDF 里找内嵌
+  图片对象——所以用矢量指令画的架构图/柱状图也会被识别成一个 Picture block 抠出来，弥补了旧版的短板。
+
+**成本权衡**：docling 要在本地跑版面分析、表格结构识别（可选 OCR）等模型，比 pymupdf 的纯规则提取更重
+——首次运行要下载模型、单页 CPU 耗时也更高。换来的是表格的结构保真和对矢量图表的覆盖，对"知识库要吃
+带图表的 PDF"这个场景是值得的。
 
 ### 15.3.3 整体分层设计
 
@@ -11824,7 +11838,7 @@ Anthropic SDK 原生支持这种格式，我们只需要在 `providers/types.py`
 Layer 1：document_loaders/（负责"读懂"各种格式的文件 + 切成语义片段）
   splitter.split_markdown() / split_plain()  → 把长文本按标题+段落控长切成多段
   TextLoader  → list[DocumentChunk]（一份文档切成多个 chunk）
-  PDFLoader   → list[DocumentChunk]（按页切 + 并发调用视觉 LLM 描述图片）
+  PDFLoader   → list[DocumentChunk]（docling 解析出 block 后分类处理：文本→切块，表格→Markdown，图片→视觉 LLM 描述）
   ImageLoader → list[DocumentChunk]（异步：调用视觉 LLM）
 
 Layer 2：knowledge_base.py（负责索引、检索）
@@ -11880,12 +11894,12 @@ cosine 是 `[-1, 1]`，两者量纲完全不同，直接加权要反复调系数
 
 ```bash
 # 激活虚拟环境（确保提示符前有 (.venv)）
-uv add pymupdf pillow sentence-transformers qdrant-client rank-bm25
+uv add docling pillow sentence-transformers qdrant-client rank-bm25
 ```
 
 `pyproject.toml` 会自动更新，加入：
 ```toml
-"pymupdf>=1.24.0",              # PDF 文字 + 图片提取
+"docling>=2.0.0",              # PDF 版面分析：文本/表格/图片 block 解析
 "pillow>=10.0.0",              # 图片处理
 "sentence-transformers>=3.0.0", # 加载 bge-small-zh-v1.5，本地生成 embedding
 "qdrant-client>=1.9.0",        # Qdrant 向量库客户端（稠密/向量检索）
@@ -11915,9 +11929,13 @@ HuggingFace 下载并缓存到 `~/.cache/huggingface/`，之后离线可用。�
 export HF_ENDPOINT=https://hf-mirror.com   # 可选：走国内镜像加速下载
 ```
 
+**docling 同样会在首次运行时下载模型。** 第一次用 `DocumentConverter` 解析 PDF 时，docling 会从
+HuggingFace 拉取版面分析 + 表格结构识别模型（体积比 bge 大，约几百 MB），同样缓存到本地、之后离线可用。
+上面配置的 `HF_ENDPOINT` 镜像对它同样生效，国内网络可复用来加速。
+
 验证安装：
 ```bash
-python -c "import fitz, PIL; from sentence_transformers import SentenceTransformer; from qdrant_client import QdrantClient; from rank_bm25 import BM25Okapi; print('依赖安装成功')"
+python -c "from docling.document_converter import DocumentConverter; import PIL; from sentence_transformers import SentenceTransformer; from qdrant_client import QdrantClient; from rank_bm25 import BM25Okapi; print('依赖安装成功')"
 # 预期输出：依赖安装成功
 ```
 
@@ -12584,30 +12602,42 @@ class TextLoader:
 ```python
 # tools/document_loaders/pdf_loader.py
 """
-PDF 文档加载器。
+PDF 文档加载器（基于 docling 版面分析）。
 
-处理流程（每个 PDF 生成**多个** DocumentChunk，粒度到"页 / 段"）：
-1. 用 pymupdf (fitz) 打开 PDF
-2. 逐页提取文字：每页文字过长时再按 splitter 控长切成多段
-3. 逐页提取图片，对每张图片调用 vision.caption_image()，图片描述各自单独成块
-4. 每个 chunk 记住自己的 page_num，便于来源归因到"第 N 页"
+处理流程（每个 PDF 生成**多个** DocumentChunk，粒度到"页 / 段 / 表 / 图"）：
+1. 用 docling 的 DocumentConverter 解析 PDF，得到结构化 block 序列
+2. 遍历 block，按类型分别处理：
+   - 文本 / 标题 block：按页拼接后再走 splitter 控长切成多段
+   - 表格 block（TableItem）：export_to_markdown() 导出为 Markdown 表格，保留行列结构，单独成块
+   - 图片 block（PictureItem）：取渲染后的图像，调用 vision.caption_image() 生成描述，单独成块
+3. 每个 chunk 记住自己的 page_num，便于来源归因到"第 N 页"
+
+为什么用 docling 而不是 pymupdf（见 15.3.2）：
+- pymupdf 的 get_text("text") 是纯文本流，表格会被拼成行列错乱的一段，结构丢失；
+- pymupdf 的 get_images() 只抓内嵌位图，用矢量指令画的架构图/柱状图完全捕获不到。
+docling 用版面分析把页面切成 Text/Table/Picture block：表格能导出 Markdown，
+Picture 基于渲染页面裁剪（不依赖是否为内嵌对象），所以矢量图表也能被抠出来交给视觉 LLM。
 
 为什么不再"整份 PDF 一个块"：一份几十页的 PDF 编码成一个向量，局部要点会被整篇稀释，
-命中后返回的还是整篇。改为按页/按段切，检索命中的是具体那一页那一段。
+命中后返回的还是整篇。改为按页/段/表/图切，检索命中的是具体那一页那一段。
 """
 
 import asyncio
+import io
 from pathlib import Path
 
 try:
-    import fitz  # pymupdf 安装后用 import fitz
-    HAS_PYMUPDF = True
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling_core.types.doc import TableItem, PictureItem
+    HAS_DOCLING = True
 except ImportError:
-    HAS_PYMUPDF = False
+    HAS_DOCLING = False
 
 from .base import DocumentChunk
 from .splitter import split_plain
-from .vision import caption_image, _guess_media_type
+from .vision import caption_image
 
 
 class PDFLoader:
@@ -12617,63 +12647,75 @@ class PDFLoader:
     # 单个 PDF 最多处理的图片数量（防止超大 PDF 消耗太多 API 调用）
     MAX_IMAGES = 20
 
-    # 忽略小于此大小的图片（字节）——通常是装饰性小图标
+    # 忽略小于此大小的图片（编码为 PNG 后的字节数）——通常是装饰性小图标
     MIN_IMAGE_BYTES = 5000
+
+    def _make_converter(self) -> "DocumentConverter":
+        """构造 docling 转换器，开启图片渲染裁剪（否则 PictureItem 拿不到图像）。"""
+        opts = PdfPipelineOptions()
+        opts.generate_picture_images = True   # 让 PictureItem 携带渲染后的图像
+        return DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+        )
 
     async def load(self, path: Path) -> list[DocumentChunk]:
         """
         异步加载单个 PDF 文件。
 
-        这是 async 方法，因为图片描述需要调用 LLM（网络请求）。
-        多张图片通过 asyncio.gather() 并发处理，不会串行等待。
+        docling 的解析是 CPU 密集的同步调用，放进线程池（asyncio.to_thread）不阻塞事件循环；
+        图片描述需要调用 LLM（网络请求），多张图片通过 asyncio.gather() 并发处理。
         """
-        if not HAS_PYMUPDF:
-            print("  [PDFLoader] 未安装 pymupdf，跳过 PDF。运行：uv add pymupdf")
+        if not HAS_DOCLING:
+            print("  [PDFLoader] 未安装 docling，跳过 PDF。运行：uv add docling")
             return []
 
         try:
-            doc = fitz.open(str(path))
+            converter = self._make_converter()
+            result = await asyncio.to_thread(converter.convert, str(path))
+            document = result.document
         except Exception as e:
-            print(f"  [PDFLoader] 无法打开 {path}: {e}")
+            print(f"  [PDFLoader] 无法解析 {path}: {e}")
             return []
 
-        # 按页收集文字；图片记录其所属页码，稍后并发描述后各自成块
-        page_texts: dict[int, str] = {}                       # page_num(1基) → 文字
-        all_images: list[tuple[int, bytes, str]] = []         # (page_num, 二进制, media_type)
+        page_count = len(document.pages)
 
-        # 遍历每一页
-        for page_num in range(len(doc)):
-            page = doc[page_num]
+        # 按页收集文本 block 的文字；表格/图片各自记录所属页码，稍后分别成块
+        page_texts: dict[int, list[str]] = {}                 # page_num(1基) → 文字片段列表
+        tables: list[tuple[int, str]] = []                    # (page_num, markdown)
+        all_images: list[tuple[int, bytes]] = []              # (page_num, PNG 二进制)
 
-            # 步骤 1：提取当前页的文字（暂存，稍后切块）
-            page_text = page.get_text("text").strip()
-            if page_text:
-                page_texts[page_num + 1] = page_text
+        def _page_of(item) -> int:
+            """从 block 的 provenance 里取 1 基页码，取不到则归到第 1 页。"""
+            try:
+                return item.prov[0].page_no
+            except (AttributeError, IndexError):
+                return 1
 
-            # 步骤 2：提取当前页的图片（如果还没超上限），记录所属页码
-            if len(all_images) < self.MAX_IMAGES:
-                for img_info in page.get_images(full=True):
-                    xref = img_info[0]  # 图片的 xref 编号（PDF 内部 ID）
-                    try:
-                        img_data = doc.extract_image(xref)
-                        # img_data 是字典，包含 "image"（二进制）和 "ext"（扩展名）
-                        img_bytes = img_data["image"]
-                        img_ext = "." + img_data.get("ext", "jpg").lower()
-                        media_type = _guess_media_type(img_ext)
+        # 遍历 docling 解析出的所有 block，按类型分流
+        for item, _level in document.iterate_items():
+            page = _page_of(item)
 
-                        # 过滤掉太小的图片
-                        if len(img_bytes) < self.MIN_IMAGE_BYTES:
-                            continue
+            if isinstance(item, TableItem):
+                md = item.export_to_markdown(document).strip()
+                if md:
+                    tables.append((page, md))
 
-                        all_images.append((page_num + 1, img_bytes, media_type))
+            elif isinstance(item, PictureItem):
+                if len(all_images) >= self.MAX_IMAGES:
+                    continue
+                pil_img = item.get_image(document)   # 渲染后的 PIL 图像；未渲染时为 None
+                if pil_img is None:
+                    continue
+                buf = io.BytesIO()
+                pil_img.convert("RGB").save(buf, format="PNG")
+                img_bytes = buf.getvalue()
+                if len(img_bytes) < self.MIN_IMAGE_BYTES:   # 过滤装饰性小图
+                    continue
+                all_images.append((page, img_bytes))
 
-                        if len(all_images) >= self.MAX_IMAGES:
-                            break
-                    except Exception:
-                        continue
-
-        page_count = len(doc)
-        doc.close()
+            elif hasattr(item, "text") and item.text and item.text.strip():
+                # TextItem / SectionHeaderItem 等文本类 block，按页累积
+                page_texts.setdefault(page, []).append(item.text.strip())
 
         title = path.stem.replace("_", " ").replace("-", " ")
         chunks: list[DocumentChunk] = []
@@ -12698,18 +12740,23 @@ class PDFLoader:
             ))
             idx += 1
 
-        # 步骤 3：每页文字过长时按 splitter 控长切成多段，各自成块
+        # 步骤 A：每页文本拼接后按 splitter 控长切成多段，各自成块
         for page in sorted(page_texts):
-            for seg in split_plain(page_texts[page]):
+            page_text = "\n".join(page_texts[page])
+            for seg in split_plain(page_text):
                 _add(seg["text"], page, is_image=False)
 
-        # 步骤 4：并发调用视觉 LLM 描述所有图片，每张描述单独成块（带所属页码）
+        # 步骤 B：每张表格作为一个块（Markdown 结构原样保留）
+        for page, md in tables:
+            _add(f"【表格】\n{md}", page, is_image=False)
+
+        # 步骤 C：并发调用视觉 LLM 描述所有图片，每张描述单独成块（带所属页码）
         if all_images:
             print(f"  [PDFLoader] {path.name}：正在描述 {len(all_images)} 张图片（并发）...")
             captions = await asyncio.gather(*[
-                caption_image(img_bytes, mt) for _, img_bytes, mt in all_images
+                caption_image(img_bytes, "image/png") for _, img_bytes in all_images
             ])
-            for (page, _, _), caption in zip(all_images, captions):
+            for (page, _), caption in zip(all_images, captions):
                 if caption:
                     _add(f"【图片描述】: {caption}", page, is_image=True)
 
@@ -12996,7 +13043,7 @@ class ToolRegistry:
 
 支持三种文件格式：
   .txt / .md  → TextLoader（切成多个语义 chunk）
-  .pdf        → PDFLoader（按页/段切块 + 并发调用视觉 LLM 描述图片）
+  .pdf        → PDFLoader（docling 解析文本/表格/图片 block，表格转 Markdown + 并发调用视觉 LLM 描述图片）
   .jpg .png 等 → ImageLoader（调用视觉 LLM 描述整张图片）
 
 检索算法：BM25（稀疏/字面）+ Embedding 向量（稠密/语义）双路召回，再用 RRF 融合排序。
@@ -13812,7 +13859,7 @@ Agent：（生成的代码通过 core.http.HttpClient 发请求，返回值按 c
 ## 15.13 本章检查清单
 
 ```
-□ 运行：python -c "import fitz, PIL; from sentence_transformers import SentenceTransformer; from qdrant_client import QdrantClient; print('OK')"  → 输出 OK
+□ 运行：python -c "from docling.document_converter import DocumentConverter; import PIL; from sentence_transformers import SentenceTransformer; from qdrant_client import QdrantClient; print('OK')"  → 输出 OK
 □ Qdrant 已启动：curl http://localhost:6333/healthz 返回 healthz check passed
   （或改用 qdrant_url=":memory:" 免容器）
 □ 运行 test_kb_load.py，知识库正常加载并建双路索引，输出多个文档块（两份 .md 按标题切成 9 段）+ 双路索引完成日志
@@ -13821,7 +13868,8 @@ Agent：（生成的代码通过 core.http.HttpClient 发请求，返回值按 c
 □ cli.py 提"按内部规范写代码"，日志显示规划出 knowledge_agent → code_writer 两步任务，
   且 knowledge_agent 先调 get_skill_guide("knowledge-base-rag") 再调 search_knowledge_base
   （验证 RAG 作为 Skill 按需加载的闭环，而非把检索策略预置在 system_prompt）
-□ （可选）在 knowledge_base/ 放一个 PDF，重跑加载，确认提取了图片描述
+□ （可选）在 knowledge_base/ 放一个 PDF，重跑加载，确认提取了图片描述，
+  且表格被完整保留为 Markdown 结构、矢量图表也生成了描述（而不仅仅是内嵌位图）
 □ （可选）在 knowledge_base/ 放一张 PNG 图片，确认生成了文字描述
 □ 验证视觉 Provider 独立配置生效：临时设 VISION_PROVIDER=openai + OPENAI_MODEL=deepseek-chat
   （纯文本模型），重跑图片加载，应看到 get_vision_provider() 抛出 ValueError 而不是静默返回空描述；
