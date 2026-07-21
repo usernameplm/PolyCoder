@@ -12374,6 +12374,71 @@ mkdir tools/document_loaders
 
 ---
 
+### 15.7.0 切分规则总览（先读这张表）
+
+本节所有切分逻辑散落在 `base.py` / `splitter.py` / `pdf_loader.py` 三个文件里。动手前先建立
+整体心智模型：**为什么这么切、按什么边界切、每个 chunk 最后带什么**。下面几张表是全节的索引。
+
+#### 1. 总原则：绝不定长硬切
+
+不按"每 N 字一刀"切——那会把一句话、一行表格、一个标题从中间截断，导致 chunk 语义破碎、
+检索命中后不可读，向量也被无关内容稀释。改为**沿自然边界切（标题 / 空行段落 / 表格整行），
+只在超长时才在边界处断**。token 用粗略估算：`max(中文字符数 // 2, 英文词数)`。
+
+三个阈值常量（`splitter.py`）：
+
+| 常量 | 值 | 作用 |
+|---|---|---|
+| `MAX_TOKENS` | 350 | 单个正文 chunk 的 token 上限，超了在段落边界断 |
+| `MIN_TOKENS` | 20 | 过短的尾块并入上一块，避免切出"只有一个标题"的碎块 |
+| `TABLE_TOKEN_LIMIT` | 800 | 单个表格块上限（比正文放宽），超了按整行边界切 |
+
+#### 2. 按文件类型分四条切分路径
+
+| 文件类型 | 入口 | 切分边界 | 产出粒度 |
+|---|---|---|---|
+| `.md` | `TextLoader` → `split_markdown` | `#`~`######` 标题为界，维护标题栈拼 `title_path`；正文超长再按空行段落控长 | 一节 / 一段 |
+| `.txt` | `TextLoader` → `split_plain` | 无标题结构，按空行分段 + `MAX_TOKENS` 累加控长 | 一段 |
+| `.pdf` | `PDFLoader.load`（docling 版面分析） | 按 block 类型分流，见下表 | 页 / 段 / 表 / 图 |
+| 独立图片 | `ImageLoader` | 整图 → 视觉 LLM 描述 → 单块 | 一张图 |
+
+#### 3. PDF 的 block 分流规则（最复杂，改动最大）
+
+**按文档顺序遍历 block，边走边维护 `section_title`（最近小节标题）与 `page_title`（页面级
+祖先标题）**；遇到标题 / 表 / 图就先把攒着的正文落盘：
+
+| block 类型 | 处理方式 |
+|---|---|
+| 文本 | 按当前小节累积，超长走 `split_plain` 控长切成多段 |
+| 标题（SectionHeaderItem） | 更新 `section_title`；标题文本**本身也单独成一个小块**（利于"查章节名"直接命中）；命中"大标题特征"（短、单行、含领域关键词）则记为本页 `page_title` |
+| 表格（TableItem） | `export_to_markdown()` → `split_table_md`：**整表优先，超长按行切、每片重复标题+表头+分隔行、绝不断行** |
+| 图片（PictureItem） | 视觉 LLM 生成描述，前面拼 `[出处] 章节 + 文档主实体`，单独成块并记 `image_path` |
+
+两个关键的"防丢上下文"机制：
+
+- **`page_title`（祖先标题）翻页才重置、同页内不被小节标题覆盖**——解决"X7R/X8R 这种
+  页面级上下文被更细的小节标题顶掉"的问题。`title_path` 拼成 `文档 > 祖先标题 > 小节标题`。
+- **表格按行切、绝不断行**——二维结构从中间断会行列错位，只在整行边界切，且每片重复表头，
+  保证任何一片单独拿出来都能读懂每列是什么。
+
+#### 4. 每个 chunk 最终携带的定位/归因元数据
+
+切完后每个 `DocumentChunk` 都带下列字段（详见 15.7.1）：
+
+| 字段 | 用途 |
+|---|---|
+| `searchable_text` | `"[标题路径] {title_path}\n" + text`，把所属章节拼进检索文本参与召回 |
+| `chunk_type` | `text` / `table` / `image`，下游据此区分处理 |
+| `section_title` / `title_path` / `page_title` / `ancestor_title` | 章节定位与来源归因（"出自哪一节"） |
+| `page_num` / `page_count` | PDF 页码归因（"第 N 页"） |
+| `table_id` / `table_part_idx` / `table_part_count` / `is_table_part` | 大表被按行切成多片时的回溯信息 |
+| `image_path` | 图片相对路径，供回答用 `![](image_path)` 回附原图 |
+
+一句话总结：**Markdown 靠标题栈、PDF 靠顺序遍历维护标题状态；正文按段落控长、表格按行
+不断行、图片补出身；每个 chunk 都记住"我出自哪一节、第几页"，检索命中即可精准归因。**
+
+---
+
 ### 15.7.1 通用数据结构 `tools/document_loaders/base.py`
 
 ```python
@@ -12429,8 +12494,39 @@ class DocumentChunk:
     chunk_index: int = 0
     """该 chunk 在所属文档内的序号（从 0 开始），便于回溯上下文顺序。"""
 
+    # ── chunk 类型与祖先标题（对齐 DDH build_chunks / _add_chunk）─────────────
+    chunk_type: str = "text"
+    """chunk 的内容类型：'text' / 'table' / 'image'。
+    下游据此区分处理——例如 image 块要用 image_path 回附图片，table 块要提示"来自表格"。"""
+
+    page_title: str = ""
+    """本页的"祖先大标题"（如 PDF 里的 "X8R / Automotive MLCC"）。
+    与 section_title 的区别：section_title 是最近的一个小节标题，翻到下一个小标题就被覆盖；
+    page_title 是页面级上下文，同一页内不被后续小节标题覆盖，翻页才重置（见 15.7.6 说明）。"""
+
+    ancestor_title: str = ""
+    """拼进 title_path 的祖先标题（page_title 与 section_title 不同名时才有值）。
+    单独留字段是为了让下游能只取"页面级上下文"而不含小节名。"""
+
+    # ── 表格分块元数据（一张大表被按行切成多块时才有意义，对齐 _split_table_html）──
+    table_id: str = ""
+    """所属表格的唯一 id。同一张大表切出来的多个块共享同一个 table_id，便于回溯拼回整表。"""
+
+    table_part_idx: int = 0
+    """本块是该表格的第几片（从 0 开始）。整表未超长时恒为 0。"""
+
+    table_part_count: int = 1
+    """该表格一共被切成几片。未超长时为 1。"""
+
+    is_table_part: bool = False
+    """该表格是否被切成了多片（table_part_count > 1 时为 True）。"""
+
     image_count: int = 0
     """本 chunk 关联的图片数量（纯文本为 0）。"""
+
+    image_path: str = ""
+    """图片相对路径（如 'imgs/manual_img_3.jpg'）。仅 chunk_type=='image' 时有值，
+    供最终回答用 ![](image_path) 回附原图并标注来源页码（对齐 HPD datasheet-rag SKILL 的强制格式）。"""
 
     page_num: int = 0
     """所在页码（PDF 才有意义，其他为 0）。"""
@@ -12606,11 +12702,17 @@ PDF 文档加载器（基于 docling 版面分析）。
 
 处理流程（每个 PDF 生成**多个** DocumentChunk，粒度到"页 / 段 / 表 / 图"）：
 1. 用 docling 的 DocumentConverter 解析 PDF，得到结构化 block 序列
-2. 遍历 block，按类型分别处理：
-   - 文本 / 标题 block：按页拼接后再走 splitter 控长切成多段
-   - 表格 block（TableItem）：export_to_markdown() 导出为 Markdown 表格，保留行列结构，单独成块
-   - 图片 block（PictureItem）：取渲染后的图像，调用 vision.caption_image() 生成描述，单独成块
-3. 每个 chunk 记住自己的 page_num，便于来源归因到"第 N 页"
+2. **按文档顺序**遍历 block，边走边维护"当前小节标题 section_title / 页面级祖先标题
+   page_title"（对齐 DDH build_chunks 的做法——docling 给的是扁平 block 流，标题和正文
+   平级出现，只有顺序遍历才能知道某段正文/某张表归属最近哪个标题）：
+   - 文本 block：按 section 累积，遇到标题/表/图就先落盘，再走 splitter 控长切成多段
+   - 标题 block（SectionHeaderItem）：更新 section_title，命中"大标题"特征则记为本页祖先；
+     标题文本本身也单独成一个小块（利于"查章节名"类问题直接命中）
+   - 表格 block（TableItem）：export_to_markdown() 导出 Markdown 表格；整表优先，超长则
+     按行切、每片重复标题+表头（见 15.7.6 split_table_md），绝不断行
+   - 图片 block（PictureItem）：取渲染图，vision.caption_image() 生成描述，并补"出处"
+     （所属章节 + 文档主实体），单独成块并记 image_path 供回答回附原图
+3. 每个 chunk 记住自己的 page_num 与 title_path，便于来源归因到"第 N 页 / 哪一节"
 
 为什么用 docling 而不是 pymupdf（见 15.3.2）：
 - pymupdf 的 get_text("text") 是纯文本流，表格会被拼成行列错乱的一段，结构丢失；
@@ -12635,9 +12737,41 @@ try:
 except ImportError:
     HAS_DOCLING = False
 
+import re
+
 from .base import DocumentChunk
-from .splitter import split_plain
+from .splitter import split_plain, split_table_md
 from .vision import caption_image
+
+
+# 页面级大标题的特征：短文本、无换行，且命中"领域关键词"（介质/汽车级/系列名等）。
+# 这类标题是"祖先标题"——同页后续更细的小节标题（如 "Capacitance Range"）会顶掉它，
+# 导致 X7R/X8R 这种页面级上下文从数据块里丢失，故单独维护 page_title 不被覆盖。
+# 关键词按自己的文档域调整；这里给的是"内部规范/器件手册"常见的一组示例。
+_PAGE_TITLE_HINT = re.compile(
+    r"(MLCC|X7R|X8R|X5R|NP0|Dielectric|Automotive|Commercial|规范|架构|错误码)",
+    re.IGNORECASE,
+)
+
+
+def _is_page_title(text: str) -> bool:
+    """判断一个标题是否是"页面级祖先标题"（短、单行、命中领域关键词）。"""
+    text = text.strip()
+    if not text or len(text) > 60 or "\n" in text:
+        return False
+    return bool(_PAGE_TITLE_HINT.search(text))
+
+
+def _doc_main_entity(all_text: str) -> str:
+    """统计整份文档出现频次最高的"实体/型号族"（如 LQG15HH / VCHA085D）。
+    图片描述由视觉 LLM 生成，不含"该图属于哪个型号/文档"的信息，同类图（两份文档的
+    卷盘图）无法区分。用这个主实体给图片补"出身"，让检索能定位到正确文档的图。"""
+    from collections import Counter
+    cnt: Counter = Counter()
+    # 实体样式：字母开头、含数字、长度≥6（如 LQG15HH6N8J02D、VCHA085D）
+    for m in re.findall(r"[A-Za-z]{2,}[0-9][A-Za-z0-9]{2,}", all_text):
+        cnt[m[:8].upper()] += 1   # 取前 8 位作为"实体族"
+    return cnt.most_common(1)[0][0] if cnt else ""
 
 
 class PDFLoader:
@@ -12678,11 +12812,7 @@ class PDFLoader:
             return []
 
         page_count = len(document.pages)
-
-        # 按页收集文本 block 的文字；表格/图片各自记录所属页码，稍后分别成块
-        page_texts: dict[int, list[str]] = {}                 # page_num(1基) → 文字片段列表
-        tables: list[tuple[int, str]] = []                    # (page_num, markdown)
-        all_images: list[tuple[int, bytes]] = []              # (page_num, PNG 二进制)
+        title = path.stem.replace("_", " ").replace("-", " ")
 
         def _page_of(item) -> int:
             """从 block 的 provenance 里取 1 基页码，取不到则归到第 1 页。"""
@@ -12691,17 +12821,67 @@ class PDFLoader:
             except (AttributeError, IndexError):
                 return 1
 
-        # 遍历 docling 解析出的所有 block，按类型分流
+        # ── 第 1 遍：按文档顺序遍历 block，维护 section_title / page_title ──────
+        # 为什么要"按顺序"而不再"按页分组后统一处理"：section_title/page_title 是随
+        # block 流推进的状态——只有顺序遍历才能知道某段正文/某张表属于最近哪个标题。
+        # 图片需要调 LLM 描述，先只收集字节 + 落一个占位，第 2 遍再并发填描述，保持原有并发。
+        pending: list[dict] = []                 # 有序的待生成块（含已解析好的 section/page_title）
+        pending_images: list[dict] = []          # 指向 pending 里的图片占位，供第 2 遍回填描述
+        text_buf: list[str] = []
+        buf_page = 1
+        section_title = ""
+        page_title = ""
+        cur_page = None
+        all_text_parts: list[str] = []           # 收集全文用于统计主实体（给图片补出身）
+
+        def _titles_now() -> tuple[str, str]:
+            """当前生效的 (title_path, ancestor_title)：page_title > section_title 层级拼接。"""
+            ancestor = page_title if page_title and page_title != section_title else ""
+            if ancestor and section_title:
+                tp = f"{title} > {ancestor} > {section_title}"
+            else:
+                tp = f"{title} > {section_title}" if section_title else title
+            return tp, ancestor
+
+        def flush_text():
+            """把攒着的正文按 splitter 控长切成多段，各自落成待生成块。"""
+            nonlocal text_buf
+            body = "\n".join(text_buf).strip()
+            text_buf = []
+            if not body:
+                return
+            tp, ancestor = _titles_now()
+            for seg in split_plain(body):
+                pending.append({"kind": "text", "text": seg["text"], "page": buf_page,
+                                "section_title": section_title, "page_title": page_title,
+                                "ancestor_title": ancestor, "title_path": tp})
+
         for item, _level in document.iterate_items():
             page = _page_of(item)
+            if page != cur_page:
+                cur_page = page
+                page_title = ""        # 翻页重置：祖先标题只在本页内生效
 
             if isinstance(item, TableItem):
+                flush_text()
                 md = item.export_to_markdown(document).strip()
-                if md:
-                    tables.append((page, md))
+                if not md:
+                    continue
+                tp, ancestor = _titles_now()
+                table_id = f"{path.stem}_tbl_p{page}_{len(pending)}"
+                # 超长表格按行切、每片重复标题+表头（见 15.7.6 split_table_md）
+                for part in split_table_md(md, title=section_title, table_id=table_id):
+                    pending.append({"kind": "table", "text": f"【表格】\n{part['text']}",
+                                    "page": page, "section_title": section_title,
+                                    "page_title": page_title, "ancestor_title": ancestor,
+                                    "title_path": tp, "table_id": part["table_id"],
+                                    "table_part_idx": part["table_part_idx"],
+                                    "table_part_count": part["table_part_count"],
+                                    "is_table_part": part["is_table_part"]})
 
             elif isinstance(item, PictureItem):
-                if len(all_images) >= self.MAX_IMAGES:
+                flush_text()
+                if len(pending_images) >= self.MAX_IMAGES:
                     continue
                 pil_img = item.get_image(document)   # 渲染后的 PIL 图像；未渲染时为 None
                 if pil_img is None:
@@ -12711,55 +12891,75 @@ class PDFLoader:
                 img_bytes = buf.getvalue()
                 if len(img_bytes) < self.MIN_IMAGE_BYTES:   # 过滤装饰性小图
                     continue
-                all_images.append((page, img_bytes))
+                tp, ancestor = _titles_now()
+                slot = {"kind": "image", "text": "", "page": page,
+                        "section_title": section_title, "page_title": page_title,
+                        "ancestor_title": ancestor, "title_path": tp,
+                        "image_path": f"imgs/{path.stem}_img_p{page}_{len(pending_images)}.png",
+                        "_img_bytes": img_bytes}
+                pending.append(slot)
+                pending_images.append(slot)
 
             elif hasattr(item, "text") and item.text and item.text.strip():
-                # TextItem / SectionHeaderItem 等文本类 block，按页累积
-                page_texts.setdefault(page, []).append(item.text.strip())
+                text = item.text.strip()
+                all_text_parts.append(text)
+                # SectionHeaderItem 视为标题：切断上文、更新 section_title，标题本身也成块
+                if type(item).__name__ == "SectionHeaderItem":
+                    flush_text()
+                    section_title = text
+                    if not page_title and _is_page_title(section_title):
+                        page_title = section_title   # 本页第一个"大标题"记为祖先，不被后续覆盖
+                    tp, ancestor = _titles_now()
+                    pending.append({"kind": "text", "text": text, "page": page,
+                                    "section_title": section_title, "page_title": page_title,
+                                    "ancestor_title": ancestor, "title_path": tp})
+                else:
+                    buf_page = page
+                    text_buf.append(text)
+        flush_text()
 
-        title = path.stem.replace("_", " ").replace("-", " ")
+        # ── 第 2 遍：并发描述图片，给每张补"出处"（章节 + 文档主实体），回填 pending ──
+        if pending_images:
+            print(f"  [PDFLoader] {path.name}：正在描述 {len(pending_images)} 张图片（并发）...")
+            captions = await asyncio.gather(*[
+                caption_image(s["_img_bytes"], "image/png") for s in pending_images
+            ])
+            main_entity = _doc_main_entity("\n".join(all_text_parts))
+            for slot, caption in zip(pending_images, captions):
+                if not caption:
+                    slot["kind"] = "_drop"       # 描述失败：标记丢弃，第 3 遍跳过
+                    continue
+                origin = " ".join(x for x in [slot["section_title"], main_entity] if x)
+                slot["text"] = "\n".join(x for x in [
+                    origin and f"[出处] {origin}",
+                    f"【图片描述】: {caption}",
+                ] if x)
+
+        # ── 第 3 遍：按原始顺序生成 DocumentChunk ──────────────────────────────
         chunks: list[DocumentChunk] = []
-        idx = 0
-
-        def _add(text: str, page: int, is_image: bool):
-            nonlocal idx
-            if not text.strip():
-                return
-            section = f"第 {page} 页"
+        for i, p in enumerate(x for x in pending if x["kind"] != "_drop"):
+            if not p["text"].strip():
+                continue
             chunks.append(DocumentChunk(
                 source=str(path),
                 title=title,
-                text=text,
-                searchable_text=f"[标题路径] {title} > {section}\n{text}",
-                section_title=section,
-                title_path=f"{title} > {section}",
-                chunk_index=idx,
-                image_count=1 if is_image else 0,
-                page_num=page,
+                text=p["text"],
+                searchable_text=f"[标题路径] {p['title_path']}\n{p['text']}",
+                section_title=p["section_title"],
+                title_path=p["title_path"],
+                chunk_index=i,
+                chunk_type=p["kind"],
+                page_title=p["page_title"],
+                ancestor_title=p["ancestor_title"],
+                table_id=p.get("table_id", ""),
+                table_part_idx=p.get("table_part_idx", 0),
+                table_part_count=p.get("table_part_count", 1),
+                is_table_part=p.get("is_table_part", False),
+                image_count=1 if p["kind"] == "image" else 0,
+                image_path=p.get("image_path", ""),
+                page_num=p["page"],
                 page_count=page_count,
             ))
-            idx += 1
-
-        # 步骤 A：每页文本拼接后按 splitter 控长切成多段，各自成块
-        for page in sorted(page_texts):
-            page_text = "\n".join(page_texts[page])
-            for seg in split_plain(page_text):
-                _add(seg["text"], page, is_image=False)
-
-        # 步骤 B：每张表格作为一个块（Markdown 结构原样保留）
-        for page, md in tables:
-            _add(f"【表格】\n{md}", page, is_image=False)
-
-        # 步骤 C：并发调用视觉 LLM 描述所有图片，每张描述单独成块（带所属页码）
-        if all_images:
-            print(f"  [PDFLoader] {path.name}：正在描述 {len(all_images)} 张图片（并发）...")
-            captions = await asyncio.gather(*[
-                caption_image(img_bytes, "image/png") for _, img_bytes in all_images
-            ])
-            for (page, _), caption in zip(all_images, captions):
-                if caption:
-                    _add(f"【图片描述】: {caption}", page, is_image=True)
-
         return chunks
 ```
 
@@ -12871,8 +13071,12 @@ import re
 MAX_TOKENS = 350
 # 过短的尾块并入上一块的阈值（避免切出"只有一个标题"的碎块）
 MIN_TOKENS = 20
+# 单个表格块的 token 上限：超过就按行切分（表格比正文更长，阈值放宽到 MAX_TOKENS 的两倍多）
+TABLE_TOKEN_LIMIT = 800
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+# Markdown 表格的分隔行（表头与数据之间那一行，如 |---|:--:|---|）
+_MD_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
 
 
 def _rough_tokens(s: str) -> int:
@@ -12951,7 +13155,75 @@ def split_plain(content: str) -> list[dict]:
     """纯文本切分：无标题结构，按空行分段 + MAX_TOKENS 控长。"""
     return [{"text": seg, "section_title": "", "title_path": ""}
             for seg in _split_long_paragraphs(content)]
+
+
+def split_table_md(table_md: str, title: str = "", table_id: str = "") -> list[dict]:
+    """表格切分：整表优先；超长则按 Markdown 行边界切，每块重复标题+表头行，绝不断行。
+
+    为什么表格不能像正文那样"按空行控长切"：表格是二维结构，从中间某个字符断开会
+    让行列错位、表头对不上，检索命中后完全不可读。所以只在整行（`| ... |`）边界上切，
+    且每一片都重复"标题 + 表头行 + 分隔行"，保证任何一片单独拿出来都能读懂每列是什么。
+    （对齐 DDH build_chunks 里的 _split_table_html，只是把 HTML <tr> 换成 docling
+    export_to_markdown() 产出的 Markdown 行——见 15.7.4 用的正是 export_to_markdown。）
+
+    返回 [{"text", "table_id", "table_part_idx", "table_part_count", "is_table_part"}]。
+    """
+    def _one_block(text: str) -> list[dict]:
+        return [{
+            "text": (f"{title}\n" if title else "") + text,
+            "table_id": table_id, "table_part_idx": 0,
+            "table_part_count": 1, "is_table_part": False,
+        }]
+
+    # 未超长：整表作为一块，不切
+    if _rough_tokens(table_md) <= TABLE_TOKEN_LIMIT:
+        return _one_block(table_md)
+
+    lines = [ln for ln in table_md.splitlines() if ln.strip()]
+    # 找到"表头 + 分隔行"：分隔行（|---|---|）之前的都算表头，之后的是数据行
+    sep_idx = next((i for i, ln in enumerate(lines) if _MD_TABLE_SEP_RE.match(ln)), -1)
+    # 找不到标准表头结构（异常表格）：无法安全按行切，整表退回单块，绝不硬切
+    if sep_idx <= 0 or sep_idx >= len(lines) - 1:
+        return _one_block(table_md)
+
+    head_lines = lines[: sep_idx + 1]          # 表头行 + 分隔行，每片都要重复
+    data_rows = lines[sep_idx + 1:]
+    head = (f"{title}\n" if title else "") + "\n".join(head_lines)
+
+    # 按行累加，超过阈值就断到下一片；每片都以 head（标题+表头+分隔行）开头
+    parts: list[list[str]] = []
+    cur: list[str] = []
+    cur_tokens = _rough_tokens(head)
+    for r in data_rows:
+        rt = _rough_tokens(r)
+        if cur and cur_tokens + rt > TABLE_TOKEN_LIMIT:
+            parts.append(cur)
+            cur = []
+            cur_tokens = _rough_tokens(head)   # 新片重新计入 head 的开销
+        cur.append(r)                          # 整行加入，绝不切断一行内部
+        cur_tokens += rt
+    if cur:
+        parts.append(cur)
+
+    out: list[dict] = []
+    for i, rows_i in enumerate(parts):
+        text_i = head + "\n" + "\n".join(rows_i)   # 第 2、3 片也带标题+表头+分隔行
+        out.append({
+            "text": text_i,
+            "table_id": table_id,
+            "table_part_idx": i,
+            "table_part_count": len(parts),
+            "is_table_part": len(parts) > 1,
+        })
+    return out
 ```
+
+> **为什么 Markdown 切分不需要 page_title、PDF 却需要？** `split_markdown` 的标题栈天然
+> 保留了完整层级（`一级 > 二级 > 三级`），祖先标题不会丢。而 PDF 经版面分析后拿到的是
+> **扁平的 block 序列**（标题和正文平级出现，没有嵌套），一页里如果先出现页面级大标题
+> （如 "X8R / Automotive"）再出现细分小节标题（如 "Capacitance Range"），后者会把前者
+> "顶掉"，导致数据块丢失页面级上下文。所以 PDF loader 需要单独维护一个"翻页才重置、
+> 同页内不被小节标题覆盖"的 `page_title`（见 15.7.4），Markdown 则复用标题栈即可。
 
 > **为什么切分粒度是"标题 + 段落控长"而不是简单定长？** 内部规范类文档（API 约定、
 > 错误码表、编码规范）天然是分节的，标题就是最好的切分边界；`title_path` 还顺便解决了
