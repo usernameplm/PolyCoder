@@ -1,5 +1,0 @@
-//记录一下目前实现中存在的Bug，待修复
-1.向量化 chunk粒度太粗  切分一下
-2.只有语义检索 没有使用到BM25 、 RRF
-3.KnowledgeAgent 的 system_prompt 瘦身为一句话："需要检索时，先 get_skill_guide('knowledge-base-rag') 拿到操作指南，再按指南驱动 search_knowledge_base"； 
-这个不是做成 skill index 吗
