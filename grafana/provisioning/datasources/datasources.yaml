@@ -5,6 +5,7 @@ datasources:
   # ── 指标：Prometheus ──────────────────────────────────────────
   - name: Prometheus
     type: prometheus
+    uid: prometheus                  # ★ Tempo 的 tracesToMetrics/serviceMap 靠这个 uid 引用它
     access: proxy
     url: http://prometheus:9090      # Docker 网络内用服务名
     isDefault: true

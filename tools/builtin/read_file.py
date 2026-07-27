@@ -45,9 +45,10 @@ class ReadFileTool(BaseTool):
         if not raw_path:
             return "错误：path 不能为空"
 
-        # 安全检查：解析绝对路径，确保不超出工作目录
+        # 安全检查：解析绝对路径，确保不超出工作目录。
+        # 用 Path 层级判断而非字符串 startswith——后者会把 /ws-evil 误判为在 /ws 内。
         target = (self.workspace / raw_path).resolve()
-        if not str(target).startswith(str(self.workspace)):
+        if target != self.workspace and self.workspace not in target.parents:
             return f"错误：禁止访问工作目录之外的文件（路径穿越检测）"
 
         if not target.exists():

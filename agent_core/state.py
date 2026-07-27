@@ -35,6 +35,7 @@ class LoopState:
                 input_tokens=self.total_usage.input_tokens + additional_usage.input_tokens,
                 output_tokens=self.total_usage.output_tokens + additional_usage.output_tokens,
                 cache_read_tokens=self.total_usage.cache_read_tokens + additional_usage.cache_read_tokens,
+                cache_write_tokens=self.total_usage.cache_write_tokens + additional_usage.cache_write_tokens,
             )
         return replace(
             self,
