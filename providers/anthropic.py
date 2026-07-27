@@ -11,7 +11,7 @@ from .base import BaseProvider
 from .types import (
     Message, ToolDefinition, ProviderResponse,
     StreamChunk, TextBlock, ToolUseBlock, ImageBlock, Usage,
-    TextDelta, MessageStart, MessageStop,
+    TextDelta, MessageStart, MessageStop, ToolUseStart, ToolInputDelta,
 )
 
 
@@ -82,6 +82,24 @@ class AnthropicProvider(BaseProvider):
             for t in tools
         ]
 
+    def _system_param(self, system: str):
+        """
+        构造发给 SDK 的 system 参数。
+
+        给 system prompt 打上 cache_control 标记以启用 Anthropic Prompt Cache
+        （第 8.5 节）：同一 system 在 5 分钟内重复调用可命中缓存，费用约降至 10%。
+        空 system 直接原样传（空字符串不能包成 text block，否则 API 报错）。
+        """
+        if not system:
+            return system
+        return [
+            {
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
     async def chat(
         self,
         messages: list[Message],
@@ -93,7 +111,7 @@ class AnthropicProvider(BaseProvider):
         kwargs = dict(
             model=self._model,
             max_tokens=max_tokens,
-            system=system,
+            system=self._system_param(system),
             messages=self._to_sdk_messages(messages),
         )
         if tools:
@@ -135,7 +153,7 @@ class AnthropicProvider(BaseProvider):
         kwargs = dict(
             model=self._model,
             max_tokens=max_tokens,
-            system=system,
+            system=self._system_param(system),
             messages=self._to_sdk_messages(messages),
         )
         if tools:
@@ -145,9 +163,14 @@ class AnthropicProvider(BaseProvider):
             # 先发出 MessageStart（包含初始 usage）
             yield MessageStart(usage=Usage())
 
+            # Anthropic 流式事件用 index 标识内容块，delta 事件不带工具 id；
+            # 这里维护 index → tool_id 映射，好让工具参数增量关联到正确的工具块。
+            index_to_tool_id: dict[int, str] = {}
+
             async for event in stream:
                 if event.type == "content_block_start":
                     if event.content_block.type == "tool_use":
+                        index_to_tool_id[event.index] = event.content_block.id
                         yield ToolUseStart(
                             tool_id=event.content_block.id,
                             tool_name=event.content_block.name,
@@ -157,7 +180,7 @@ class AnthropicProvider(BaseProvider):
                         yield TextDelta(text=event.delta.text)
                     elif hasattr(event.delta, "partial_json"):
                         yield ToolInputDelta(
-                            tool_id=event.content_block_id,
+                            tool_id=index_to_tool_id.get(event.index, ""),
                             partial_json=event.delta.partial_json,
                         )
 
@@ -168,5 +191,7 @@ class AnthropicProvider(BaseProvider):
                 usage=Usage(
                     input_tokens=final.usage.input_tokens,
                     output_tokens=final.usage.output_tokens,
+                    cache_read_tokens=getattr(final.usage, "cache_read_input_tokens", 0) or 0,
+                    cache_write_tokens=getattr(final.usage, "cache_creation_input_tokens", 0) or 0,
                 ),
             )
