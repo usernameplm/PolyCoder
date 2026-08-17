@@ -11,7 +11,6 @@ Gemini API 和 Anthropic/OpenAI 的主要格式差异：
   4. 工具调用：function_declarations 格式，和 OpenAI tool_calls 不同
   5. 流式：generate_content_async(stream=True) + async for chunk
 """
-import uuid
 from typing import AsyncGenerator
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig
@@ -114,8 +113,11 @@ class GeminiProvider(BaseProvider):
                     content.append(TextBlock(text=part.text))
                 elif hasattr(part, "function_call") and part.function_call:
                     fc = part.function_call
+                    # ★ Gemini 没有原生 tool-call id，回传结果时靠"函数名"匹配。
+                    #   所以用函数名当 id（而非随机 uuid），下面 _to_gemini 里
+                    #   function_response.name = block.tool_use_id 才能对上。
                     content.append(ToolUseBlock(
-                        id=str(uuid.uuid4()),
+                        id=fc.name,
                         name=fc.name,
                         input=dict(fc.args),
                     ))
