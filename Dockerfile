@@ -13,6 +13,18 @@ ENV PYTHONUNBUFFERED=1
 ENV UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 ENV UV_HTTP_TIMEOUT=120
 
+# 系统依赖：docling 间接依赖 opencv-python（版面分析用），在 slim 镜像里
+# import cv2 会因缺少这些动态库而报错（libGL.so.1 等），需提前装好。
+# --no-install-recommends 减小镜像体积；装完清理 apt 缓存。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # 先只复制依赖清单，利用 Docker 层缓存（依赖没变时不重装）
 COPY pyproject.toml uv.lock ./
 

@@ -155,6 +155,10 @@ WORKSPACE=./workspace
 REDIS_HOST=localhost
 REDIS_PORT=6379
 
+# Qdrant（RAG 知识库向量库）：本地跑用 localhost；docker-compose 部署要改成服务名
+# QDRANT_URL=http://qdrant:6333
+QDRANT_URL=http://localhost:6333
+
 # 可观测性：OTLP 导出地址（Tempo/Jaeger），不填则不导出
 OTEL_EXPORTER_OTLP_ENDPOINT=
 
@@ -226,6 +230,7 @@ docker compose up -d --build
 |------|------|------|
 | agent | 8002 | 主服务 |
 | redis | 6379 | 会话 / 白板持久化 |
+| qdrant | 6333 / 6334 | RAG 知识库向量存储 |
 | prometheus | 9090 | 指标采集 |
 | grafana | 3000 | 可视化（默认 admin/admin，指标+链路+日志一处看齐） |
 | tempo | 4317 / 3200 | 链路追踪存储 |

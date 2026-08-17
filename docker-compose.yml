@@ -17,10 +17,23 @@ services:
     depends_on:
       redis:
         condition: service_healthy  # 等 Redis 健康检查通过后才启动 agent
+      qdrant:
+        condition: service_started  # Qdrant 无内置 healthcheck，起了容器即可（agent 连接失败也有降级处理）
     restart: unless-stopped         # 除非手动停止，否则崩溃后自动重启
     volumes:
       - ./sessions:/app/sessions    # 把会话文件映射到主机，重建容器不丢失
       - ./workspace:/app/workspace  # 工作目录（WORKSPACE）映射到主机，工具产出不丢失
+
+  # ── Qdrant 向量库（RAG 知识库的稠密召回存储）───────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"                  # HTTP/REST API
+      - "6334:6334"                  # gRPC API
+    volumes:
+      - qdrant_data:/qdrant/storage   # 向量数据持久化（容器重建不丢失）
+    restart: unless-stopped
 
   # ── Redis 服务 ────────────────────────────────────────────────────
   redis:
@@ -112,6 +125,7 @@ services:
 
 volumes:
   redis_data:
+  qdrant_data:
   prometheus_data:
   grafana_data:
   tempo_data:

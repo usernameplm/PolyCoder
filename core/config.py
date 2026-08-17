@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     redis_host: str = "localhost"
     redis_port: int = 6379
 
+    # Qdrant（RAG 知识库向量库）：本地跑用 localhost，docker-compose 部署要改成服务名
+    # http://qdrant:6333（同一 Docker 网络内用服务名互相访问，不能用 localhost）
+    qdrant_url: str = "http://localhost:6333"
+
     # 飞书机器人（第 12 章）
     feishu_app_id: str = ""
     feishu_app_secret: str = ""

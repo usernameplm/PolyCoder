@@ -53,8 +53,9 @@ class ToolRegistry:
         from tools.builtin.search_code import SearchCodeTool
         from tools.builtin.run_python import RunPythonTool
         from tools.builtin.write_file import WriteFileTool
+        from core.config import settings
 
-        registry.register(KnowledgeBaseTool())
+        registry.register(KnowledgeBaseTool(qdrant_url=settings.qdrant_url))
         registry.register(ListDirTool())
         registry.register(ReadFileTool())
         registry.register(SearchCodeTool())
