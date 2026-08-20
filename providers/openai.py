@@ -25,12 +25,23 @@ from observability.logging import logger
 
 class OpenAIProvider(BaseProvider):
 
-    def __init__(self, api_key: str, model: str, base_url: str | None = None):
+    # 已知支持视觉输入的模型名关键词（按需扩充）。
+    # 这是"尽力而为"的启发式判断，不是 OpenAI 官方能力查询接口——
+    # 如果你接的是一个不在列表里、但实际支持视觉的模型，用 VISION_CAPABLE=true 显式覆盖（见 15.6.5）。
+    _VISION_MODEL_HINTS = ("gpt-4o", "gpt-4.1", "gpt-4-vision", "gpt-5", "o1", "o3", "-vl", "vision")
+
+    def __init__(self, api_key: str, model: str, base_url: str | None = None,
+                 supports_vision: bool | None = None):
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
         )
         self._model = model
+        # 显式传入优先；否则按模型名做启发式匹配
+        self._supports_vision = (
+            supports_vision if supports_vision is not None
+            else any(hint in model.lower() for hint in self._VISION_MODEL_HINTS)
+        )
 
     @property
     def model_name(self) -> str:
@@ -207,21 +218,6 @@ class OpenAIProvider(BaseProvider):
             logger.warning("openai_stream_no_usage", model=self._model)
 
         yield MessageStop(stop_reason="end_turn", usage=final_usage)
-
-    # 已知支持视觉输入的模型名关键词（按需扩充）。
-    # 这是"尽力而为"的启发式判断，不是 OpenAI 官方能力查询接口——
-    # 如果你接的是一个不在列表里、但实际支持视觉的模型，用 VISION_CAPABLE=true 显式覆盖（见 15.6.5）。
-    _VISION_MODEL_HINTS = ("gpt-4o", "gpt-4.1", "gpt-4-vision", "gpt-5", "o1", "o3", "-vl", "vision")
-
-    def __init__(self, api_key: str, model: str, base_url: str | None = None,
-                 supports_vision: bool | None = None):
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        self._model = model
-        # 显式传入优先；否则按模型名做启发式匹配
-        self._supports_vision = (
-            supports_vision if supports_vision is not None
-            else any(hint in model.lower() for hint in self._VISION_MODEL_HINTS)
-        )
 
     @property
     def supports_vision(self) -> bool:
