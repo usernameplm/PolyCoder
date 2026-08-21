@@ -1,7 +1,5 @@
 # docker-compose.yml
 
-version: "3.9"
-
 services:
 
   # ── 你的 Agent 服务 ──────────────────────────────────────────────
@@ -26,7 +24,7 @@ services:
 
   # ── Qdrant 向量库（RAG 知识库的稠密召回存储）───────────────────────
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.18.3
     container_name: qdrant
     ports:
       - "6333:6333"                  # HTTP/REST API
@@ -52,7 +50,7 @@ services:
 
   # ── Prometheus 监控 ──────────────────────────────────────────────
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.13.1
     container_name: prometheus
     ports:
       - "9090:9090"
@@ -66,7 +64,7 @@ services:
 
   # ── Grafana 可视化（一处看齐：指标 Prometheus + 链路 Tempo + 日志 Loki）─
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.1.0
     container_name: grafana
     ports:
       - "3000:3000"
@@ -87,7 +85,7 @@ services:
 
   # ── Tempo 链路追踪（存储后端，UI 走 Grafana）─────────────────────
   tempo:
-    image: grafana/tempo:latest
+    image: grafana/tempo:v3.0.0
     container_name: tempo
     command: ["-config.file=/etc/tempo.yaml"]
     ports:
@@ -100,7 +98,7 @@ services:
 
   # ── Loki 日志存储（存储后端，UI 走 Grafana）─────────────────────
   loki:
-    image: grafana/loki:latest
+    image: grafana/loki:3.7.3
     container_name: loki
     command: ["-config.file=/etc/loki/local-config.yaml"]  # 用镜像自带默认配置即可
     ports:
@@ -111,7 +109,7 @@ services:
 
   # ── Promtail 日志采集器（读容器 stdout，推给 Loki）──────────────
   promtail:
-    image: grafana/promtail:latest
+    image: grafana/promtail:3.6.8
     container_name: promtail
     command: ["-config.file=/etc/promtail/config.yaml"]
     volumes:
