@@ -32,11 +32,13 @@ def _get_sub_agents() -> dict:
     from sub_agents.code_reviewer import CodeReviewerAgent
     from sub_agents.debugger import DebuggerAgent
     from sub_agents.test_writer import TestWriterAgent
+    from sub_agents.knowledge_agent import KnowledgeAgent
     return {
-        "code_writer":   CodeWriterAgent(),
-        "code_reviewer": CodeReviewerAgent(),
-        "debugger":      DebuggerAgent(),
-        "test_writer":   TestWriterAgent(),
+        "code_writer":     CodeWriterAgent(),
+        "code_reviewer":   CodeReviewerAgent(),
+        "debugger":        DebuggerAgent(),
+        "test_writer":     TestWriterAgent(),
+        "knowledge_agent": KnowledgeAgent(),
     }
 
 

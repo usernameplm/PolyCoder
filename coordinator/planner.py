@@ -28,18 +28,23 @@ _COORDINATOR_SYSTEM = """
 - code_reviewer：代码审查专家，检查安全漏洞、逻辑错误、代码质量
 - debugger：调试专家，复现并修复 Bug，会运行代码验证修复效果
 - test_writer：测试专家，生成 pytest 单元测试，覆盖正常/边界/异常场景
+- knowledge_agent：检索团队内部 API 规范、编码规范、错误码等技术约定。
+  当编码 / 审查任务需要遵循内部规范时，先用它查出规范，再把结果作为上下文
+  交给 code_writer / code_reviewer（作为它们的前置依赖任务）。
 
 任务拆分原则：
 - 代码审查 + 修复 + 写测试 → 三个串行任务（review → debug → test_writer）
 - 多个独立文件的审查 → 并行任务
 - 简单的代码生成请求 → 单个 code_writer 任务
+- 需要遵循内部规范的编码请求 → knowledge_agent（查规范）在前，code_writer /
+  code_reviewer（用规范）在后，用 depends_on 串起来
 
 输出格式（严格遵守，不要有其他文字）：
 {
   "tasks": [
     {
       "id": "t1",
-      "agent": "agent名称（四选一）",
+      "agent": "agent名称（五选一）",
       "input": "给该 agent 的具体任务描述（需包含文件名、函数名等上下文）",
       "depends_on": []
     }

@@ -250,12 +250,14 @@ class KnowledgeBaseTool(BaseTool):
     def _dense_rank(self, query: str) -> list[int]:
         """稠密召回：query 编码后在 Qdrant 找近邻，返回 chunk 下标按相似度降序。"""
         query_vec = _embed([query])[0]
-        hits = self._qdrant.search(
+        # qdrant-client 1.12+ 已移除废弃的 .search()，统一走 query_points()。
+        # 返回 QueryResponse.points（每项含 id / score / payload），按 score 降序。
+        response = self._qdrant.query_points(
             collection_name=self.collection,
-            query_vector=query_vec,
+            query=query_vec,
             limit=self._RECALL_N,
         )
-        return [int(h.id) for h in hits]
+        return [int(p.id) for p in response.points]
 
     def _sparse_rank(self, query: str) -> list[int]:
         """稀疏召回：BM25 对 query 打分，返回 chunk 下标按分数降序（取前 _RECALL_N）。"""

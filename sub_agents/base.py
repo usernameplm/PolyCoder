@@ -86,6 +86,11 @@ class SubAgent(ABC):
             tools=registry.get_all_definitions(),
             executor=executor,
             max_turns=99,
+            # 输出预算给到 16k：推理型模型（如 DeepSeek v4 / Claude 思考模式）会先产出
+            # 大段 thinking 块再写正文，默认 4096 会在思考阶段就被截断——表现为
+            # 子 Agent 跑完多轮工具调用后"完成"却返回空文本。16k 在 DeepSeek 与
+            # Claude 的输出上限之内，普通模型也只按实际用量计费。
+            max_tokens=16384,
             session_id=session_id,
             agent_name=self.name,
         )

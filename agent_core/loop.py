@@ -120,6 +120,7 @@ async def run_agent_loop(
             text_chunks: list[str] = []
             tool_calls: list[ToolUseBlock] = []
             turn_usage = Usage()
+            turn_stop_reason: str | None = None   # 本轮 Provider 返回的停止原因（截断诊断用）
 
             with tracer.start_as_current_span(f"turn_{state.turn_count}") as turn_span:
                 if on_text_delta:
@@ -148,6 +149,7 @@ async def run_agent_loop(
 
                         elif isinstance(chunk, MessageStop):
                             turn_usage = chunk.usage
+                            turn_stop_reason = chunk.stop_reason
 
                     # 流结束后，从累积的 JSON 重建 ToolUseBlock
                     import json
@@ -177,6 +179,7 @@ async def run_agent_loop(
                             tool_calls.append(block)
 
                     turn_usage = response.usage
+                    turn_stop_reason = response.stop_reason
 
                 turn_span.set_attribute("input_tokens", turn_usage.input_tokens)
                 turn_span.set_attribute("output_tokens", turn_usage.output_tokens)
@@ -188,6 +191,17 @@ async def run_agent_loop(
             # [判断] 是否有工具调用
             if not tool_calls:
                 # 没有工具调用 → LLM 给出了最终答案，Loop 结束
+                final_text = "".join(text_chunks)
+                if not final_text.strip():
+                    # 空结果告警：常见原因是响应被 max_tokens 截断（推理模型的 thinking
+                    # 块吃光预算、正文一个字都没出），或 Provider 侧异常返回空内容。
+                    # 不在这里硬重试（会成倍烧 Token），交给上层按告警排查。
+                    log.warning(
+                        "agent_loop_empty_result",
+                        turn=state.turn_count,
+                        provider_stop_reason=turn_stop_reason,
+                        hint="最终轮无任何文本块——疑似 max_tokens 截断或 Provider 空响应",
+                    )
                 log.info(
                     "agent_loop_complete",
                     turn=state.turn_count,
@@ -196,7 +210,7 @@ async def run_agent_loop(
                     stop_reason=STOP_COMPLETED,
                 )
                 return LoopResult(
-                    text="".join(text_chunks),
+                    text=final_text,
                     total_usage=state.total_usage,
                     turn_count=state.turn_count,
                     stop_reason=STOP_COMPLETED,

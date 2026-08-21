@@ -65,6 +65,9 @@ class SwarmAgent(ABC):
             tools=registry.get_all_definitions(),
             executor=ToolExecutor(registry),
             max_turns=99,
+            # 同 sub_agents/base.py：推理型模型的 thinking 块会先吃 Token，
+            # 默认 4096 可能在正文前就被截断，给到 16k。
+            max_tokens=16384,
             session_id=self.agent_id,
             agent_name=type(self).__name__,
         )
