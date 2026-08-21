@@ -84,16 +84,15 @@
 
 ### 环境要求
 
-- Python **3.14+**（本项目用 `uv` 管理，见 `.python-version` / `pyproject.toml`）
+- Python **3.14+**（本项目用 `uv` 管理，见 `pyproject.toml`）
 - Redis 7+（可选，会话持久化与 Swarm 白板备份用，未启动有降级处理）
 - Docker 24+（仅容器化部署用）
 
 ### 本地运行
 
 ```bash
-# 1. 安装依赖（推荐 uv）
+# 1. 安装依赖
 uv sync
-#   或 pip install -r requirements.txt
 
 # 2. 配置 .env，至少填一个 Provider 的 Key
 cp .env.docker .env   # 参考模板，按需修改
