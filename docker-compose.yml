@@ -85,7 +85,7 @@ services:
 
   # ── Tempo 链路追踪（存储后端，UI 走 Grafana）─────────────────────
   tempo:
-    image: grafana/tempo:v3.0.0
+    image: grafana/tempo:2.9.4
     container_name: tempo
     command: ["-config.file=/etc/tempo.yaml"]
     ports:
